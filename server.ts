@@ -47,6 +47,16 @@ async function startServer() {
     res.json(upstoxService.getState());
   });
 
+  // Reset Signals / PnL API
+  app.post("/api/reset-signals", (req, res) => {
+    try {
+      upstoxService.resetSignals();
+      res.json({ success: true, state: upstoxService.getState() });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // Option Chain Expiries API
   app.get("/api/expirys", async (req, res) => {
     try {

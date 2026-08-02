@@ -134,6 +134,22 @@ export default function App() {
     await saveSettingsToStorageAndServer(newSettings);
   };
 
+  const handleResetLogs = async () => {
+    try {
+      await fetch('/api/reset-signals', { method: 'POST' });
+      setState((prev: any) => ({
+        ...prev,
+        signals: [],
+        overallPnL: 0,
+        winRate: 0,
+        totalTrades: 0,
+        winningTrades: 0
+      }));
+    } catch (e) {
+      console.warn("Reset signals error:", e);
+    }
+  };
+
   const updateGlobalSettings = async (field: string, value: any) => {
     if (!settings) return;
     const newSettings = { ...settings, [field]: value };
@@ -235,7 +251,10 @@ export default function App() {
             <span>{settings?.isTradingEnabled ? 'PAUSE MARKET FEED' : 'START MARKET FEED'}</span>
           </button>
           
-          <button className="flex items-center space-x-2 px-4 py-2 rounded bg-transparent border border-[#1F2937] hover:bg-[#1F2937] text-sm text-gray-400 transition-all">
+          <button 
+            onClick={handleResetLogs}
+            className="flex items-center space-x-2 px-4 py-2 rounded bg-transparent border border-[#1F2937] hover:bg-[#1F2937] text-sm text-gray-400 transition-all cursor-pointer"
+          >
             <RefreshCw size={16} />
             <span>Reset Logs</span>
           </button>

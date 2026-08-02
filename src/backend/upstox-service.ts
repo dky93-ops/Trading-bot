@@ -30,10 +30,10 @@ export class UpstoxService {
   };
 
   private state: AppState = {
-    nifty50: { lastPrice: 24383.60, change: 66.45, timestamp: Date.now() },
-    bankNifty: { lastPrice: 57264.85, change: 120.30, timestamp: Date.now() },
-    indiaVix: { lastPrice: 12.85, change: -0.35, timestamp: Date.now() },
-    isConnected: true,
+    nifty50: { lastPrice: 0, change: 0, timestamp: 0 },
+    bankNifty: { lastPrice: 0, change: 0, timestamp: 0 },
+    indiaVix: { lastPrice: 0, change: 0, timestamp: 0 },
+    isConnected: false,
     signals: [],
     overallPnL: 0,
     winRate: 0,
@@ -118,6 +118,16 @@ export class UpstoxService {
         this.clients.delete(ws);
       });
     });
+  }
+
+  public resetSignals() {
+    this.state.signals = [];
+    this.strategyEngine.activeSignals.clear();
+    this.state.overallPnL = 0;
+    this.state.winRate = 0;
+    this.state.totalTrades = 0;
+    this.state.winningTrades = 0;
+    this.broadcastState();
   }
 
   getSettings(): AppSettings {
@@ -411,12 +421,43 @@ export class UpstoxService {
       return;
     }
 
-    // Run strategy engine tick on live data
-    if (this.settings.isTradingEnabled && this.state.isConnected) {
-      const newSignals = await this.strategyEngine.onTick(this.state);
-      if (newSignals.length > 0) {
-        this.state.signals.push(...newSignals);
+    // Run strategy engine tick ONLY on live, fresh real-time feed during market hours
+    if (this.settings.isTradingEnabled && this.state.isConnected && !this.state.apiError && this.strategyEngine.isMarketOpen()) {
+      const now = Date.now();
+      const isNiftyFresh = this.state.nifty50.timestamp > 0 && (now - this.state.nifty50.timestamp < 12000);
+      const isBankNiftyFresh = this.state.bankNifty.timestamp > 0 && (now - this.state.bankNifty.timestamp < 12000);
+
+      if (isNiftyFresh || isBankNiftyFresh) {
+        const newSignals = await this.strategyEngine.onTick(this.state);
+        if (newSignals.length > 0) {
+          for (const sig of newSignals) {
+            const existingIdx = this.state.signals.findIndex(s => s.id === sig.id);
+            if (existingIdx >= 0) {
+              this.state.signals[existingIdx] = { ...sig };
+            } else {
+              this.state.signals.push({ ...sig });
+            }
+          }
+          this.updatePnL();
+        }
+      }
+    } else {
+      // If market is closed or trading disabled or feed inactive, exit any active positions
+      if (this.strategyEngine.activeSignals.size > 0) {
+        const reason = !this.strategyEngine.isMarketOpen() 
+          ? "Market Closed (Outside NSE Trading Hours)" 
+          : "Market Feed Inactive or Trading Disabled";
+        this.strategyEngine.exitAllActiveTrades(reason);
         this.updatePnL();
+      }
+
+      // Mark any remaining active signal in state as CLOSED
+      for (const sig of this.state.signals) {
+        if (sig.status === 'ACTIVE') {
+          sig.status = 'CLOSED';
+          sig.exitPrice = sig.latestPrice || sig.entryPrice;
+          sig.exitTime = Date.now();
+        }
       }
     }
 
@@ -433,6 +474,14 @@ export class UpstoxService {
         console.warn(`Upstox connection lost for ${this.errorCount * 1.5}s. Exiting all active trades due to missing realtime feed.`);
         this.strategyEngine.exitAllActiveTrades("Upstox Connection Lost - Realtime Feed Unavailable");
         this.updatePnL();
+      }
+
+      for (const sig of this.state.signals) {
+        if (sig.status === 'ACTIVE') {
+          sig.status = 'CLOSED';
+          sig.exitPrice = sig.latestPrice || sig.entryPrice;
+          sig.exitTime = Date.now();
+        }
       }
     }
 

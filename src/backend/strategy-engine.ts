@@ -86,12 +86,36 @@ export class StrategyEngine {
     this.settings = settings;
   }
 
+  public isMarketOpen(): boolean {
+    try {
+      const istString = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+      const istDate = new Date(istString);
+      const day = istDate.getDay(); // 0 = Sunday, 6 = Saturday
+      if (day === 0 || day === 6) return false;
+
+      const mins = istDate.getHours() * 60 + istDate.getMinutes();
+      // NSE Trading Hours: 09:15 AM (555 mins) to 03:30 PM (930 mins) IST
+      return mins >= 555 && mins <= 930;
+    } catch (e) {
+      return false;
+    }
+  }
+
   public async onTick(newState: AppState): Promise<Signal[]> {
     this.state = newState;
     const newSignals: Signal[] = [];
 
-    // If global trading toggle is disabled, do not execute strategies or manage trades
-    if (!this.settings.isTradingEnabled) return newSignals;
+    // If global trading toggle is disabled or market is closed, exit active trades and return
+    if (!this.settings.isTradingEnabled || !this.isMarketOpen()) {
+      if (this.activeSignals.size > 0) {
+        this.exitAllActiveTrades(
+          !this.settings.isTradingEnabled 
+            ? "Trading Paused" 
+            : "Market Closed (Outside NSE Trading Hours 09:15 - 15:30 IST)"
+        );
+      }
+      return newSignals;
+    }
 
     // Manage active trades first
     this.manageActiveTrades(newSignals);
@@ -198,13 +222,18 @@ export class StrategyEngine {
       passedFilters.push('Session time suitable for options buying');
     }
 
-    // Max active trades global constraint
+    // Max active trades global constraint check
     const maxAllowedTrades = this.settings.maxActiveTrades || 2;
-    if (this.activeSignals.size >= maxAllowedTrades) {
-      failedFilters.push(`Max active trades capacity reached (${maxAllowedTrades} active trades)`);
+    const currentActiveForIndex = Array.from(this.activeSignals.values()).filter(s => s.index === index && s.status === 'ACTIVE').length;
+    if (currentActiveForIndex >= maxAllowedTrades) {
+      failedFilters.push(`Max active trades capacity reached (${currentActiveForIndex}/${maxAllowedTrades} active trades)`);
+      return null;
     } else {
       passedFilters.push('Active trades capacity available');
     }
+
+    // Helper to check if a strategy family is already active on this index
+    const isStratActive = (stratName: string) => Array.from(this.activeSignals.values()).some(s => s.index === index && s.strategy_family === stratName && s.status === 'ACTIVE');
 
     // Evaluate strategy candidates in PREFERRED PRIORITY ORDER:
     // 1. FAILED_RETEST
@@ -218,7 +247,7 @@ export class StrategyEngine {
     // ----------------------------------------------------
     // PRIORITY 1: FAILED_RETEST (Failed Retest Reversal)
     // ----------------------------------------------------
-    if (!selectedSignal && this.settings.strategies.failedRetest?.enabled) {
+    if (!selectedSignal && this.settings.strategies.failedRetest?.enabled && !isStratActive('FAILED_RETEST')) {
       selectedSignal = await this.checkFailedRetest(
         index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
       );
@@ -227,7 +256,7 @@ export class StrategyEngine {
     // ----------------------------------------------------
     // PRIORITY 2: CONTINUATION_BREAKDOWN
     // ----------------------------------------------------
-    if (!selectedSignal && this.settings.strategies.continuationBreakdown?.enabled) {
+    if (!selectedSignal && this.settings.strategies.continuationBreakdown?.enabled && !isStratActive('CONTINUATION_BREAKDOWN')) {
       selectedSignal = await this.checkContinuationBreakdown(
         index, spotPrice, todayCandles, chainRows, sessState, nearestPEWallBelow, passedFilters, failedFilters
       );
@@ -236,7 +265,7 @@ export class StrategyEngine {
     // ----------------------------------------------------
     // PRIORITY 3: CONTINUATION_BREAKOUT
     // ----------------------------------------------------
-    if (!selectedSignal && this.settings.strategies.continuationBreakout?.enabled) {
+    if (!selectedSignal && this.settings.strategies.continuationBreakout?.enabled && !isStratActive('CONTINUATION_BREAKOUT')) {
       selectedSignal = await this.checkContinuationBreakout(
         index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, passedFilters, failedFilters
       );
@@ -245,7 +274,7 @@ export class StrategyEngine {
     // ----------------------------------------------------
     // PRIORITY 4: OPENING_TRAP (Opening Breakout Trap)
     // ----------------------------------------------------
-    if (!selectedSignal && this.settings.strategies.openingTrap?.enabled) {
+    if (!selectedSignal && this.settings.strategies.openingTrap?.enabled && !isStratActive('OPENING_TRAP')) {
       selectedSignal = await this.checkOpeningTrap(
         index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
       );
@@ -254,7 +283,7 @@ export class StrategyEngine {
     // ----------------------------------------------------
     // PRIORITY 5: OI_WALL_REJECTION
     // ----------------------------------------------------
-    if (!selectedSignal && this.settings.strategies.oiWallRejection?.enabled) {
+    if (!selectedSignal && this.settings.strategies.oiWallRejection?.enabled && !isStratActive('OI_WALL_REJECTION')) {
       selectedSignal = await this.checkOIWallRejection(
         index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
       );
@@ -549,24 +578,31 @@ export class StrategyEngine {
   private async checkOIWallRejection(
     index: string, spot: number, candles: Candle[], chainRows: any[], sess: SessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
   ): Promise<Signal | null> {
-    const ceTestCount = sess.wallTestCounts[wallAbove] || 0;
-    const peTestCount = sess.wallTestCounts[wallBelow] || 0;
+    if (candles.length < 3) return null;
+
+    const step = index === 'NIFTY' ? 50 : 100;
+    const tolerance = step * 0.25;
+
+    // Count how many recent 3m candles reached wallAbove and closed below it
+    const ceWallTests = candles.filter(c => c.high >= wallAbove - tolerance && c.close < wallAbove).length;
+    // Count how many recent 3m candles reached wallBelow and closed above it
+    const peWallTests = candles.filter(c => c.low <= wallBelow + tolerance && c.close > wallBelow).length;
 
     // BUY_PUT on CE Wall Rejection
-    if (ceTestCount >= 2 && spot < wallAbove) {
-      const atmStrike = Math.round(spot / (index === 'NIFTY' ? 50 : 100)) * (index === 'NIFTY' ? 50 : 100);
+    if (ceWallTests >= 2 && spot < wallAbove && spot >= wallAbove - step) {
+      const atmStrike = Math.round(spot / step) * step;
       const peOpt = await this.fetchOptionData(index, 'PE', spot, 0);
       if (peOpt && peOpt.price > 0) {
         const roomPts = spot - wallBelow;
         const rewardRatio = roomPts / Math.max(10, wallAbove - spot);
 
         if (rewardRatio >= 0.8) {
-          passed.push(`CE Wall Rejection Put confirmed at ${wallAbove} (Tested ${ceTestCount} times)`);
+          passed.push(`CE Wall Rejection Put confirmed at ${wallAbove} (${ceWallTests} candle rejections)`);
           return this.createSignal(
             index, 'OI_WALL_REJECTION', 'BUY_PUT', 'PE', spot, wallAbove, wallAbove, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey,
             78,
             [
-              `Heavy CE wall at ${wallAbove} rejected price ${ceTestCount} times`,
+              `Heavy CE wall at ${wallAbove} rejected price ${ceWallTests} times in recent candles`,
               `CE wall OI weakening / unwinding`,
               `PE premium expanding on downside rejection`
             ],
@@ -577,20 +613,20 @@ export class StrategyEngine {
     }
 
     // BUY_CALL on PE Wall Rejection
-    if (peTestCount >= 2 && spot > wallBelow) {
-      const atmStrike = Math.round(spot / (index === 'NIFTY' ? 50 : 100)) * (index === 'NIFTY' ? 50 : 100);
+    if (peWallTests >= 2 && spot > wallBelow && spot <= wallBelow + step) {
+      const atmStrike = Math.round(spot / step) * step;
       const ceOpt = await this.fetchOptionData(index, 'CE', spot, 0);
       if (ceOpt && ceOpt.price > 0) {
         const roomPts = wallAbove - spot;
         const rewardRatio = roomPts / Math.max(10, spot - wallBelow);
 
         if (rewardRatio >= 0.8) {
-          passed.push(`PE Wall Rejection Call confirmed at ${wallBelow} (Tested ${peTestCount} times)`);
+          passed.push(`PE Wall Rejection Call confirmed at ${wallBelow} (${peWallTests} candle rejections)`);
           return this.createSignal(
             index, 'OI_WALL_REJECTION', 'BUY_CALL', 'CE', spot, wallBelow, wallAbove, wallBelow, atmStrike, ceOpt.price, ceOpt.instrumentKey,
             78,
             [
-              `Heavy PE wall at ${wallBelow} rejected price ${peTestCount} times`,
+              `Heavy PE wall at ${wallBelow} rejected price ${peWallTests} times in recent candles`,
               `PE wall OI weakening / unwinding`,
               `CE premium expanding on upside rejection`
             ],
