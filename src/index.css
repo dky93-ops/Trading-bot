@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-bg: #0A0F1C;
+  --color-brand-card: #111827;
+  --color-brand-border: #1F2937;
+  --color-brand-green: #00FFA3;
+  --color-brand-blue: #00D1FF;
+}
+
+@layer base {
+  body {
+    @apply bg-brand-bg text-gray-200 antialiased font-mono;
+  }
+}
+
+@layer utilities {
+  .hide-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .hide-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
