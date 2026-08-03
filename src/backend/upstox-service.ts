@@ -16,10 +16,9 @@ export class UpstoxService {
     accessToken: process.env.UPSTOX_ACCESS_TOKEN || 'eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJDSDQ1ODIiLCJqdGkiOiI2YTNjMGE1ZTU0ZjIyZjBkMzQzYjAwNzciLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzgyMzE5NzEwLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MTM4NzQ0MDB9.hdLqe8bdkWS0zcc4pASjX8nJSJ_WjwbE_diOwGqHQ8Y',
     isTradingEnabled: true, // Global switch
     nifty50Enabled: true,
-    bankNiftyEnabled: true,
     expiryDate: 'CURRENT',
     defaultLotsPerTrade: 1,
-    maxActiveTrades: 2,
+    maxActiveTrades: 1, // Rule: STRICTLY 1 open trade at a time
     strategies: {
       openingTrap: { enabled: true, lotSize: 1 },
       failedRetest: { enabled: true, lotSize: 1 },
@@ -31,11 +30,12 @@ export class UpstoxService {
 
   private state: AppState = {
     nifty50: { lastPrice: 0, change: 0, timestamp: 0 },
-    bankNifty: { lastPrice: 0, change: 0, timestamp: 0 },
     indiaVix: { lastPrice: 0, change: 0, timestamp: 0 },
     isConnected: false,
     signals: [],
     overallPnL: 0,
+    realizedPnL: 0,
+    unrealizedPnL: 0,
     winRate: 0,
     totalTrades: 0,
     winningTrades: 0,
@@ -323,7 +323,6 @@ export class UpstoxService {
 
         const keysList = [
           'NSE_INDEX|Nifty 50', 
-          'NSE_INDEX|Nifty Bank',
           'NSE_INDEX|India VIX',
           ...activeOptionKeys
         ];
@@ -353,15 +352,6 @@ export class UpstoxService {
             };
             insertTick('NIFTY', tick.last_price, Date.now());
           }
-          if (data['NSE_INDEX:Nifty Bank']) {
-            const tick = data['NSE_INDEX:Nifty Bank'];
-            this.state.bankNifty = {
-              lastPrice: tick.last_price,
-              change: tick.net_change,
-              timestamp: Date.now()
-            };
-            insertTick('BANKNIFTY', tick.last_price, Date.now());
-          }
           if (data['NSE_INDEX:India VIX']) {
             const tick = data['NSE_INDEX:India VIX'];
             this.state.indiaVix = {
@@ -385,6 +375,16 @@ export class UpstoxService {
               );
               if (matchingQuote && matchingQuote.last_price !== undefined) {
                 signal.latestPrice = matchingQuote.last_price;
+              }
+            }
+          }
+
+          // Sync latest prices into state.signals array
+          for (const sig of this.state.signals) {
+            if (sig.status === 'ACTIVE') {
+              const activeSig = this.strategyEngine.activeSignals.get(sig.id);
+              if (activeSig && activeSig.latestPrice !== undefined) {
+                sig.latestPrice = activeSig.latestPrice;
               }
             }
           }
@@ -425,9 +425,8 @@ export class UpstoxService {
     if (this.settings.isTradingEnabled && this.state.isConnected && !this.state.apiError && this.strategyEngine.isMarketOpen()) {
       const now = Date.now();
       const isNiftyFresh = this.state.nifty50.timestamp > 0 && (now - this.state.nifty50.timestamp < 12000);
-      const isBankNiftyFresh = this.state.bankNifty.timestamp > 0 && (now - this.state.bankNifty.timestamp < 12000);
 
-      if (isNiftyFresh || isBankNiftyFresh) {
+      if (isNiftyFresh) {
         const newSignals = await this.strategyEngine.onTick(this.state);
         if (newSignals.length > 0) {
           for (const sig of newSignals) {
@@ -438,7 +437,6 @@ export class UpstoxService {
               this.state.signals.push({ ...sig });
             }
           }
-          this.updatePnL();
         }
       }
     } else {
@@ -448,7 +446,6 @@ export class UpstoxService {
           ? "Market Closed (Outside NSE Trading Hours)" 
           : "Market Feed Inactive or Trading Disabled";
         this.strategyEngine.exitAllActiveTrades(reason);
-        this.updatePnL();
       }
 
       // Mark any remaining active signal in state as CLOSED
@@ -461,6 +458,7 @@ export class UpstoxService {
       }
     }
 
+    this.updatePnL();
     this.broadcastState();
   }
 
@@ -473,7 +471,6 @@ export class UpstoxService {
       if (this.strategyEngine.activeSignals.size > 0) {
         console.warn(`Upstox connection lost for ${this.errorCount * 1.5}s. Exiting all active trades due to missing realtime feed.`);
         this.strategyEngine.exitAllActiveTrades("Upstox Connection Lost - Realtime Feed Unavailable");
-        this.updatePnL();
       }
 
       for (const sig of this.state.signals) {
@@ -485,19 +482,32 @@ export class UpstoxService {
       }
     }
 
+    this.updatePnL();
     this.broadcastState();
   }
 
   private updatePnL() {
-    let closedTrades = this.state.signals.filter(s => s.status === 'CLOSED');
+    const closedTrades = this.state.signals.filter(s => s.status === 'CLOSED');
+    const activeTrades = this.state.signals.filter(s => s.status === 'ACTIVE');
+    
     this.state.totalTrades = closedTrades.length;
-    this.state.winningTrades = closedTrades.filter(s => s.realizedPnL && s.realizedPnL > 0).length;
+    this.state.winningTrades = closedTrades.filter(s => (s.realizedPnL || 0) > 0).length;
+    this.state.winRate = this.state.totalTrades > 0 ? (this.state.winningTrades / this.state.totalTrades) * 100 : 0;
+
+    const realized = closedTrades.reduce((sum, s) => sum + (s.realizedPnL || 0), 0);
     
-    if (this.state.totalTrades > 0) {
-      this.state.winRate = (this.state.winningTrades / this.state.totalTrades) * 100;
+    let unrealized = 0;
+    for (const sig of activeTrades) {
+      const curPrice = sig.latestPrice || sig.entryPrice;
+      const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
+      const lotConfig = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
+      const qty = 25 * lotConfig;
+      unrealized += (curPrice - sig.entryPrice) * qty;
     }
-    
-    this.state.overallPnL = closedTrades.reduce((sum, s) => sum + (s.realizedPnL || 0), 0);
+
+    this.state.realizedPnL = realized;
+    this.state.unrealizedPnL = unrealized;
+    this.state.overallPnL = realized + unrealized;
   }
 
   private broadcastState() {

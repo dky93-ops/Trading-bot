@@ -4,7 +4,7 @@ export interface AppSettings {
   accessToken: string;
   isTradingEnabled: boolean;
   nifty50Enabled: boolean;
-  bankNiftyEnabled: boolean;
+  bankNiftyEnabled?: boolean;
   expiryDate: string;
   defaultLotsPerTrade?: number;
   maxActiveTrades?: number;
@@ -33,12 +33,14 @@ export interface InstrumentData {
 
 export interface AppState {
   nifty50: InstrumentData;
-  bankNifty: InstrumentData;
+  bankNifty?: InstrumentData;
   indiaVix: InstrumentData;
   isConnected: boolean;
   apiError?: string;
   signals: Signal[];
   overallPnL: number;
+  realizedPnL?: number;
+  unrealizedPnL?: number;
   winRate: number;
   totalTrades: number;
   winningTrades: number;

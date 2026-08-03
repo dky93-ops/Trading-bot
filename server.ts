@@ -22,9 +22,32 @@ async function startServer() {
   // Initialize Upstox Service (this handles polling, strategies, and signals)
   const upstoxService = new UpstoxService(wss);
   
-  // Health Check Endpoint for Koyeb / Docker health checks
+  // Health Check Endpoint for Koyeb / UptimeRobot keep-alive checks
+  let healthCheckCount = 0;
+  let lastPingTime: string | null = null;
+  let lastPingUserAgent: string | null = null;
+  let recentPings: Array<{ time: string; userAgent: string; ip: string }> = [];
+
   app.get("/api/health", (req, res) => {
-    res.json({ status: "healthy", timestamp: new Date().toISOString() });
+    healthCheckCount++;
+    lastPingTime = new Date().toISOString();
+    lastPingUserAgent = req.headers['user-agent'] || 'unknown';
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+    
+    recentPings.unshift({
+      time: lastPingTime,
+      userAgent: lastPingUserAgent,
+      ip: clientIp
+    });
+    if (recentPings.length > 10) recentPings.pop();
+
+    res.json({
+      status: "healthy",
+      timestamp: lastPingTime,
+      pingCount: healthCheckCount,
+      lastPingUserAgent,
+      recentPings
+    });
   });
 
   // Settings API

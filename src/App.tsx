@@ -230,10 +230,10 @@ export default function App() {
 
         {/* Top Stats Grid */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <StatBox title="INDEX SPOT (NIFTY)" value={`₹${state.nifty50?.lastPrice || '---'}`} sub={`Change: ${state.nifty50?.change || 0}`} color="green" />
+          <StatBox title="INDEX SPOT (NIFTY 50)" value={`₹${state.nifty50?.lastPrice || '---'}`} sub={`Change: ${state.nifty50?.change || 0}`} color="green" />
           <StatBox title="INDIA VIX" value={state.indiaVix?.lastPrice || '---'} sub={`Vol Change: ${state.indiaVix?.change || 0}`} color="yellow" />
-          <StatBox title="BANK NIFTY" value={`₹${state.bankNifty?.lastPrice || '---'}`} sub={`Change: ${state.bankNifty?.change || 0}`} color="blue" />
-          <StatBox title="VWAP / DELTA" value={`₹${state.nifty50?.lastPrice ? (state.nifty50.lastPrice - 10).toFixed(2) : '---'}`} sub="Vol Δ: +0" color="purple" />
+          <StatBox title="VWAP / SPOT DELTA" value={`₹${state.nifty50?.lastPrice ? (state.nifty50.lastPrice - 10).toFixed(2) : '---'}`} sub="Vol Δ: +0" color="purple" />
+          <StatBox title="NET REALIZED P&L" value={`${(state.overallPnL || 0) >= 0 ? '+' : ''}₹${(state.overallPnL || 0).toLocaleString('en-IN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}`} sub={`Realized: ₹${(state.realizedPnL || 0).toFixed(1)} | Live: ₹${(state.unrealizedPnL || 0).toFixed(1)}`} color={(state.overallPnL || 0) >= 0 ? "green" : "red"} />
         </div>
 
         {/* Controls */}
@@ -349,11 +349,11 @@ export default function App() {
                     </thead>
                     <tbody className="divide-y divide-[#1F2937]">
                       {[
-                        { id: 'failedRetest', name: '1. Failed Retest Reversal (FAILED_RETEST)', desc: 'Priority 1 | Catches failed retests of broken key levels after candle confirmation.', rr: '>= 0.8R to 1.5R+' },
-                        { id: 'continuationBreakdown', name: '2. Continuation Breakdown (CONTINUATION_BREAKDOWN)', desc: 'Priority 2 | Trades bearish continuation after level breakdown and consolidation pause.', rr: '>= 0.8R to 1.5R' },
-                        { id: 'continuationBreakout', name: '3. Continuation Breakout (CONTINUATION_BREAKOUT)', desc: 'Priority 3 | Trades bullish continuation after level breakout and consolidation pause.', rr: '>= 0.8R to 1.5R' },
-                        { id: 'openingTrap', name: '4. Opening Breakout Trap (OPENING_TRAP)', desc: 'Priority 4 | Catches opening range fake breakouts/breakdowns upon retest confirmation.', rr: '>= 0.8R to 1.0R' },
-                        { id: 'oiWallRejection', name: '5. OI Wall Rejection (OI_WALL_REJECTION)', desc: 'Priority 5 | Rejection trades when 1.5x dominant OI walls reject price 2+ times & begin unwinding.', rr: '>= 0.8R to 1.2R' },
+                        { id: 'failedRetest', familyKey: 'FAILED_RETEST', name: '1. Failed Retest Reversal (FAILED_RETEST)', desc: 'Priority 1 | Catches failed retests of broken key levels after candle confirmation.', rr: '>= 0.8R to 1.5R+' },
+                        { id: 'continuationBreakdown', familyKey: 'CONTINUATION_BREAKDOWN', name: '2. Continuation Breakdown (CONTINUATION_BREAKDOWN)', desc: 'Priority 2 | Trades bearish continuation after level breakdown and consolidation pause.', rr: '>= 0.8R to 1.5R' },
+                        { id: 'continuationBreakout', familyKey: 'CONTINUATION_BREAKOUT', name: '3. Continuation Breakout (CONTINUATION_BREAKOUT)', desc: 'Priority 3 | Trades bullish continuation after level breakout and consolidation pause.', rr: '>= 0.8R to 1.5R' },
+                        { id: 'openingTrap', familyKey: 'OPENING_TRAP', name: '4. Opening Breakout Trap (OPENING_TRAP)', desc: 'Priority 4 | Catches opening range fake breakouts/breakdowns upon retest confirmation.', rr: '>= 0.8R to 1.0R' },
+                        { id: 'oiWallRejection', familyKey: 'OI_WALL_REJECTION', name: '5. OI Wall Rejection (OI_WALL_REJECTION)', desc: 'Priority 5 | Rejection trades when 1.5x dominant OI walls reject price 2+ times & begin unwinding.', rr: '>= 0.8R to 1.2R' },
                       ].map(strat => {
                         const isEnabled = !!settings?.strategies?.[strat.id]?.enabled;
                         const toggleStrat = () => {
@@ -363,6 +363,32 @@ export default function App() {
                           };
                           updateGlobalSettings('strategies', updated);
                         };
+
+                        const stratSignals = state.signals?.filter((s: any) => 
+                          s.strategy_family === strat.familyKey || 
+                          (s.strategy_family || '').toUpperCase() === strat.familyKey || 
+                          s.strategy === strat.id
+                        ) || [];
+
+                        const closedStrat = stratSignals.filter((s: any) => s.status === 'CLOSED');
+                        const winningStrat = closedStrat.filter((s: any) => (s.realizedPnL || 0) > 0);
+                        const winRateStr = closedStrat.length > 0 
+                          ? `${((winningStrat.length / closedStrat.length) * 100).toFixed(0)}%` 
+                          : (stratSignals.length > 0 ? '0%' : '---');
+
+                        const stratPnL = stratSignals.reduce((sum: number, s: any) => {
+                          if (s.status === 'CLOSED') {
+                            return sum + (s.realizedPnL || 0);
+                          } else {
+                            const curP = s.latestPrice || s.entryPrice;
+                            const lots = settings?.strategies?.[strat.id]?.lotSize || 1;
+                            return sum + ((curP - s.entryPrice) * 25 * lots);
+                          }
+                        }, 0);
+
+                        const pnlFormatted = stratPnL >= 0 
+                          ? `+₹${stratPnL.toLocaleString('en-IN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}` 
+                          : `-₹${Math.abs(stratPnL).toLocaleString('en-IN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}`;
 
                         return (
                           <tr key={strat.id} className="hover:bg-[#1F2937]/50 transition-colors">
@@ -383,12 +409,16 @@ export default function App() {
                                 {isEnabled ? 'ACTIVE' : 'INACTIVE'}
                               </button>
                             </td>
-                            <td className="px-6 py-4 text-gray-300">
-                              {state.signals?.filter((s: any) => s.strategy_family === strat.id.toUpperCase() || s.strategy === strat.id).length || 0}
+                            <td className="px-6 py-4 text-gray-300 font-bold">
+                              {stratSignals.length}
                             </td>
-                            <td className="px-6 py-4 text-brand-green">100%</td>
-                            <td className="px-6 py-4 text-brand-green">+₹0</td>
-                            <td className="px-6 py-4 text-brand-blue">{strat.rr}</td>
+                            <td className={cn("px-6 py-4 font-bold", closedStrat.length > 0 && winningStrat.length > 0 ? "text-brand-green" : "text-gray-400")}>
+                              {winRateStr}
+                            </td>
+                            <td className={cn("px-6 py-4 font-bold", stratPnL > 0 ? "text-brand-green" : stratPnL < 0 ? "text-red-400" : "text-gray-400")}>
+                              {pnlFormatted}
+                            </td>
+                            <td className="px-6 py-4 text-brand-blue font-bold">{strat.rr}</td>
                           </tr>
                         );
                       })}
@@ -413,6 +443,7 @@ export default function App() {
                   <thead className="text-xs text-gray-500 uppercase bg-[#0A0F1C] border-b border-[#1F2937]">
                     <tr>
                       <th className="px-4 py-3">Timestamp</th>
+                      <th className="px-4 py-3">Status</th>
                       <th className="px-4 py-3">Signal</th>
                       <th className="px-4 py-3">Strategy Family</th>
                       <th className="px-4 py-3">Spot</th>
@@ -420,6 +451,8 @@ export default function App() {
                       <th className="px-4 py-3">Walls (CE / PE)</th>
                       <th className="px-4 py-3">Strike & Opt</th>
                       <th className="px-4 py-3">Entry</th>
+                      <th className="px-4 py-3">Current / Exit</th>
+                      <th className="px-4 py-3 text-right">Profit / Loss (₹)</th>
                       <th className="px-4 py-3">Stoploss</th>
                       <th className="px-4 py-3">Target1 / T2</th>
                       <th className="px-4 py-3">Conf</th>
@@ -429,44 +462,81 @@ export default function App() {
                   <tbody className="divide-y divide-[#1F2937] text-xs">
                     {state.signals.length === 0 ? (
                       <tr>
-                        <td colSpan={12} className="px-4 py-12 text-center text-gray-500">
+                        <td colSpan={15} className="px-4 py-12 text-center text-gray-500">
                           No active trades generated yet. Strategy engine actively evaluating level breaks, OI walls, and retests...
                         </td>
                       </tr>
                     ) : (
-                      state.signals.map((sig: any, i: number) => (
-                        <tr key={i} className="hover:bg-[#1F2937]/50">
-                          <td className="px-4 py-3 text-gray-400 whitespace-nowrap">{new Date(sig.timestamp).toLocaleTimeString()}</td>
-                          <td className="px-4 py-3">
-                            <span className={cn(
-                              "px-2 py-0.5 rounded text-[10px] font-bold uppercase",
-                              sig.signal === 'BUY_CALL' ? 'bg-brand-green/20 text-brand-green border border-brand-green/40' :
-                              sig.signal === 'BUY_PUT' ? 'bg-red-500/20 text-red-400 border border-red-500/40' :
-                              'bg-gray-800 text-gray-400'
+                      state.signals.map((sig: any, i: number) => {
+                        const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
+                        const lots = settings?.strategies?.[stratKey]?.lotSize || 1;
+                        const qty = 25 * lots;
+                        
+                        let tradePnL = 0;
+                        if (sig.status === 'CLOSED') {
+                          tradePnL = sig.realizedPnL !== undefined ? sig.realizedPnL : ((sig.exitPrice || sig.latestPrice || sig.entryPrice) - sig.entryPrice) * qty;
+                        } else {
+                          const curP = sig.latestPrice || sig.entryPrice;
+                          tradePnL = (curP - sig.entryPrice) * qty;
+                        }
+
+                        const pnlText = tradePnL >= 0 
+                          ? `+₹${tradePnL.toLocaleString('en-IN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}` 
+                          : `-₹${Math.abs(tradePnL).toLocaleString('en-IN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}`;
+
+                        return (
+                          <tr key={i} className="hover:bg-[#1F2937]/50">
+                            <td className="px-4 py-3 text-gray-400 whitespace-nowrap">{new Date(sig.timestamp).toLocaleTimeString()}</td>
+                            <td className="px-4 py-3">
+                              <span className={cn(
+                                "px-2 py-0.5 rounded text-[10px] font-bold uppercase",
+                                sig.status === 'ACTIVE' 
+                                  ? 'bg-brand-blue/20 text-brand-blue border border-brand-blue/40 animate-pulse' 
+                                  : 'bg-gray-800 text-gray-400 border border-gray-700'
+                              )}>
+                                {sig.status || 'ACTIVE'}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">
+                              <span className={cn(
+                                "px-2 py-0.5 rounded text-[10px] font-bold uppercase",
+                                sig.signal === 'BUY_CALL' ? 'bg-brand-green/20 text-brand-green border border-brand-green/40' :
+                                sig.signal === 'BUY_PUT' ? 'bg-red-500/20 text-red-400 border border-red-500/40' :
+                                'bg-gray-800 text-gray-400'
+                              )}>
+                                {sig.signal}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 text-gray-200 font-bold">{sig.strategy_family || sig.strategy}</td>
+                            <td className="px-4 py-3 text-white font-bold">{sig.spot || sig.entryPrice}</td>
+                            <td className="px-4 py-3 text-yellow-400 font-bold">{sig.broken_level || '-'}</td>
+                            <td className="px-4 py-3 text-gray-400 whitespace-nowrap">
+                              <span className="text-red-400">CE: {sig.wall_above || '-'}</span> / <span className="text-brand-green">PE: {sig.wall_below || '-'}</span>
+                            </td>
+                            <td className="px-4 py-3 text-brand-blue font-bold whitespace-nowrap">
+                              {sig.strike ? `${sig.strike} ${sig.option_type}` : sig.contract}
+                            </td>
+                            <td className="px-4 py-3 text-gray-200 font-bold">₹{sig.entry || sig.entryPrice}</td>
+                            <td className="px-4 py-3 text-white font-bold">
+                              ₹{sig.status === 'CLOSED' ? (sig.exitPrice || sig.latestPrice || sig.entryPrice) : (sig.latestPrice || sig.entryPrice)}
+                            </td>
+                            <td className={cn(
+                              "px-4 py-3 text-right font-bold font-mono text-xs whitespace-nowrap",
+                              tradePnL > 0 ? "text-brand-green" : tradePnL < 0 ? "text-red-400" : "text-gray-400"
                             )}>
-                              {sig.signal}
-                            </span>
-                          </td>
-                          <td className="px-4 py-3 text-gray-200 font-bold">{sig.strategy_family || sig.strategy}</td>
-                          <td className="px-4 py-3 text-white font-bold">{sig.spot || sig.entryPrice}</td>
-                          <td className="px-4 py-3 text-yellow-400 font-bold">{sig.broken_level || '-'}</td>
-                          <td className="px-4 py-3 text-gray-400 whitespace-nowrap">
-                            <span className="text-red-400">CE: {sig.wall_above || '-'}</span> / <span className="text-brand-green">PE: {sig.wall_below || '-'}</span>
-                          </td>
-                          <td className="px-4 py-3 text-brand-blue font-bold whitespace-nowrap">
-                            {sig.strike ? `${sig.strike} ${sig.option_type}` : sig.contract}
-                          </td>
-                          <td className="px-4 py-3 text-gray-200 font-bold">₹{sig.entry || sig.entryPrice}</td>
-                          <td className="px-4 py-3 text-red-400 font-bold">₹{sig.stoploss || sig.stopLoss}</td>
-                          <td className="px-4 py-3 text-brand-green font-bold whitespace-nowrap">
-                            ₹{sig.target1 || sig.target} / ₹{sig.target2 || '-'}
-                          </td>
-                          <td className="px-4 py-3 text-purple-400 font-bold">{sig.confidence ? `${sig.confidence}%` : '-'}</td>
-                          <td className="px-4 py-3 text-gray-400 max-w-xs">
-                            {sig.reason && Array.isArray(sig.reason) ? sig.reason.join(' | ') : '-'}
-                          </td>
-                        </tr>
-                      ))
+                              {pnlText}
+                            </td>
+                            <td className="px-4 py-3 text-red-400 font-bold">₹{sig.stoploss || sig.stopLoss}</td>
+                            <td className="px-4 py-3 text-brand-green font-bold whitespace-nowrap">
+                              ₹{sig.target1 || sig.target} / ₹{sig.target2 || '-'}
+                            </td>
+                            <td className="px-4 py-3 text-purple-400 font-bold">{sig.confidence ? `${sig.confidence}%` : '-'}</td>
+                            <td className="px-4 py-3 text-gray-400 max-w-xs">
+                              {sig.reason && Array.isArray(sig.reason) ? sig.reason.join(' | ') : '-'}
+                            </td>
+                          </tr>
+                        );
+                      })
                     )}
                   </tbody>
                 </table>
@@ -502,7 +572,7 @@ export default function App() {
                       onChange={(e) => updateGlobalSettings('accessToken', e.target.value.trim())}
                       className="w-full bg-[#0A0F1C] border border-[#1F2937] rounded px-4 py-2 text-brand-green font-mono text-xs focus:border-brand-green outline-none"
                     />
-                    <p className="text-[10px] text-gray-500 mt-1">Generated daily from Upstox Developer Portal or OAuth flow. Required for live Nifty & BankNifty Option Chain.</p>
+                    <p className="text-[10px] text-gray-500 mt-1">Generated daily from Upstox Developer Portal or OAuth flow. Required for live Nifty 50 Option Chain.</p>
                   </div>
 
                   <div>
@@ -556,7 +626,7 @@ export default function App() {
                       onChange={(e) => updateGlobalSettings('defaultLotsPerTrade', parseInt(e.target.value) || 1)}
                       className="w-full bg-[#0A0F1C] border border-[#1F2937] rounded px-4 py-2 text-brand-green font-bold focus:border-brand-green outline-none font-mono text-sm"
                     />
-                    <p className="text-[10px] text-gray-500 mt-1">Default number of lots assigned to trades (Nifty: 50 qty/lot, BankNifty: 15 qty/lot)</p>
+                    <p className="text-[10px] text-gray-500 mt-1">Default number of lots assigned to trades (Nifty 50: 25 qty/lot)</p>
                   </div>
 
                   <div>
@@ -565,11 +635,11 @@ export default function App() {
                       type="number" 
                       min="1"
                       max="10"
-                      value={settings.maxActiveTrades || 2}
+                      value={settings.maxActiveTrades || 1}
                       onChange={(e) => updateGlobalSettings('maxActiveTrades', parseInt(e.target.value) || 1)}
                       className="w-full bg-[#0A0F1C] border border-[#1F2937] rounded px-4 py-2 text-brand-blue font-bold focus:border-brand-blue outline-none font-mono text-sm"
                     />
-                    <p className="text-[10px] text-gray-500 mt-1">Maximum number of concurrent active trades allowed across all 5 strategies</p>
+                    <p className="text-[10px] text-gray-500 mt-1">Strict rule: Maximum 1 concurrent active trade allowed at a time</p>
                   </div>
 
                   <div>
@@ -1211,8 +1281,7 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
           </button>
 
           <select value={instrument} onChange={e => setInstrument(e.target.value)} className="px-2.5 py-1 bg-[#111827] border border-[#1F2937] rounded text-xs font-bold text-white outline-none cursor-pointer">
-            <option value="NSE_INDEX|Nifty 50">NIFTY 50</option>
-            <option value="NSE_INDEX|Nifty Bank">BANK NIFTY</option>
+            <option value="NSE_INDEX|Nifty 50">NIFTY 50 ONLY</option>
           </select>
 
           <select value={expiry} onChange={e => setExpiry(e.target.value)} className="px-2.5 py-1 bg-[#111827] border border-[#1F2937] rounded text-xs font-bold text-white outline-none cursor-pointer">

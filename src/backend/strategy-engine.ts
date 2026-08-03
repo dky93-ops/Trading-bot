@@ -43,7 +43,6 @@ export class StrategyEngine {
 
   private sessionStates: Record<string, SessionState> = {
     'NIFTY': this.createInitialSessionState(),
-    'BANKNIFTY': this.createInitialSessionState(),
   };
 
   constructor(
@@ -120,14 +119,9 @@ export class StrategyEngine {
     // Manage active trades first
     this.manageActiveTrades(newSignals);
 
-    // Evaluate NIFTY and BANKNIFTY
+    // Evaluate NIFTY ONLY
     if (this.settings.nifty50Enabled && this.state.nifty50.lastPrice > 0) {
       const sig = await this.evaluateIndex('NIFTY', this.state.nifty50.lastPrice);
-      if (sig && sig.signal !== 'NO_TRADE') newSignals.push(sig);
-    }
-
-    if (this.settings.bankNiftyEnabled && this.state.bankNifty.lastPrice > 0) {
-      const sig = await this.evaluateIndex('BANKNIFTY', this.state.bankNifty.lastPrice);
       if (sig && sig.signal !== 'NO_TRADE') newSignals.push(sig);
     }
 
@@ -173,13 +167,13 @@ export class StrategyEngine {
     } else if (todayCandles.length > 0) {
       sessState.sessionHigh = Math.max(...todayCandles.map(c => c.high));
       sessState.sessionLow = Math.min(...todayCandles.map(c => c.low));
-      sessState.openingRangeHigh = 0;
-      sessState.openingRangeLow = 0;
+      sessState.openingRangeHigh = sessState.sessionHigh;
+      sessState.openingRangeLow = sessState.sessionLow;
     } else {
-      sessState.sessionHigh = 0;
-      sessState.sessionLow = 0;
-      sessState.openingRangeHigh = 0;
-      sessState.openingRangeLow = 0;
+      sessState.sessionHigh = spotPrice;
+      sessState.sessionLow = spotPrice;
+      sessState.openingRangeHigh = spotPrice;
+      sessState.openingRangeLow = spotPrice;
     }
 
     // Fetch live option chain
@@ -222,14 +216,14 @@ export class StrategyEngine {
       passedFilters.push('Session time suitable for options buying');
     }
 
-    // Max active trades global constraint check
-    const maxAllowedTrades = this.settings.maxActiveTrades || 2;
-    const currentActiveForIndex = Array.from(this.activeSignals.values()).filter(s => s.index === index && s.status === 'ACTIVE').length;
-    if (currentActiveForIndex >= maxAllowedTrades) {
-      failedFilters.push(`Max active trades capacity reached (${currentActiveForIndex}/${maxAllowedTrades} active trades)`);
+    // Max active trades global constraint check - STRICTLY 1 OPEN TRADE AT A TIME
+    const maxAllowedTrades = this.settings.maxActiveTrades || 1;
+    const totalActiveTrades = Array.from(this.activeSignals.values()).filter(s => s.status === 'ACTIVE').length;
+    if (totalActiveTrades >= maxAllowedTrades) {
+      failedFilters.push(`Max active trades limit reached (${totalActiveTrades}/${maxAllowedTrades} open trade). Strictly 1 open trade allowed at a time.`);
       return null;
     } else {
-      passedFilters.push('Active trades capacity available');
+      passedFilters.push('Strict 1 active trade slot available');
     }
 
     // Helper to check if a strategy family is already active on this index
@@ -836,7 +830,7 @@ export class StrategyEngine {
     signal.exitPrice = exitPrice;
     signal.exitTime = Date.now();
 
-    const lotQuantity = signal.index === 'NIFTY' ? 50 : 15;
+    const lotQuantity = 25;
     const stratKey = signal.strategy_family ? signal.strategy_family.toLowerCase() : '';
     const stratLotConfig = (this.settings.strategies as any)[stratKey]?.lotSize;
     const lots = stratLotConfig || this.settings.defaultLotsPerTrade || 1;
