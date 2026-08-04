@@ -1,14 +1,19 @@
 import axios from 'axios';
 import { WebSocketServer, WebSocket } from 'ws';
+import fs from 'fs';
+import path from 'path';
 import { StrategyEngine } from './strategy-engine.js';
-import { InstrumentData, AppState, AppSettings, Signal } from './types.js';
+import { InstrumentData, AppState, AppSettings, Signal, OptionChainSnapshot } from './types.js';
 import { insertTick } from '../db/market.js';
 
 export class UpstoxService {
   private wss: WebSocketServer;
   private clients: Set<WebSocket> = new Set();
   private pollingInterval: NodeJS.Timeout | null = null;
+  private oneMinRecorderInterval: NodeJS.Timeout | null = null;
   private strategyEngine: StrategyEngine;
+  public optionChainHistory: OptionChainSnapshot[] = [];
+  private historyFilePath = path.join(process.cwd(), 'data', 'option_chain_history.json');
   
   private settings: AppSettings = {
     apiKey: process.env.UPSTOX_API_KEY || 'b054bae2-c8eb-448e-a9d4-aacd4d355003',
@@ -96,6 +101,57 @@ export class UpstoxService {
   }
 
 
+  private loadOptionChainHistoryFromDisk() {
+    try {
+      if (fs.existsSync(this.historyFilePath)) {
+        const raw = fs.readFileSync(this.historyFilePath, 'utf-8');
+        const json = JSON.parse(raw);
+        if (Array.isArray(json)) {
+          this.optionChainHistory = json;
+          console.log(`Loaded ${json.length} recorded 1-min option chain snapshots from disk.`);
+        }
+      }
+    } catch (e) {
+      console.error("Failed to load option chain history from disk:", e);
+    }
+  }
+
+  private saveOptionChainHistoryToDisk() {
+    try {
+      const dir = path.dirname(this.historyFilePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.writeFileSync(this.historyFilePath, JSON.stringify(this.optionChainHistory, null, 2), 'utf-8');
+    } catch (e) {
+      console.error("Failed to save option chain history to disk:", e);
+    }
+  }
+
+  private startOneMinOptionChainRecorder() {
+    if (this.oneMinRecorderInterval) {
+      clearInterval(this.oneMinRecorderInterval);
+    }
+
+    console.log("Starting 1-Minute Option Chain Recording Engine...");
+    
+    // Trigger immediately once, then schedule every 60 seconds (1 minute)
+    this.recordOneMinOptionChain();
+    this.oneMinRecorderInterval = setInterval(() => {
+      this.recordOneMinOptionChain();
+    }, 60000);
+  }
+
+  private async recordOneMinOptionChain() {
+    if (!this.settings.accessToken) return;
+    try {
+      const niftyExpiry = await this.getNearestExpiry('NSE_INDEX|Nifty 50');
+      await this.getOptionChain('NSE_INDEX|Nifty 50', niftyExpiry);
+    } catch (e) {
+      console.error("Error in 1-min option chain recording tick:", e);
+    }
+  }
+
   constructor(wss: WebSocketServer) {
     this.wss = wss;
     this.strategyEngine = new StrategyEngine(
@@ -105,10 +161,16 @@ export class UpstoxService {
       this.getOptionChain.bind(this),
       this.getNearestExpiry.bind(this)
     );
+
+    // Load recorded 1-minute option chain history from disk
+    this.loadOptionChainHistoryFromDisk();
     
     if (this.settings.accessToken && this.settings.isTradingEnabled) {
       this.startPolling();
     }
+
+    // Always run the 1-minute Option Chain recording loop during server runtime
+    this.startOneMinOptionChainRecorder();
 
     this.wss.on('connection', (ws) => {
       this.clients.add(ws);
@@ -217,6 +279,10 @@ export class UpstoxService {
           this.state.apiError = undefined;
           const result = { status: "success", data: rawRows, source: "UPSTOX_REALTIME" };
           this.optionChainCache[cacheKey] = { timestamp: Date.now(), data: result };
+
+          // Record snapshot for backtest / analysis replay
+          this.recordOptionChainSnapshot(instrumentKey, expiryDate, rawRows);
+
           return result;
         }
       } catch (error: any) {
@@ -508,6 +574,96 @@ export class UpstoxService {
     this.state.realizedPnL = realized;
     this.state.unrealizedPnL = unrealized;
     this.state.overallPnL = realized + unrealized;
+  }
+
+  private recordOptionChainSnapshot(instrumentKey: string, expiryDate: string, rawRows: any[]) {
+    try {
+      if (!rawRows || rawRows.length === 0) return;
+      const spot = Number(rawRows[0].underlying_spot_price || 0);
+      let totalCallOI = 0;
+      let totalPutOI = 0;
+      let maxCallOI = -1;
+      let maxPutOI = -1;
+      let maxCallStrike = 0;
+      let maxPutStrike = 0;
+
+      for (const r of rawRows) {
+        const coi = r.call_options?.market_data?.oi || 0;
+        const poi = r.put_options?.market_data?.oi || 0;
+        totalCallOI += coi;
+        totalPutOI += poi;
+        if (coi > maxCallOI) {
+          maxCallOI = coi;
+          maxCallStrike = r.strike_price;
+        }
+        if (poi > maxPutOI) {
+          maxPutOI = poi;
+          maxPutStrike = r.strike_price;
+        }
+      }
+
+      const pcr = totalCallOI > 0 ? Number((totalPutOI / totalCallOI).toFixed(2)) : 0;
+      const nowMs = Date.now();
+      
+      // Filter last snap for same instrument
+      const matchingSnaps = this.optionChainHistory.filter(s => s.instrumentKey === instrumentKey);
+      const lastSnap = matchingSnaps[matchingSnaps.length - 1];
+
+      // Enforce 1-minute recording interval (>= 50 seconds apart)
+      if (!lastSnap || (nowMs - lastSnap.timestamp >= 50000)) {
+        const snap: OptionChainSnapshot = {
+          id: `OC_1M_${nowMs}`,
+          timestamp: nowMs,
+          timeISO: new Date(nowMs).toISOString(),
+          instrumentKey,
+          expiryDate: expiryDate || 'CURRENT',
+          spotPrice: spot,
+          totalCallOI,
+          totalPutOI,
+          pcr,
+          maxCallOIStrike: maxCallStrike,
+          maxPutOIStrike: maxPutStrike,
+          strikeCount: rawRows.length,
+          rows: rawRows.map((r: any) => ({
+            strike: r.strike_price,
+            spot: r.underlying_spot_price,
+            ce: {
+              price: r.call_options?.market_data?.ltp || 0,
+              oi: r.call_options?.market_data?.oi || 0,
+              oiChange: r.call_options?.market_data?.oi_change || 0,
+              volume: r.call_options?.market_data?.volume || 0,
+              iv: r.call_options?.option_greeks?.iv || 0
+            },
+            pe: {
+              price: r.put_options?.market_data?.ltp || 0,
+              oi: r.put_options?.market_data?.oi || 0,
+              oiChange: r.put_options?.market_data?.oi_change || 0,
+              volume: r.put_options?.market_data?.volume || 0,
+              iv: r.put_options?.option_greeks?.iv || 0
+            }
+          }))
+        };
+
+        this.optionChainHistory.push(snap);
+        if (this.optionChainHistory.length > 5000) {
+          this.optionChainHistory.shift();
+        }
+
+        // Persist to disk asynchronously
+        this.saveOptionChainHistoryToDisk();
+      }
+    } catch (e) {
+      console.error("Error recording 1-min option chain snapshot:", e);
+    }
+  }
+
+  public getOptionChainHistory(): OptionChainSnapshot[] {
+    return this.optionChainHistory;
+  }
+
+  public clearOptionChainHistory() {
+    this.optionChainHistory = [];
+    this.saveOptionChainHistoryToDisk();
   }
 
   private broadcastState() {

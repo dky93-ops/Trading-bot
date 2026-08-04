@@ -8,6 +8,7 @@ import { Settings, Activity, Clock, ShieldAlert, BarChart3, TrendingUp, Power, S
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { OptionChainReplay } from './components/OptionChainReplay';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -277,6 +278,7 @@ export default function App() {
             { id: 'dashboard', label: '5 Core Strategies Dashboard' },
             { id: 'settings', label: 'Configure 5 Strategies' },
             { id: 'options', label: 'Live Option Chain' },
+            { id: 'replay', label: 'Option Chain Replay & History' },
             { id: 'logs', label: 'Execution Signals Log' },
           ].map(item => (
             <button
@@ -484,9 +486,17 @@ export default function App() {
                           ? `+₹${tradePnL.toLocaleString('en-IN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}` 
                           : `-₹${Math.abs(tradePnL).toLocaleString('en-IN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}`;
 
+                        const formatTimestamp = (ts: any) => {
+                          if (!ts) return '-';
+                          if (typeof ts === 'number') return new Date(ts).toLocaleTimeString();
+                          const d = new Date(ts);
+                          if (!isNaN(d.getTime())) return d.toLocaleTimeString();
+                          return String(ts);
+                        };
+
                         return (
                           <tr key={i} className="hover:bg-[#1F2937]/50">
-                            <td className="px-4 py-3 text-gray-400 whitespace-nowrap">{new Date(sig.timestamp).toLocaleTimeString()}</td>
+                            <td className="px-4 py-3 text-gray-400 whitespace-nowrap">{formatTimestamp(sig.timestamp)}</td>
                             <td className="px-4 py-3">
                               <span className={cn(
                                 "px-2 py-0.5 rounded text-[10px] font-bold uppercase",
@@ -542,6 +552,10 @@ export default function App() {
                 </table>
               </div>
             </div>
+          )}
+
+          {activeTab === 'replay' && (
+            <OptionChainReplay />
           )}
 
           {activeTab === 'settings' && settings && (
@@ -717,13 +731,68 @@ export default function App() {
                           <span className="text-gray-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded text-[9px]">Prompt Structure</span>
                         </div>
                         <div className="flex flex-wrap items-center justify-between gap-2 text-gray-400 pt-1">
-                          <div><span className="text-gray-500 mr-2 uppercase font-bold">Timeframes:</span> <span className="text-white font-bold">3 Min (Primary Snapshot) + 1 Min (Micro Execution)</span></div>
+                          <div><span className="text-gray-500 mr-2 uppercase font-bold">Timeframes:</span> <span className="text-white font-bold">1-Min Live Option-Chain Updates (Completed 1m)</span></div>
                           <div><span className="text-gray-500 mr-2 uppercase font-bold">Optimal Window:</span> <span className="text-brand-blue font-bold">{win}</span></div>
                         </div>
                       </div>
                     </div>
                   );
                 })}
+              </div>
+
+              {/* 18-Rule Quantitative Trade Audit Checklist & Order Pipeline */}
+              <div className="bg-[#111827] border border-[#1F2937] rounded-lg p-6 mt-8">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[#1F2937] pb-4 mb-6">
+                  <div>
+                    <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-brand-green animate-pulse"></span>
+                      18-Rule Quantitative Trade Audit Checklist
+                    </h3>
+                    <p className="text-xs text-gray-400 mt-1">
+                      Strict internal execution pipeline for fake-signal filtering & precision entry validation
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 bg-[#0A0F1C] border border-brand-green/30 px-3 py-1.5 rounded-md text-xs font-mono text-brand-green">
+                    <span className="font-bold">Execution Order:</span>
+                    <span className="text-gray-300">Time → Levels → Retest → Premium → OI → Room → R:R → Chop → Decision</span>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 font-mono text-xs">
+                  {[
+                    { id: 1, title: 'Capture session state', desc: 'Store session H/L, ORH/ORL, PDH/PDL, CE/PE walls, last broken/failed level, failedLevelsToday' },
+                    { id: 2, title: 'Use only completed candles', desc: 'Evaluate signals ONLY after 1m candle closes. Ignore incomplete live updates' },
+                    { id: 3, title: 'Apply time filter first', desc: 'Hard block 09:15-09:30 AM IST opening noise. Prefer 09:30-14:45. Strict block post 15:15 IST' },
+                    { id: 4, title: 'Detect meaningful levels', desc: 'Accept ORH/ORL, PDH/PDL, session H/L, dominant OI walls only. Ignore weak levels' },
+                    { id: 5, title: 'Validate wall strength', desc: 'Mark wall only if OI >= 1.5x surrounding strikes AND stable (no rapid unwinding)' },
+                    { id: 6, title: 'Require clear break/rejection', desc: 'Price must clearly break level or reject wall. Sideways/mixed action = NO_TRADE' },
+                    { id: 7, title: 'Require confirmation', desc: 'No entry on 1st touch or 1st break candle. Wait for retest or continuation pause' },
+                    { id: 8, title: 'Check retest quality', desc: 'Retest must hold in 3-5 bar window. Reject if level reclaimed quickly or shallow' },
+                    { id: 9, title: 'Confirm premium behavior', desc: 'CE premium must rise for CALLs, PE for PUTs. Stalled or weakening premium = REJECT' },
+                    { id: 10, title: 'Confirm OI direction', desc: 'Bullish requires PE support/CE unwind; Bearish requires CE wall/PE unwind' },
+                    { id: 11, title: 'Check room to target', desc: 'Ensure sufficient distance to next wall/swing level (Target 1 >= 0.8R)' },
+                    { id: 12, title: 'Enforce reward-to-risk rules', desc: 'Reject if T1 < 0.8R. Hard reject if Target 2 < 1.50R minimum threshold' },
+                    { id: 13, title: 'Block chop zones', desc: 'Reject trades when price is trapped between walls (< 30 pts) or repeated failed levels' },
+                    { id: 14, title: 'Prevent re-entry in same zone', desc: 'If level failed once today, block re-entry at same zone without fresh structure' },
+                    { id: 15, title: 'Reject overextended moves', desc: 'Continuation trades only if move < 1.5x impulse candle range from breakout' },
+                    { id: 16, title: 'Enforce candle-direction sanity', desc: 'Confirmation candle close MUST support trade direction (Green for CALL, Red for PUT)' },
+                    { id: 17, title: 'One trade per structure', desc: 'Allow strictly 1 primary trade per setup structure. Reset only on new structure' },
+                    { id: 18, title: 'Output a strict decision', desc: 'Return exactly one of: BUY_CALL, BUY_PUT, or NO_TRADE. If any filter fails = NO_TRADE' }
+                  ].map((rule) => (
+                    <div key={rule.id} className="bg-[#0A0F1C] border border-[#1F2937] rounded-md p-3 flex flex-col justify-between hover:border-brand-green/40 transition-colors">
+                      <div>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="text-[11px] font-bold text-brand-green uppercase">Rule #{rule.id}</span>
+                          <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded font-sans font-bold">
+                            ENFORCED
+                          </span>
+                        </div>
+                        <h4 className="text-xs font-bold text-white mb-1">{rule.title}</h4>
+                        <p className="text-[11px] text-gray-400 leading-normal font-sans">{rule.desc}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
           )}

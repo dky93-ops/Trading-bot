@@ -102,6 +102,37 @@ async function startServer() {
     }
   });
 
+  // Option Chain Recorded History API for Backtest & Analysis Replay
+  app.get("/api/option-chain/history", (req, res) => {
+    try {
+      const history = upstoxService.getOptionChainHistory();
+      res.json({ status: "success", count: history.length, snapshots: history });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/option-chain/clear", (req, res) => {
+    try {
+      upstoxService.clearOptionChainHistory();
+      res.json({ success: true, message: "Option chain history cleared." });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/option-chain/export", (req, res) => {
+    try {
+      const history = upstoxService.getOptionChainHistory();
+      const filename = `option_chain_replay_${new Date().toISOString().slice(0, 10)}.json`;
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(JSON.stringify(history, null, 2));
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // Market News & OI Context API
   app.get("/api/market-news", async (req, res) => {
     try {

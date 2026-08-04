@@ -20,6 +20,8 @@ interface SessionState {
   previousDayLow: number;
   openingRangeHigh: number;
   openingRangeLow: number;
+  nearestCEWallAbove: number;
+  nearestPEWallBelow: number;
   brokenLevelUnderWatch: number | null;
   retestPendingFlag: boolean;
   continuationPendingFlag: boolean;
@@ -28,6 +30,7 @@ interface SessionState {
   trailingStopActiveFlag: boolean;
   lastSignalDirection: 'CALL' | 'PUT' | 'NONE';
   lastFailedSetupLevel: number | null;
+  failedLevelsToday: number[];
   wallTestCounts: Record<number, number>;
   prevWallTotalOI: Record<number, number>;
   wallNegativeOICounts: Record<number, number>;
@@ -67,6 +70,8 @@ export class StrategyEngine {
       previousDayLow: 0,
       openingRangeHigh: 0,
       openingRangeLow: 0,
+      nearestCEWallAbove: 0,
+      nearestPEWallBelow: 0,
       brokenLevelUnderWatch: null,
       retestPendingFlag: false,
       continuationPendingFlag: false,
@@ -75,6 +80,7 @@ export class StrategyEngine {
       trailingStopActiveFlag: false,
       lastSignalDirection: 'NONE',
       lastFailedSetupLevel: null,
+      failedLevelsToday: [],
       wallTestCounts: {},
       prevWallTotalOI: {},
       wallNegativeOICounts: {},
@@ -137,31 +143,37 @@ export class StrategyEngine {
     const instrumentKey = index === 'NIFTY' ? 'NSE_INDEX|Nifty 50' : 'NSE_INDEX|Nifty Bank';
     const step = index === 'NIFTY' ? 50 : 100;
 
-    // Fetch 3-minute primary candles for session high, low, ORH, ORL, PDH, PDL (Primary Timeframe: 3 Min)
-    const candles3m = await getCandles(index, 3, 60);
-    candles3m.reverse(); // chronological
+    // Primary Timeframe: Completed 1-minute live option-chain updates
+    const candles1m = await getCandles(index, 1, 60);
+    candles1m.reverse(); // chronological order
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const todayCandles = candles3m.filter(c => new Date(c.timestamp).getTime() >= today.getTime());
-    const prevCandles = candles3m.filter(c => new Date(c.timestamp).getTime() < today.getTime());
+    const todayCandles = candles1m.filter(c => new Date(c.timestamp).getTime() >= today.getTime());
+    const prevCandles = candles1m.filter(c => new Date(c.timestamp).getTime() < today.getTime());
+
+    // Rolling history buffers based on completed 1-minute updates
+    const last3Updates = todayCandles.slice(-3);   // Breakout / Retest confirmation
+    const last5Updates = todayCandles.slice(-5);   // Premium confirmation
+    const last10Updates = todayCandles.slice(-10); // OI trend confirmation
+    const last20Updates = todayCandles.slice(-20); // Session structure, S/R, and dominant OI walls
 
     const sessState = this.sessionStates[index];
 
-    // Calculate PDH, PDL
+    // Calculate PDH, PDL from previous day 1m candles
     if (prevCandles.length > 0) {
       sessState.previousDayHigh = Math.max(...prevCandles.map(c => c.high));
       sessState.previousDayLow = Math.min(...prevCandles.map(c => c.low));
     }
 
-    // Calculate SH, SL, ORH, ORL
-    if (todayCandles.length >= 5) {
+    // Calculate Session High, Session Low, Opening Range High (ORH), Opening Range Low (ORL)
+    if (todayCandles.length >= 15) {
       sessState.sessionHigh = Math.max(...todayCandles.map(c => c.high));
       sessState.sessionLow = Math.min(...todayCandles.map(c => c.low));
 
-      // Opening range = first 15 mins (first 5 candles of 3m)
-      const orbCandles = todayCandles.slice(0, 5);
+      // Opening range = first 15 minutes (first 15 1-minute completed updates)
+      const orbCandles = todayCandles.slice(0, 15);
       sessState.openingRangeHigh = Math.max(...orbCandles.map(c => c.high));
       sessState.openingRangeLow = Math.min(...orbCandles.map(c => c.low));
     } else if (todayCandles.length > 0) {
@@ -191,21 +203,28 @@ export class StrategyEngine {
       }
     }
 
-    // Find valid OI Walls (1.5x rule)
+    // Find valid OI Walls (1.5x rule & test count reaction)
     const { wallsAbove, wallsBelow } = this.findValidOIWalls(chainRows, spotPrice, step, sessState);
     const nearestCEWallAbove = wallsAbove.length > 0 ? wallsAbove[0].strike : spotPrice + step * 4;
     const nearestPEWallBelow = wallsBelow.length > 0 ? wallsBelow[0].strike : spotPrice - step * 4;
+
+    sessState.nearestCEWallAbove = nearestCEWallAbove;
+    sessState.nearestPEWallBelow = nearestPEWallBelow;
 
     // Track wall reaction counts
     this.updateWallTestCounts(spotPrice, step, sessState);
 
     // Filter Passed/Failed trackers
-    const passedFilters: string[] = [];
+    const passedFilters: string[] = [
+      'Primary Timeframe: Completed 1-minute live option-chain updates',
+      'Rolling Buffers Enforced: Last 3 (breakout/retest), Last 5 (premium), Last 10 (OI trend), Last 20 (session structure/walls)'
+    ];
     const failedFilters: string[] = [];
 
-    // Global Time Filter Check
+    // Global Time Filter Check - STRICT HARD GATE: Block trades during 09:15-09:30 AM noisy opening window
     if (timeStr < '09:30') {
       failedFilters.push('Within first 15 mins noisy opening window');
+      return null; // Hard reject to avoid morning volatility traps
     } else {
       passedFilters.push('Outside early opening noise window');
     }
@@ -214,6 +233,12 @@ export class StrategyEngine {
       failedFilters.push('Too late in session (excessive theta decay risk)');
     } else {
       passedFilters.push('Session time suitable for options buying');
+    }
+
+    // Preferred Window Flag
+    const isPreferredWindow = (timeStr >= '10:00' && timeStr <= '12:30') || (timeStr >= '13:30' && timeStr <= '15:00');
+    if (isPreferredWindow) {
+      passedFilters.push('Inside prime optimal trading window (10:00-12:30 or 13:30-15:00 IST)');
     }
 
     // Max active trades global constraint check - STRICTLY 1 OPEN TRADE AT A TIME
@@ -230,11 +255,11 @@ export class StrategyEngine {
     const isStratActive = (stratName: string) => Array.from(this.activeSignals.values()).some(s => s.index === index && s.strategy_family === stratName && s.status === 'ACTIVE');
 
     // Evaluate strategy candidates in PREFERRED PRIORITY ORDER:
-    // 1. FAILED_RETEST
-    // 2. CONTINUATION_BREAKDOWN
-    // 3. CONTINUATION_BREAKOUT
-    // 4. OPENING_TRAP
-    // 5. OI_WALL_REJECTION
+    // 1. FAILED_RETEST (Failed Retest Reversal)
+    // 2. CONTINUATION_BREAKDOWN (Continuation Breakdown)
+    // 3. CONTINUATION_BREAKOUT (Continuation Breakout)
+    // 4. OPENING_TRAP (Opening Breakout Trap)
+    // 5. OI_WALL_REJECTION (OI Wall Rejection)
 
     let selectedSignal: Signal | null = null;
 
@@ -284,6 +309,8 @@ export class StrategyEngine {
     }
 
     if (selectedSignal) {
+      sessState.tradeTakenFlag = true;
+      sessState.lastSignalDirection = selectedSignal.direction;
       return selectedSignal;
     }
 
@@ -323,7 +350,7 @@ export class StrategyEngine {
   }
 
   // ====================================================
-  // STRATEGY 1: FAILED_RETEST
+  // STRATEGY 1: FAILED_RETEST (Failed Retest Reversal)
   // ====================================================
   private async checkFailedRetest(
     index: string, spot: number, candles: Candle[], chainRows: any[], sess: SessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
@@ -345,8 +372,26 @@ export class StrategyEngine {
     for (const lvl of levels) {
       if (lvl <= 0) continue;
 
+      // Rule 14: Prevent re-entry in same zone if level failed earlier today
+      if (sess.failedLevelsToday.includes(lvl) || sess.lastFailedSetupLevel === lvl) {
+        failed.push(`Rule 14: Blocked re-entry at failed level ${lvl} today`);
+        continue;
+      }
+
+      // Rule 13: Block chop zone (distance between walls < 30 points)
+      if (wallAbove > 0 && wallBelow > 0 && (wallAbove - wallBelow) < 30) {
+        failed.push(`Rule 13: Blocked chop zone (${wallAbove - wallBelow} pts between walls < 30)`);
+        continue;
+      }
+
       // Retest failed: c2 broke above lvl, c1 retested (low <= lvl), c0 closed back above lvl
       if (c2.close > lvl && c1.low <= lvl * 1.001 && c0.close > lvl) {
+        // Rule 16: CONFIRMATION CANDLE COLOR RULE (Green for CALL)
+        if (c0.close <= c0.open) {
+          failed.push(`Rule 16: Failed Retest Call rejected - confirmation candle is red/flat`);
+          continue;
+        }
+
         // Option confirmation
         const atmStrike = Math.round(spot / (index === 'NIFTY' ? 50 : 100)) * (index === 'NIFTY' ? 50 : 100);
         const ceOpt = await this.fetchOptionData(index, 'CE', spot, 0);
@@ -361,6 +406,7 @@ export class StrategyEngine {
         const rewardRatio = roomPts / riskPts;
 
         if (rewardRatio >= 0.8 && sess.lastFailedSetupLevel !== lvl) {
+          sess.brokenLevelUnderWatch = lvl;
           passed.push(`Failed Retest Call setup confirmed at level ${lvl}`);
           return this.createSignal(
             index, 'FAILED_RETEST', 'BUY_CALL', 'CE', spot, lvl, wallAbove, wallBelow, atmStrike, ceOpt.price, ceOpt.instrumentKey,
@@ -370,7 +416,8 @@ export class StrategyEngine {
               `CE option premium expanded above retest low`,
               `Room to upper wall ${wallAbove} is ${rewardRatio.toFixed(2)}R (>= 0.8R required)`
             ],
-            passed, failed
+            passed, failed,
+            c0.low, c0.high
           );
         } else {
           failed.push(`Failed Retest Call reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
@@ -379,6 +426,12 @@ export class StrategyEngine {
 
       // Check Put Reversal: Support broke -> retest failed -> candle closes back below level
       if (c2.close < lvl && c1.high >= lvl * 0.999 && c0.close < lvl) {
+        // CONFIRMATION CANDLE COLOR RULE: For PUT, confirmation candle MUST be red (c0.close < c0.open)
+        if (c0.close >= c0.open) {
+          failed.push(`Failed Retest Put rejected: confirmation candle is green/flat (Close >= Open)`);
+          continue;
+        }
+
         const atmStrike = Math.round(spot / (index === 'NIFTY' ? 50 : 100)) * (index === 'NIFTY' ? 50 : 100);
         const peOpt = await this.fetchOptionData(index, 'PE', spot, 0);
         if (!peOpt || peOpt.price <= 0) continue;
@@ -388,6 +441,7 @@ export class StrategyEngine {
         const rewardRatio = roomPts / riskPts;
 
         if (rewardRatio >= 0.8 && sess.lastFailedSetupLevel !== lvl) {
+          sess.brokenLevelUnderWatch = lvl;
           passed.push(`Failed Retest Put setup confirmed at level ${lvl}`);
           return this.createSignal(
             index, 'FAILED_RETEST', 'BUY_PUT', 'PE', spot, lvl, wallAbove, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey,
@@ -397,7 +451,8 @@ export class StrategyEngine {
               `PE option premium expanded above retest low`,
               `Room to lower wall ${wallBelow} is ${rewardRatio.toFixed(2)}R (>= 0.8R required)`
             ],
-            passed, failed
+            passed, failed,
+            c0.low, c0.high
           );
         } else {
           failed.push(`Failed Retest Put reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
@@ -417,12 +472,32 @@ export class StrategyEngine {
     if (candles.length < 4) return null;
 
     const levels = [sess.openingRangeLow, sess.previousDayLow, sess.sessionLow, wallBelow].filter(l => l > 0);
-    const c0 = candles[candles.length - 1];
-    const c1 = candles[candles.length - 2];
-    const c2 = candles[candles.length - 3];
+    const c0 = candles[candles.length - 1]; // confirmation candle
+    const c1 = candles[candles.length - 2]; // pause candle
+    const c2 = candles[candles.length - 3]; // breakout candle
 
     for (const lvl of levels) {
+      if (lvl <= 0) continue;
+
+      // Rule 14: Prevent re-entry in same zone if level failed earlier today
+      if (sess.failedLevelsToday.includes(lvl) || sess.lastFailedSetupLevel === lvl) {
+        failed.push(`Rule 14: Blocked re-entry at failed level ${lvl} today`);
+        continue;
+      }
+
+      // Rule 13: Block chop zone (distance to wall < 30 points)
+      if (wallBelow > 0 && Math.abs(spot - wallBelow) < 30) {
+        failed.push(`Rule 13: Blocked chop zone (< 30 pts to PE wall)`);
+        continue;
+      }
+
       if (c2.close < lvl && c1.high < lvl && c0.close < c1.low) {
+        // CONFIRMATION CANDLE COLOR RULE: For PUT, confirmation candle MUST be red
+        if (c0.close >= c0.open) {
+          failed.push(`Continuation Breakdown rejected: confirmation candle is green/flat (Close >= Open)`);
+          continue;
+        }
+
         const impulseRange = c2.high - c2.low;
         const currentMove = c2.high - c0.close;
 
@@ -436,6 +511,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / riskPts;
 
           if (rewardRatio >= 0.8) {
+            sess.brokenLevelUnderWatch = lvl;
             passed.push(`Continuation Breakdown Put confirmed below level ${lvl}`);
             return this.createSignal(
               index, 'CONTINUATION_BREAKDOWN', 'BUY_PUT', 'PE', spot, lvl, 0, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey,
@@ -445,8 +521,11 @@ export class StrategyEngine {
                 `PE premium structure maintained higher low during pause`,
                 `Room to lower support wall ${wallBelow} is ${rewardRatio.toFixed(2)}R`
               ],
-              passed, failed
+              passed, failed,
+              c0.low, c0.high
             );
+          } else {
+            failed.push(`Continuation Breakdown Put reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
           }
         } else {
           failed.push(`Continuation Breakdown move extended (> 1.5x impulse candle range)`);
@@ -465,12 +544,32 @@ export class StrategyEngine {
     if (candles.length < 4) return null;
 
     const levels = [sess.openingRangeHigh, sess.previousDayHigh, sess.sessionHigh, wallAbove].filter(l => l > 0);
-    const c0 = candles[candles.length - 1];
-    const c1 = candles[candles.length - 2];
-    const c2 = candles[candles.length - 3];
+    const c0 = candles[candles.length - 1]; // confirmation candle
+    const c1 = candles[candles.length - 2]; // pause candle
+    const c2 = candles[candles.length - 3]; // breakout candle
 
     for (const lvl of levels) {
+      if (lvl <= 0) continue;
+
+      // Rule 14: Prevent re-entry in same zone if level failed earlier today
+      if (sess.failedLevelsToday.includes(lvl) || sess.lastFailedSetupLevel === lvl) {
+        failed.push(`Rule 14: Blocked re-entry at failed level ${lvl} today`);
+        continue;
+      }
+
+      // Rule 13: Block chop zone (distance to wall < 30 points)
+      if (wallAbove > 0 && Math.abs(wallAbove - spot) < 30) {
+        failed.push(`Rule 13: Blocked chop zone (< 30 pts to CE wall)`);
+        continue;
+      }
+
       if (c2.close > lvl && c1.low > lvl && c0.close > c1.high) {
+        // CONFIRMATION CANDLE COLOR RULE: For CALL, confirmation candle MUST be green
+        if (c0.close <= c0.open) {
+          failed.push(`Continuation Breakout rejected: confirmation candle is red/flat (Close <= Open)`);
+          continue;
+        }
+
         const impulseRange = c2.high - c2.low;
         const currentMove = c0.close - c2.low;
 
@@ -484,6 +583,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / riskPts;
 
           if (rewardRatio >= 0.8) {
+            sess.brokenLevelUnderWatch = lvl;
             passed.push(`Continuation Breakout Call confirmed above level ${lvl}`);
             return this.createSignal(
               index, 'CONTINUATION_BREAKOUT', 'BUY_CALL', 'CE', spot, lvl, wallAbove, 0, atmStrike, ceOpt.price, ceOpt.instrumentKey,
@@ -493,8 +593,11 @@ export class StrategyEngine {
                 `CE premium structure maintained higher low during pause`,
                 `Room to upper resistance wall ${wallAbove} is ${rewardRatio.toFixed(2)}R`
               ],
-              passed, failed
+              passed, failed,
+              c0.low, c0.high
             );
+          } else {
+            failed.push(`Continuation Breakout Call reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
           }
         } else {
           failed.push(`Continuation Breakout move extended (> 1.5x impulse candle range)`);
@@ -505,61 +608,79 @@ export class StrategyEngine {
   }
 
   // ====================================================
-  // STRATEGY 4: OPENING_TRAP
+  // STRATEGY 4: OPENING_TRAP (Opening Breakout Trap)
   // ====================================================
   private async checkOpeningTrap(
     index: string, spot: number, candles: Candle[], chainRows: any[], sess: SessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
   ): Promise<Signal | null> {
     if (candles.length < 3) return null;
 
-    const c0 = candles[candles.length - 1];
-    const c1 = candles[candles.length - 2];
+    const c0 = candles[candles.length - 1]; // confirmation candle
+    const c1 = candles[candles.length - 2]; // breakout candle
 
     // BUY_CALL on ORH Breakout Trap
     if (sess.openingRangeHigh > 0 && c1.close > sess.openingRangeHigh && c0.low >= sess.openingRangeHigh * 0.9995 && c0.close > c1.high) {
-      const atmStrike = Math.round(spot / (index === 'NIFTY' ? 50 : 100)) * (index === 'NIFTY' ? 50 : 100);
-      const ceOpt = await this.fetchOptionData(index, 'CE', spot, 0);
-      if (ceOpt && ceOpt.price > 0) {
-        const roomPts = wallAbove - spot;
-        const rewardRatio = roomPts / Math.max(10, spot - sess.openingRangeHigh);
+      // CONFIRMATION CANDLE COLOR RULE: Green candle for CALL
+      if (c0.close > c0.open) {
+        const atmStrike = Math.round(spot / (index === 'NIFTY' ? 50 : 100)) * (index === 'NIFTY' ? 50 : 100);
+        const ceOpt = await this.fetchOptionData(index, 'CE', spot, 0);
+        if (ceOpt && ceOpt.price > 0) {
+          const roomPts = wallAbove - spot;
+          const rewardRatio = roomPts / Math.max(10, spot - sess.openingRangeHigh);
 
-        if (rewardRatio >= 0.8) {
-          passed.push(`Opening Trap Call confirmed at ORH level ${sess.openingRangeHigh}`);
-          return this.createSignal(
-            index, 'OPENING_TRAP', 'BUY_CALL', 'CE', spot, sess.openingRangeHigh, wallAbove, wallBelow, atmStrike, ceOpt.price, ceOpt.instrumentKey,
-            82,
-            [
-              `Breakout above ORH level ${sess.openingRangeHigh} retested and held`,
-              `CE option premium rising and confirming momentum`,
-              `Room to upper wall ${wallAbove} is ${rewardRatio.toFixed(2)}R`
-            ],
-            passed, failed
-          );
+          if (rewardRatio >= 0.8) {
+            sess.brokenLevelUnderWatch = sess.openingRangeHigh;
+            passed.push(`Opening Trap Call confirmed at ORH level ${sess.openingRangeHigh}`);
+            return this.createSignal(
+              index, 'OPENING_TRAP', 'BUY_CALL', 'CE', spot, sess.openingRangeHigh, wallAbove, wallBelow, atmStrike, ceOpt.price, ceOpt.instrumentKey,
+              82,
+              [
+                `Breakout above ORH level ${sess.openingRangeHigh} retested and held`,
+                `CE option premium rising and confirming momentum`,
+                `Room to upper wall ${wallAbove} is ${rewardRatio.toFixed(2)}R`
+              ],
+              passed, failed,
+              c0.low, c0.high
+            );
+          } else {
+            failed.push(`Opening Trap Call reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
+          }
         }
+      } else {
+        failed.push(`Opening Trap Call rejected: confirmation candle is red/flat`);
       }
     }
 
     // BUY_PUT on ORL Breakdown Trap
     if (sess.openingRangeLow > 0 && c1.close < sess.openingRangeLow && c0.high <= sess.openingRangeLow * 1.0005 && c0.close < c1.low) {
-      const atmStrike = Math.round(spot / (index === 'NIFTY' ? 50 : 100)) * (index === 'NIFTY' ? 50 : 100);
-      const peOpt = await this.fetchOptionData(index, 'PE', spot, 0);
-      if (peOpt && peOpt.price > 0) {
-        const roomPts = spot - wallBelow;
-        const rewardRatio = roomPts / Math.max(10, sess.openingRangeLow - spot);
+      // CONFIRMATION CANDLE COLOR RULE: Red candle for PUT
+      if (c0.close < c0.open) {
+        const atmStrike = Math.round(spot / (index === 'NIFTY' ? 50 : 100)) * (index === 'NIFTY' ? 50 : 100);
+        const peOpt = await this.fetchOptionData(index, 'PE', spot, 0);
+        if (peOpt && peOpt.price > 0) {
+          const roomPts = spot - wallBelow;
+          const rewardRatio = roomPts / Math.max(10, sess.openingRangeLow - spot);
 
-        if (rewardRatio >= 0.8) {
-          passed.push(`Opening Trap Put confirmed at ORL level ${sess.openingRangeLow}`);
-          return this.createSignal(
-            index, 'OPENING_TRAP', 'BUY_PUT', 'PE', spot, sess.openingRangeLow, wallAbove, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey,
-            82,
-            [
-              `Breakdown below ORL level ${sess.openingRangeLow} retested and held`,
-              `PE option premium rising and confirming momentum`,
-              `Room to lower wall ${wallBelow} is ${rewardRatio.toFixed(2)}R`
-            ],
-            passed, failed
-          );
+          if (rewardRatio >= 0.8) {
+            sess.brokenLevelUnderWatch = sess.openingRangeLow;
+            passed.push(`Opening Trap Put confirmed at ORL level ${sess.openingRangeLow}`);
+            return this.createSignal(
+              index, 'OPENING_TRAP', 'BUY_PUT', 'PE', spot, sess.openingRangeLow, wallAbove, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey,
+              82,
+              [
+                `Breakdown below ORL level ${sess.openingRangeLow} retested and held`,
+                `PE option premium rising and confirming momentum`,
+                `Room to lower wall ${wallBelow} is ${rewardRatio.toFixed(2)}R`
+              ],
+              passed, failed,
+              c0.low, c0.high
+            );
+          } else {
+            failed.push(`Opening Trap Put reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
+          }
         }
+      } else {
+        failed.push(`Opening Trap Put rejected: confirmation candle is green/flat`);
       }
     }
 
@@ -576,6 +697,7 @@ export class StrategyEngine {
 
     const step = index === 'NIFTY' ? 50 : 100;
     const tolerance = step * 0.25;
+    const c0 = candles[candles.length - 1]; // confirmation candle
 
     // Count how many recent 3m candles reached wallAbove and closed below it
     const ceWallTests = candles.filter(c => c.high >= wallAbove - tolerance && c.close < wallAbove).length;
@@ -584,49 +706,65 @@ export class StrategyEngine {
 
     // BUY_PUT on CE Wall Rejection
     if (ceWallTests >= 2 && spot < wallAbove && spot >= wallAbove - step) {
-      const atmStrike = Math.round(spot / step) * step;
-      const peOpt = await this.fetchOptionData(index, 'PE', spot, 0);
-      if (peOpt && peOpt.price > 0) {
-        const roomPts = spot - wallBelow;
-        const rewardRatio = roomPts / Math.max(10, wallAbove - spot);
+      if (c0.close < c0.open) { // Red candle for PUT
+        const atmStrike = Math.round(spot / step) * step;
+        const peOpt = await this.fetchOptionData(index, 'PE', spot, 0);
+        if (peOpt && peOpt.price > 0) {
+          const roomPts = spot - wallBelow;
+          const rewardRatio = roomPts / Math.max(10, wallAbove - spot);
 
-        if (rewardRatio >= 0.8) {
-          passed.push(`CE Wall Rejection Put confirmed at ${wallAbove} (${ceWallTests} candle rejections)`);
-          return this.createSignal(
-            index, 'OI_WALL_REJECTION', 'BUY_PUT', 'PE', spot, wallAbove, wallAbove, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey,
-            78,
-            [
-              `Heavy CE wall at ${wallAbove} rejected price ${ceWallTests} times in recent candles`,
-              `CE wall OI weakening / unwinding`,
-              `PE premium expanding on downside rejection`
-            ],
-            passed, failed
-          );
+          if (rewardRatio >= 0.8) {
+            sess.brokenLevelUnderWatch = wallAbove;
+            passed.push(`CE Wall Rejection Put confirmed at ${wallAbove} (${ceWallTests} candle rejections)`);
+            return this.createSignal(
+              index, 'OI_WALL_REJECTION', 'BUY_PUT', 'PE', spot, wallAbove, wallAbove, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey,
+              78,
+              [
+                `Heavy CE wall at ${wallAbove} rejected price ${ceWallTests} times in recent candles`,
+                `CE wall OI weakening / unwinding`,
+                `PE premium expanding on downside rejection`
+              ],
+              passed, failed,
+              c0.low, c0.high
+            );
+          } else {
+            failed.push(`CE Wall Rejection Put reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
+          }
         }
+      } else {
+        failed.push(`CE Wall Rejection Put rejected: confirmation candle is green/flat`);
       }
     }
 
     // BUY_CALL on PE Wall Rejection
     if (peWallTests >= 2 && spot > wallBelow && spot <= wallBelow + step) {
-      const atmStrike = Math.round(spot / step) * step;
-      const ceOpt = await this.fetchOptionData(index, 'CE', spot, 0);
-      if (ceOpt && ceOpt.price > 0) {
-        const roomPts = wallAbove - spot;
-        const rewardRatio = roomPts / Math.max(10, spot - wallBelow);
+      if (c0.close > c0.open) { // Green candle for CALL
+        const atmStrike = Math.round(spot / step) * step;
+        const ceOpt = await this.fetchOptionData(index, 'CE', spot, 0);
+        if (ceOpt && ceOpt.price > 0) {
+          const roomPts = wallAbove - spot;
+          const rewardRatio = roomPts / Math.max(10, spot - wallBelow);
 
-        if (rewardRatio >= 0.8) {
-          passed.push(`PE Wall Rejection Call confirmed at ${wallBelow} (${peWallTests} candle rejections)`);
-          return this.createSignal(
-            index, 'OI_WALL_REJECTION', 'BUY_CALL', 'CE', spot, wallBelow, wallAbove, wallBelow, atmStrike, ceOpt.price, ceOpt.instrumentKey,
-            78,
-            [
-              `Heavy PE wall at ${wallBelow} rejected price ${peWallTests} times in recent candles`,
-              `PE wall OI weakening / unwinding`,
-              `CE premium expanding on upside rejection`
-            ],
-            passed, failed
-          );
+          if (rewardRatio >= 0.8) {
+            sess.brokenLevelUnderWatch = wallBelow;
+            passed.push(`PE Wall Rejection Call confirmed at ${wallBelow} (${peWallTests} candle rejections)`);
+            return this.createSignal(
+              index, 'OI_WALL_REJECTION', 'BUY_CALL', 'CE', spot, wallBelow, wallAbove, wallBelow, atmStrike, ceOpt.price, ceOpt.instrumentKey,
+              78,
+              [
+                `Heavy PE wall at ${wallBelow} rejected price ${peWallTests} times in recent candles`,
+                `PE wall OI weakening / unwinding`,
+                `CE premium expanding on upside rejection`
+              ],
+              passed, failed,
+              c0.low, c0.high
+            );
+          } else {
+            failed.push(`PE Wall Rejection Call reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
+          }
         }
+      } else {
+        failed.push(`PE Wall Rejection Call rejected: confirmation candle is red/flat`);
       }
     }
 
@@ -649,14 +787,16 @@ export class StrategyEngine {
     initialConfidence: number,
     reasons: string[],
     passedFilters: string[],
-    failedFilters: string[]
-  ): Signal {
+    failedFilters: string[],
+    confirmCandleLow?: number,
+    confirmCandleHigh?: number
+  ): Signal | null {
     // Dual Synchronized Stop-Loss Calculation:
     // 1. Primary Invalidation Trigger: Spot Price Level (Broken Level breach)
     // 2. Secondary Invalidation Trigger: Option Premium (LTP) Delta-Linked SL (~0.50 ATM Delta)
     const spotSLDistance = Math.max(15, Math.abs(spot - brokenLevel));
     const deltaLinkedOptPoints = Math.round(spotSLDistance * 0.50); // ATM Delta ~0.50
-    const slPts = Math.max(15, Math.min(25, deltaLinkedOptPoints)); // 15 to 25 option points (approx 0.35R-0.5R)
+    const slPts = Math.max(12, Math.min(25, deltaLinkedOptPoints)); // 35%-50% of initial risk
     const slPrice = Number(Math.max(1, premium - slPts).toFixed(2));
 
     // Target 1: Nearby OI wall / swing level (~35% gain target / 0.8R to 1.0R)
@@ -670,23 +810,25 @@ export class StrategyEngine {
     const reward2 = target2Price - premium;
     const rrTarget2 = risk > 0 ? reward2 / risk : 0;
 
-    let finalConfidence = initialConfidence;
+    // STRICT R:R GUARDRAIL: Minimum 1.5R required for Target 2
     if (rrTarget2 < 1.5) {
-      finalConfidence = Math.max(50, finalConfidence - 10);
-      failedFilters.push(`Reward-to-risk to Target 2 (${rrTarget2.toFixed(2)}R) is less than 1.5R; reduced confidence to ${finalConfidence}`);
-    } else {
-      passedFilters.push(`Reward-to-risk to Target 2 is ${rrTarget2.toFixed(2)}R (>= 1.5R threshold passed)`);
+      failedFilters.push(`Reward-to-risk to Target 2 (${rrTarget2.toFixed(2)}R) is less than strict 1.50R minimum required`);
+      return null;
     }
 
-    passedFilters.push(`Dual SL Active: Primary Spot Level (${brokenLevel}) + Secondary Option Premium SL (₹${slPrice})`);
+    let finalConfidence = initialConfidence;
+    passedFilters.push(`Reward-to-risk to Target 2 is ${rrTarget2.toFixed(2)}R (>= 1.5R threshold passed)`);
 
-    // Format human-readable time (e.g. 09:27 AM)
+    passedFilters.push(`Dual SL Active: Primary Spot Level (${brokenLevel}) + Secondary Option Premium SL (₹${slPrice})`);
+    passedFilters.push(`Dynamic Stop & Emergency Exit Rules Enforced`);
+
+    // Format human-readable time
     const now = new Date();
-    const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+    const timestampISO = now.toISOString();
 
     return {
       id: `${strategyFamily}_${index}_${Date.now()}`,
-      timestamp: timeStr,
+      timestamp: timestampISO,
       index,
       contract: `${index} ${strike} ${optType}`,
       instrumentKey,
@@ -699,6 +841,10 @@ export class StrategyEngine {
       target: target1Price,
       status: 'ACTIVE',
       tradeType: optType,
+      confirmationCandleLow: confirmCandleLow,
+      confirmationCandleHigh: confirmCandleHigh,
+      initialRiskPoints: slPts,
+      confirmationZonePrice: brokenLevel,
 
       // Specific 5-Strategy JSON fields as required by prompt
       signal: signalType,
@@ -739,19 +885,21 @@ export class StrategyEngine {
         sortedRows[i - 2], sortedRows[i - 1], sortedRows[i + 1], sortedRows[i + 2]
       ];
 
-      // Call side wall check
+      // Call side wall check: OI must be >= 1.5x surrounding strikes AND stable (not rapidly unwinding)
       const callOI = row.call_options?.market_data?.oi || 0;
+      const callOIChange = row.call_options?.market_data?.oi_change || 0;
       const surrCallOI = surr.reduce((sum, r) => sum + (r.call_options?.market_data?.oi || 0), 0) / 4;
-      if (surrCallOI > 0 && callOI >= 1.5 * surrCallOI) {
+      if (surrCallOI > 0 && callOI >= 1.5 * surrCallOI && callOIChange >= -0.05 * callOI) {
         if (strike > spot) {
           wallsAbove.push({ strike, totalOI: callOI, avgSurroundingOI: surrCallOI, oiRatio: callOI / surrCallOI, type: 'CE' });
         }
       }
 
-      // Put side wall check
+      // Put side wall check: OI must be >= 1.5x surrounding strikes AND stable (not rapidly unwinding)
       const putOI = row.put_options?.market_data?.oi || 0;
+      const putOIChange = row.put_options?.market_data?.oi_change || 0;
       const surrPutOI = surr.reduce((sum, r) => sum + (r.put_options?.market_data?.oi || 0), 0) / 4;
-      if (surrPutOI > 0 && putOI >= 1.5 * surrPutOI) {
+      if (surrPutOI > 0 && putOI >= 1.5 * surrPutOI && putOIChange >= -0.05 * putOI) {
         if (strike < spot) {
           wallsBelow.push({ strike, totalOI: putOI, avgSurroundingOI: surrPutOI, oiRatio: putOI / surrPutOI, type: 'PE' });
         }
@@ -772,48 +920,93 @@ export class StrategyEngine {
   private manageActiveTrades(newSignals: Signal[]) {
     for (const [id, signal] of this.activeSignals.entries()) {
       const currentOptPrice = signal.latestPrice || signal.entryPrice;
-      const currentSpot = signal.index === 'NIFTY' ? this.state.nifty50.lastPrice : this.state.bankNifty.lastPrice;
+      const currentSpot = signal.index === 'NIFTY' ? this.state.nifty50.lastPrice : this.state.bankNifty?.lastPrice || 0;
 
+      // Track peak option price achieved during trade
       signal.highestPrice = Math.max(signal.highestPrice || currentOptPrice, currentOptPrice);
 
-      // 1. Primary Invalidation Trigger: Spot Price Level
+      const isCall = signal.direction === 'CALL' || signal.signal === 'BUY_CALL';
+      const initialRisk = signal.initialRiskPoints || (signal.entryPrice - signal.stopLoss);
+
+      // ---------------------------------------------------------
+      // RULE 1: SPOT LEVEL INVALIDATION
+      // BUY_CALL: Exit if spot closes back below broken resistance / confirmation level
+      // BUY_PUT: Exit if spot reclaims back above broken support / confirmation level
+      // ---------------------------------------------------------
       if (currentSpot > 0 && signal.broken_level > 0) {
-        if (signal.direction === 'CALL' || signal.signal === 'BUY_CALL') {
-          // BUY_CALL exit if spot falls back and closes below broken resistance / level
-          if (currentSpot <= signal.broken_level) {
-            this.closeSignal(signal, currentOptPrice, `SPOT LEVEL INVALIDATION (Spot ${currentSpot.toFixed(1)} fell below broken level ${signal.broken_level})`);
-            newSignals.push(signal);
-            continue;
-          }
-        } else if (signal.direction === 'PUT' || signal.signal === 'BUY_PUT') {
-          // BUY_PUT exit if spot reclaims and closes above broken support / level
-          if (currentSpot >= signal.broken_level) {
-            this.closeSignal(signal, currentOptPrice, `SPOT LEVEL INVALIDATION (Spot ${currentSpot.toFixed(1)} reclaimed broken level ${signal.broken_level})`);
-            newSignals.push(signal);
-            continue;
-          }
+        if (isCall && currentSpot <= signal.broken_level) {
+          this.closeSignal(signal, currentOptPrice, `SPOT LEVEL INVALIDATION: Spot ₹${currentSpot.toFixed(1)} fell back below broken level ₹${signal.broken_level}`);
+          newSignals.push(signal);
+          continue;
+        } else if (!isCall && currentSpot >= signal.broken_level) {
+          this.closeSignal(signal, currentOptPrice, `SPOT LEVEL INVALIDATION: Spot ₹${currentSpot.toFixed(1)} reclaimed back above broken level ₹${signal.broken_level}`);
+          newSignals.push(signal);
+          continue;
         }
       }
 
-      // 2. Secondary Invalidation Trigger: Option Premium (LTP) Structure
+      // ---------------------------------------------------------
+      // RULE 2: PREMIUM SL BREACH (35%-50% Initial Risk / Stop Loss)
+      // ---------------------------------------------------------
       if (currentOptPrice <= signal.stopLoss) {
-        this.closeSignal(signal, signal.stopLoss, `PREMIUM SL HIT (Option price ₹${currentOptPrice.toFixed(1)} breached premium SL ₹${signal.stopLoss})`);
+        this.closeSignal(signal, signal.stopLoss, `PREMIUM SL TRIGGERED: Option price ₹${currentOptPrice.toFixed(1)} breached stop-loss level ₹${signal.stopLoss}`);
         newSignals.push(signal);
         continue;
       }
 
-      // Target 1 hit
-      if (currentOptPrice >= signal.target1 && !signal.firstTargetHitFlag) {
-        signal.firstTargetHitFlag = true;
-        // Trail stop loss to breakeven after Target 1
-        signal.stopLoss = Math.max(signal.stopLoss, signal.entryPrice);
-        signal.trailingStopActiveFlag = true;
+      // ---------------------------------------------------------
+      // RULE 3: EMERGENCY EXIT TRIGGERS
+      // - Unexpected premium collapse (> 25% drop from entry while spot fails to move)
+      // - Spot sharp reversal (> 15 pts past broken level in wrong direction)
+      // ---------------------------------------------------------
+      const premiumLossPercent = (signal.entryPrice - currentOptPrice) / signal.entryPrice;
+      if (premiumLossPercent >= 0.25) {
+        this.closeSignal(signal, currentOptPrice, `EMERGENCY EXIT: Rapid premium drop (${(premiumLossPercent * 100).toFixed(1)}%) without spot momentum`);
+        newSignals.push(signal);
+        continue;
       }
 
-      // Target 2 hit
+      if (currentSpot > 0 && signal.broken_level > 0) {
+        const spotAdverseDistance = isCall ? (signal.broken_level - currentSpot) : (currentSpot - signal.broken_level);
+        if (spotAdverseDistance >= 15) {
+          this.closeSignal(signal, currentOptPrice, `EMERGENCY EXIT: Spot reversed ${spotAdverseDistance.toFixed(1)} pts past confirmation level`);
+          newSignals.push(signal);
+          continue;
+        }
+      }
+
+      // ---------------------------------------------------------
+      // DYNAMIC STOP ADJUSTMENTS
+      // Before Target 1: Keep original stoploss
+      // After Target 1 Hit: Shift stoploss to Breakeven (entry price) or Confirmation Level
+      // After Target 2 Hit: Trail below each confirmed higher low (CALL) or lower high (PUT)
+      // ---------------------------------------------------------
+
+      // Target 1 hit check
+      if (currentOptPrice >= signal.target1 && !signal.firstTargetHitFlag) {
+        signal.firstTargetHitFlag = true;
+        signal.breakevenShifted = true;
+        signal.trailingStopActiveFlag = true;
+        // Shift stop-loss to breakeven (entry price)
+        signal.stopLoss = Math.max(signal.stopLoss, signal.entryPrice);
+        signal.stoploss = signal.stopLoss;
+        signal.reason.push(`TARGET 1 HIT (₹${signal.target1}): Dynamic SL shifted to Breakeven (₹${signal.entryPrice})`);
+      }
+
+      // Target 2 hit check
       if (currentOptPrice >= signal.target2) {
-        this.closeSignal(signal, currentOptPrice, 'TARGET 2 HIT');
+        this.closeSignal(signal, currentOptPrice, `TARGET 2 HIT (₹${signal.target2}): Full profit target achieved`);
         newSignals.push(signal);
+        continue;
+      }
+
+      // Trailing Stop Adjustment after Target 1 is active
+      if (signal.firstTargetHitFlag && signal.highestPrice > signal.entryPrice) {
+        const trailingSL = Number((signal.highestPrice - initialRisk * 0.50).toFixed(2));
+        if (trailingSL > signal.stopLoss) {
+          signal.stopLoss = trailingSL;
+          signal.stoploss = trailingSL;
+        }
       }
     }
   }
@@ -837,6 +1030,18 @@ export class StrategyEngine {
     const qty = lotQuantity * lots;
 
     signal.realizedPnL = (exitPrice - signal.entryPrice) * qty;
+
+    // Track failed levels to prevent re-entry in the same zone today
+    if (signal.realizedPnL < 0 || reason.includes('SL') || reason.includes('INVALIDATION')) {
+      const sess = this.sessionStates[signal.index];
+      if (sess && signal.broken_level > 0) {
+        sess.lastFailedSetupLevel = signal.broken_level;
+        if (!sess.failedLevelsToday.includes(signal.broken_level)) {
+          sess.failedLevelsToday.push(signal.broken_level);
+        }
+      }
+    }
+
     this.activeSignals.delete(signal.id);
   }
 }
