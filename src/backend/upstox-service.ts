@@ -145,15 +145,9 @@ export class UpstoxService {
   private async recordOneMinOptionChain() {
     if (!this.settings.accessToken) return;
 
-    // Only record during market hours (09:15 to 15:30 IST)
-    const now = new Date();
-    const istTime = new Date(now.toLocaleString("en-US", {timeZone: "Asia/Kolkata"}));
-    const hours = istTime.getHours();
-    const minutes = istTime.getMinutes();
-    const timeStr = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
-    
-    if (timeStr < '09:15' || timeStr >= '15:31') {
-      return; // Outside market hours
+    // Only record during market hours
+    if (!this.strategyEngine.isMarketOpen()) {
+      return;
     }
 
     try {
@@ -428,7 +422,9 @@ export class UpstoxService {
               change: tick.net_change,
               timestamp: Date.now()
             };
-            insertTick('NIFTY', tick.last_price, Date.now());
+            if (this.strategyEngine.isMarketOpen()) {
+              insertTick('NIFTY', tick.last_price, Date.now());
+            }
           }
           if (data['NSE_INDEX:India VIX']) {
             const tick = data['NSE_INDEX:India VIX'];
@@ -437,7 +433,9 @@ export class UpstoxService {
               change: tick.net_change,
               timestamp: Date.now()
             };
-            insertTick('VIX', tick.last_price, Date.now());
+            if (this.strategyEngine.isMarketOpen()) {
+              insertTick('VIX', tick.last_price, Date.now());
+            }
           }
           
           // Update live prices for active options using exact instrument_token match from Upstox quote response
@@ -596,6 +594,7 @@ export class UpstoxService {
 
   private recordOptionChainSnapshot(instrumentKey: string, expiryDate: string, rawRows: any[]) {
     try {
+      if (!this.strategyEngine.isMarketOpen()) return;
       if (!rawRows || rawRows.length === 0) return;
       const spot = Number(rawRows[0].underlying_spot_price || 0);
       let totalCallOI = 0;

@@ -384,7 +384,7 @@ export default function App() {
                           } else {
                             const curP = s.latestPrice || s.entryPrice;
                             const lots = settings?.strategies?.[strat.id]?.lotSize || 1;
-                            return sum + ((curP - s.entryPrice) * 25 * lots);
+                            return sum + ((curP - s.entryPrice) * 75 * lots);
                           }
                         }, 0);
 
@@ -472,7 +472,7 @@ export default function App() {
                       state.signals.map((sig: any, i: number) => {
                         const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
                         const lots = settings?.strategies?.[stratKey]?.lotSize || 1;
-                        const qty = 25 * lots;
+                        const qty = 75 * lots;
                         
                         let tradePnL = 0;
                         if (sig.status === 'CLOSED') {
@@ -640,7 +640,7 @@ export default function App() {
                       onChange={(e) => updateGlobalSettings('defaultLotsPerTrade', parseInt(e.target.value) || 1)}
                       className="w-full bg-[#0A0F1C] border border-[#1F2937] rounded px-4 py-2 text-brand-green font-bold focus:border-brand-green outline-none font-mono text-sm"
                     />
-                    <p className="text-[10px] text-gray-500 mt-1">Default number of lots assigned to trades (Nifty 50: 25 qty/lot)</p>
+                    <p className="text-[10px] text-gray-500 mt-1">Default number of lots assigned to trades (Nifty 50: 75 qty/lot)</p>
                   </div>
 
                   <div>
