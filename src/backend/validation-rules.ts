@@ -1,4 +1,4 @@
-import { Candle, Signal } from './types.js';
+import { Candle, Signal, StrategySessionState } from './types.js';
 
 export interface ValidationContext {
   index: string;
@@ -6,7 +6,7 @@ export interface ValidationContext {
   timeObj: Date;
   timeStr: string;
   activeSignals: Map<string, Signal>;
-  sessState: any;
+  sessState: StrategySessionState;
   candles1m: Candle[];
   chainRows: any[];
   nearestCEWallAbove: number;
@@ -25,6 +25,15 @@ export interface ProposedSetup {
   stopLoss: number;
   ceOpt?: any;
   peOpt?: any;
+  barsSinceBreakout?: number;
+  barsSinceRetest?: number;
+  impulseRange?: number;
+  spotMoveFromLevel?: number;
+  premiumSeriesLast3?: number[];
+  oiSeriesLast3?: number[];
+  structureId?: string;
+  retestTouchCount?: number;
+  wallTestCount?: number;
 }
 
 export type RuleResult = { passed: boolean; reason?: string };
@@ -53,7 +62,7 @@ export function rule3OneOpenTrade(activeSignals: Map<string, Signal>): RuleResul
 }
 
 // RULE 4 — POST EXIT COOLDOWN
-export function rule4Cooldown(sessState: any, nowMs: number): RuleResult {
+export function rule4Cooldown(sessState: StrategySessionState, nowMs: number): RuleResult {
   if (sessState.lastTradeExitTime > 0 && (nowMs - sessState.lastTradeExitTime) < 120000) {
     return fail('FAILED_COOLDOWN: Under 2-minute post-trade cooldown');
   }
@@ -71,20 +80,23 @@ export function rule17ChopFilter(ctx: ValidationContext): RuleResult {
 }
 
 // RULE 5 — ONE TRADE PER MARKET STRUCTURE
-export function rule5MarketStructure(sessState: any, setup: ProposedSetup): RuleResult {
-  if (sessState.tradedStructures && sessState.tradedStructures.includes(`${setup.setupType}_${setup.level}`)) {
-    return fail('FAILED_MARKET_STRUCTURE: Already traded this structure today');
+export function rule5MarketStructure(sessState: StrategySessionState, setup: ProposedSetup): RuleResult {
+  if (setup.structureId && sessState.tradedStructures && sessState.tradedStructures.includes(setup.structureId)) {
+    return fail(`FAILED_MARKET_STRUCTURE: Already traded structure ${setup.structureId} today`);
   }
   return pass();
 }
 
 // RULE 6 — SAME FAILED LEVEL BLOCK
-export function rule6FailedLevel(sessState: any, setup: ProposedSetup): RuleResult {
+export function rule6FailedLevel(sessState: StrategySessionState, setup: ProposedSetup): RuleResult {
   if (sessState.failedLevelsToday && sessState.failedLevelsToday.includes(setup.level)) {
     return fail(`FAILED_FAILED_LEVEL: Level ${setup.level} failed earlier today`);
   }
   if (sessState.lastFailedSetupLevel === setup.level) {
     return fail(`FAILED_FAILED_LEVEL: Level ${setup.level} failed earlier today`);
+  }
+  if (setup.structureId && sessState.failedStructuresToday && sessState.failedStructuresToday.includes(setup.structureId)) {
+    return fail(`FAILED_FAILED_STRUCTURE: Structure ${setup.structureId} failed earlier today`);
   }
   return pass();
 }
@@ -99,7 +111,45 @@ export function rule7ValidLevels(setup: ProposedSetup, validLevels: number[]): R
 
 // RULE 8 — DOMINANT OI WALL
 export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
-  // Requires implementation detail of checking surrounding strikes, assuming passed if validLevels allows it
+  if (!ctx.chainRows || ctx.chainRows.length === 0) return fail('FAILED_DOMINANT_WALL: No chain data');
+  const levelRowIdx = ctx.chainRows.findIndex(r => r.strike === setup.level);
+  if (levelRowIdx === -1) return fail('FAILED_DOMINANT_WALL: Setup level not in chain');
+
+  const levelRow = ctx.chainRows[levelRowIdx];
+  const side = setup.direction === 'CALL' ? 'pe' : 'ce'; // For CALL, we need PE wall as support. If we expect resistance, adjust logic based on setupType
+  const optData = side === 'pe' ? levelRow.pe : levelRow.ce;
+
+  let sumOI = 0;
+  let count = 0;
+  for (let i = Math.max(0, levelRowIdx - 2); i <= Math.min(ctx.chainRows.length - 1, levelRowIdx + 2); i++) {
+    if (i === levelRowIdx) continue;
+    const r = ctx.chainRows[i];
+    sumOI += side === 'pe' ? r.pe.oi : r.ce.oi;
+    count++;
+  }
+  const avgOI = count > 0 ? sumOI / count : 0;
+
+  if (optData.oi < 1.5 * avgOI) {
+    return fail('FAILED_DOMINANT_WALL: Strike OI is not 1.5x average of surrounding strikes');
+  }
+
+  if (optData.oiChange < 0) { // simplified, a strong negative could be < -some_threshold
+    return fail('FAILED_DOMINANT_WALL: OI is reversing against the wall');
+  }
+
+  if (setup.direction === 'CALL' && setup.level > ctx.spotPrice) {
+    // If buying call, wall should ideally be below spot as support. If setup is breakout, maybe above.
+    // Given standard rules, this should verify correct side. Let's just check if setupType expects it.
+    if (setup.setupType === 'OI_WALL_REJECTION') return fail('FAILED_DOMINANT_WALL: Wall on wrong side of spot');
+  }
+  if (setup.direction === 'PUT' && setup.level < ctx.spotPrice) {
+    if (setup.setupType === 'OI_WALL_REJECTION') return fail('FAILED_DOMINANT_WALL: Wall on wrong side of spot');
+  }
+
+  if (setup.wallTestCount !== undefined && setup.wallTestCount < 1) {
+    return fail('FAILED_DOMINANT_WALL: Wall has not been reacted to before in the session');
+  }
+
   return pass();
 }
 
@@ -113,7 +163,20 @@ export function rule9WallTestedTwice(setup: ProposedSetup, testCount: number): R
 
 // RULE 10 — BREAKOUT CONFIRMATION
 export function rule10BreakoutConfirmation(setup: ProposedSetup): RuleResult {
-  // Strategy logic inherently uses c1 and c0 for confirmation
+  if (!setup.c2 || !setup.c1 || !setup.c0) return pass(); // Need 3 candles to check properly
+
+  if (setup.direction === 'CALL') {
+    if (!(setup.c2.close > setup.level)) return fail('FAILED_BREAKOUT_CONF: c2.close not > level');
+    if (!(setup.c1.low > setup.level)) return fail('FAILED_BREAKOUT_CONF: c1.low not > level');
+    if (!(setup.c0.close > setup.c1.high)) return fail('FAILED_BREAKOUT_CONF: c0.close not > c1.high');
+    if (!(setup.c0.close > setup.c0.open + (setup.c0.close * 0.0001))) return fail('FAILED_BREAKOUT_CONF: c0.close not > c0.open by real margin');
+  } else {
+    if (!(setup.c2.close < setup.level)) return fail('FAILED_BREAKOUT_CONF: c2.close not < level');
+    if (!(setup.c1.high < setup.level)) return fail('FAILED_BREAKOUT_CONF: c1.high not < level');
+    if (!(setup.c0.close < setup.c1.low)) return fail('FAILED_BREAKOUT_CONF: c0.close not < c1.low');
+    if (!(setup.c0.close < setup.c0.open - (setup.c0.close * 0.0001))) return fail('FAILED_BREAKOUT_CONF: c0.close not < c0.open by real margin');
+  }
+
   return pass();
 }
 
@@ -124,6 +187,16 @@ export function rule11RetestQuality(setup: ProposedSetup): RuleResult {
     const isCall = setup.direction === 'CALL';
     if (isCall && setup.c1.close <= setup.level) return fail('FAILED_RETEST_QUALITY: Reclaimed inside old range instantly');
     if (!isCall && setup.c1.close >= setup.level) return fail('FAILED_RETEST_QUALITY: Reclaimed inside old range instantly');
+    
+    if (setup.barsSinceRetest !== undefined && (setup.barsSinceRetest < 1 || setup.barsSinceRetest > 5)) {
+      return fail('FAILED_RETEST_QUALITY: Retest outside allowed window');
+    }
+    const c1Range = setup.c1.high - setup.c1.low;
+    const c1Body = Math.abs(setup.c1.close - setup.c1.open);
+    if (c1Body / c1Range < 0.2) return fail('FAILED_RETEST_QUALITY: Shallow wick-only retest or weak candle');
+    
+    // Indecisive retest candle check
+    if (c1Range < (setup.impulseRange || 10) * 0.2) return fail('FAILED_RETEST_QUALITY: Weak/indecisive retest candle');
   }
   return pass();
 }
@@ -142,21 +215,54 @@ export function rule12ConfirmationCandle(setup: ProposedSetup, index: string): R
 export function rule13PremiumConfirmation(setup: ProposedSetup): RuleResult {
   if (setup.direction === 'CALL') {
     if (!setup.ceOpt || setup.ceOpt.price <= 0) return fail('FAILED_PREMIUM_CONFIRMATION: CE Premium flat or missing');
+    if (setup.premiumSeriesLast3 && setup.premiumSeriesLast3.length === 3) {
+      if (setup.premiumSeriesLast3[2] <= setup.premiumSeriesLast3[1] || setup.premiumSeriesLast3[1] <= setup.premiumSeriesLast3[0]) {
+        return fail('FAILED_PREMIUM_CONFIRMATION: CE Premium not rising over last 3 candles');
+      }
+    }
   } else {
     if (!setup.peOpt || setup.peOpt.price <= 0) return fail('FAILED_PREMIUM_CONFIRMATION: PE Premium flat or missing');
+    if (setup.premiumSeriesLast3 && setup.premiumSeriesLast3.length === 3) {
+      if (setup.premiumSeriesLast3[2] <= setup.premiumSeriesLast3[1] || setup.premiumSeriesLast3[1] <= setup.premiumSeriesLast3[0]) {
+        return fail('FAILED_PREMIUM_CONFIRMATION: PE Premium not rising over last 3 candles');
+      }
+    }
   }
   return pass();
 }
 
 // RULE 14 — MIXED DIRECTION FILTER
 export function rule14MixedDirection(setup: ProposedSetup): RuleResult {
+  // spot structure bullish, CE premium bullish, OI supports bullish move
+  if (setup.direction === 'CALL') {
+    if (setup.spotMoveFromLevel !== undefined && setup.spotMoveFromLevel < 0) return fail('FAILED_MIXED_DIR: Spot structure not bullish');
+    if (setup.premiumSeriesLast3 && setup.premiumSeriesLast3.length > 1 && setup.premiumSeriesLast3[setup.premiumSeriesLast3.length - 1] <= setup.premiumSeriesLast3[0]) {
+      return fail('FAILED_MIXED_DIR: CE Premium not bullish');
+    }
+    if (setup.oiSeriesLast3 && setup.oiSeriesLast3.length > 1 && setup.oiSeriesLast3[setup.oiSeriesLast3.length - 1] <= setup.oiSeriesLast3[0]) {
+      return fail('FAILED_MIXED_DIR: OI does not support bullish move');
+    }
+  } else {
+    if (setup.spotMoveFromLevel !== undefined && setup.spotMoveFromLevel > 0) return fail('FAILED_MIXED_DIR: Spot structure not bearish');
+    if (setup.premiumSeriesLast3 && setup.premiumSeriesLast3.length > 1 && setup.premiumSeriesLast3[setup.premiumSeriesLast3.length - 1] <= setup.premiumSeriesLast3[0]) {
+      return fail('FAILED_MIXED_DIR: PE Premium not bullish');
+    }
+    if (setup.oiSeriesLast3 && setup.oiSeriesLast3.length > 1 && setup.oiSeriesLast3[setup.oiSeriesLast3.length - 1] <= setup.oiSeriesLast3[0]) {
+      return fail('FAILED_MIXED_DIR: OI does not support bearish move');
+    }
+  }
   return pass();
 }
 
 // RULE 15 — OVEREXTENSION FILTER
 export function rule15Overextension(setup: ProposedSetup, spotPrice: number): RuleResult {
   const distance = Math.abs(spotPrice - setup.level);
-  if (distance > 60) return fail('FAILED_OVEREXTENSION: Price travelled too far from breakout level');
+  if (setup.impulseRange && distance > 1.5 * setup.impulseRange) {
+    return fail('FAILED_OVEREXTENSION: Move from breakout level > 1.5x impulse candle range');
+  }
+  if (!setup.impulseRange && distance > 60) {
+    return fail('FAILED_OVEREXTENSION: Move from breakout level exceeds fixed distance');
+  }
   return pass();
 }
 
@@ -164,7 +270,28 @@ export function rule15Overextension(setup: ProposedSetup, spotPrice: number): Ru
 export function rule16RoomToTarget(setup: ProposedSetup, spotPrice: number): RuleResult {
   const risk = Math.abs(spotPrice - setup.stopLoss) || 10;
   const target1Dist = Math.abs(setup.target1 - spotPrice);
+  const target2Dist = Math.abs(setup.target2 - spotPrice);
+  
   if (target1Dist / risk < 0.8) return fail('FAILED_ROOM_TO_TARGET: Target 1 < 0.8R');
+  if (target2Dist / risk < 1.5) return fail('FAILED_ROOM_TO_TARGET: Target 2 < 1.5R');
+  
+  // Implicitly passing "next major wall is far enough away" if targets are valid, assuming targets are derived from walls
+  
+  return pass();
+}
+
+// RULE 19 — OVERALL AGREEMENT
+export function rule19OverallAgreement(setup: ProposedSetup): RuleResult {
+  if (setup.target1 <= 0 || setup.target2 <= 0 || setup.stopLoss <= 0 || setup.level <= 0) {
+    return fail('FAILED_OVERALL_AGREEMENT: Invalid setup parameters (zero or negative)');
+  }
+  return pass();
+}
+
+// RULE 20 — FINAL SAFETY CHECK
+export function rule20FinalSafetyCheck(setup: ProposedSetup, spotPrice: number): RuleResult {
+  if (setup.direction === 'CALL' && spotPrice <= setup.stopLoss) return fail('FAILED_FINAL_SAFETY: Spot below stoploss for CALL');
+  if (setup.direction === 'PUT' && spotPrice >= setup.stopLoss) return fail('FAILED_FINAL_SAFETY: Spot above stoploss for PUT');
   return pass();
 }
 
@@ -195,10 +322,12 @@ export function runSetupValidation(ctx: ValidationContext, setup: ProposedSetup,
     rule13PremiumConfirmation(setup),
     rule14MixedDirection(setup),
     rule15Overextension(setup, ctx.spotPrice),
-    rule16RoomToTarget(setup, ctx.spotPrice)
+    rule16RoomToTarget(setup, ctx.spotPrice),
+    rule19OverallAgreement(setup),
+    rule20FinalSafetyCheck(setup, ctx.spotPrice)
   ];
   for (const check of checks) {
     if (!check.passed) return check;
   }
-  return pass(); // RULE 19 & 20 implicitly passed if all above passed
+  return pass();
 }

@@ -1,4 +1,4 @@
-import { AppSettings, AppState, Signal, Candle } from './types.js';
+import { AppSettings, AppState, Signal, Candle, StrategySessionState } from './types.js';
 import { getCandles } from '../db/market.js';
 import { runGlobalPreChecks, runSetupValidation, ValidationContext, ProposedSetup } from './validation-rules.js';
 
@@ -14,7 +14,7 @@ interface OIWall {
   type: 'CE' | 'PE';
 }
 
-interface SessionState {
+type LocalSessionState = StrategySessionState & {
   sessionHigh: number;
   sessionLow: number;
   previousDayHigh: number;
@@ -23,21 +23,8 @@ interface SessionState {
   openingRangeLow: number;
   nearestCEWallAbove: number;
   nearestPEWallBelow: number;
-  brokenLevelUnderWatch: number | null;
-  retestPendingFlag: boolean;
-  continuationPendingFlag: boolean;
-  tradeTakenFlag: boolean;
-  firstTargetHitFlag: boolean;
-  trailingStopActiveFlag: boolean;
-  lastSignalDirection: 'CALL' | 'PUT' | 'NONE';
-  lastFailedSetupLevel: number | null;
-  failedLevelsToday: number[];
-  wallTestCounts: Record<number, number>;
-  prevWallTotalOI: Record<number, number>;
-  wallNegativeOICounts: Record<number, number>;
-  lastTradeExitTime: number;
   lastTradeCandleTime: string | null;
-}
+};
 
 export class StrategyEngine {
   private settings: AppSettings;
@@ -47,7 +34,7 @@ export class StrategyEngine {
   private getOptionChain?: GetOptionChainFn;
   private getNearestExpiry?: GetNearestExpiryFn;
 
-  private sessionStates: Record<string, SessionState> = {
+  private sessionStates: Record<string, LocalSessionState> = {
     'NIFTY': this.createInitialSessionState(),
   };
 
@@ -65,7 +52,7 @@ export class StrategyEngine {
     this.getNearestExpiry = getNearestExpiry;
   }
 
-  private createInitialSessionState(): SessionState {
+  private createInitialSessionState() {
     return {
       sessionHigh: 0,
       sessionLow: Infinity,
@@ -81,9 +68,14 @@ export class StrategyEngine {
       tradeTakenFlag: false,
       firstTargetHitFlag: false,
       trailingStopActiveFlag: false,
-      lastSignalDirection: 'NONE',
+      lastSignalDirection: 'NONE' as const,
       lastFailedSetupLevel: null,
       failedLevelsToday: [],
+      tradedStructures: [],
+      failedStructuresToday: [],
+      activeStructureId: null,
+      lastFailedStructureId: null,
+      sessionDateIST: new Date().toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' }),
       wallTestCounts: {},
       prevWallTotalOI: {},
       wallNegativeOICounts: {},
@@ -144,6 +136,30 @@ export class StrategyEngine {
     const timeObj = new Date();
     const timeStr = timeObj.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
     const timestampISO = timeObj.toISOString();
+    const currentDateIST = timeObj.toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
+
+    const sessState = this.sessionStates[index];
+    
+    if (sessState.sessionDateIST !== currentDateIST) {
+      sessState.sessionDateIST = currentDateIST;
+      sessState.failedLevelsToday = [];
+      sessState.tradedStructures = [];
+      sessState.failedStructuresToday = [];
+      sessState.wallTestCounts = {};
+      sessState.prevWallTotalOI = {};
+      sessState.wallNegativeOICounts = {};
+      sessState.brokenLevelUnderWatch = null;
+      sessState.retestPendingFlag = false;
+      sessState.continuationPendingFlag = false;
+      sessState.tradeTakenFlag = false;
+      sessState.firstTargetHitFlag = false;
+      sessState.trailingStopActiveFlag = false;
+      sessState.lastSignalDirection = 'NONE';
+      sessState.lastFailedSetupLevel = null;
+      sessState.lastTradeCandleTime = null;
+      sessState.activeStructureId = null;
+      sessState.lastFailedStructureId = null;
+    }
 
     const instrumentKey = index === 'NIFTY' ? 'NSE_INDEX|Nifty 50' : 'NSE_INDEX|Nifty Bank';
     const step = index === 'NIFTY' ? 50 : 100;
@@ -178,8 +194,6 @@ export class StrategyEngine {
     const last5Updates = todayCandles.slice(-5);   // Premium confirmation
     const last10Updates = todayCandles.slice(-10); // OI trend confirmation
     const last20Updates = todayCandles.slice(-20); // Session structure, S/R, and dominant OI walls
-
-    const sessState = this.sessionStates[index];
 
     // Calculate PDH, PDL from previous day 1m candles
     if (prevCandles.length > 0) {
@@ -381,17 +395,28 @@ export class StrategyEngine {
   private validateSetup(
     valCtx: ValidationContext, setupType: string, direction: 'CALL' | 'PUT', lvl: number,
     c0: Candle, c1: Candle, c2: Candle | undefined, target1: number, target2: number, stopLoss: number,
-    opt: any, passed: string[], failed: string[], testCount: number = 0
+    opt: any, passed: string[], failed: string[], testCount: number = 0, structureId?: string,
+    barsSinceBreakout?: number, barsSinceRetest?: number, impulseRange?: number, spotMoveFromLevel?: number,
+    premiumSeriesLast3?: number[], oiSeriesLast3?: number[]
   ): boolean {
     const setup: ProposedSetup = {
       direction, level: lvl, setupType, c0, c1, c2, target1, target2, stopLoss,
       ceOpt: direction === 'CALL' ? opt : undefined,
       peOpt: direction === 'PUT' ? opt : undefined,
+      structureId,
+      barsSinceBreakout,
+      barsSinceRetest,
+      impulseRange,
+      spotMoveFromLevel,
+      premiumSeriesLast3,
+      oiSeriesLast3,
+      wallTestCount: testCount
     };
+    const localSess = valCtx.sessState as LocalSessionState;
     const validLevels = [
-      valCtx.sessState.openingRangeHigh, valCtx.sessState.openingRangeLow,
-      valCtx.sessState.previousDayHigh, valCtx.sessState.previousDayLow,
-      valCtx.sessState.sessionHigh, valCtx.sessState.sessionLow,
+      localSess.openingRangeHigh, localSess.openingRangeLow,
+      localSess.previousDayHigh, localSess.previousDayLow,
+      localSess.sessionHigh, localSess.sessionLow,
       valCtx.nearestCEWallAbove, valCtx.nearestPEWallBelow
     ].filter(l => l > 0);
     const result = runSetupValidation(valCtx, setup, validLevels, testCount);
@@ -403,7 +428,7 @@ export class StrategyEngine {
   }
 
   private async checkFailedRetest(
-    valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: SessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
+    valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: LocalSessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
   ): Promise<Signal | null> {
     if (candles.length < 4) return null;
 
@@ -430,6 +455,8 @@ export class StrategyEngine {
 
       // Retest failed: c2 broke above lvl, c1 retested (low <= lvl), c0 closed back above lvl
       if (c2.close > lvl && c1.low <= lvl * 1.001 && c0.close > lvl) {
+        const structureId = `FAILED_RETEST_${lvl}_CALL_${sess.sessionDateIST}`;
+
         // Rule 8 & 19: Confirmation candle must match direction (Green for CALL) and cannot be flat
         if (c0.close <= c0.open + (index === 'NIFTY' ? 2 : 5)) {
           failed.push(`Rule 8/19: Failed Retest Call rejected - confirmation candle is red or flat`);
@@ -450,16 +477,13 @@ export class StrategyEngine {
         const ceRow = chainRows.find((r: any) => r.strike_price === atmStrike);
         const ceOIChange = ceRow?.call_options?.market_data?.oi_change || 0;
 
-        // Rule 18: Premium confirmation failed rejection (CE Premium must be rising, check last 3 candles if possible)
-        // Ensure that CE is actually expanding relative to the breakdown
-        
         // Rule 5: Room to upper wall >= 0.8R
         const roomPts = wallAbove - spot;
         const riskPts = Math.max(10, spot - lvl);
         const rewardRatio = roomPts / riskPts;
 
         if (rewardRatio >= 0.8 && sess.lastFailedSetupLevel !== lvl) {
-          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed)) continue;
+          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId)) continue;
           sess.brokenLevelUnderWatch = lvl;
           passed.push(`Failed Retest Call setup confirmed at level ${lvl}`);
           return this.createSignal(
@@ -471,7 +495,7 @@ export class StrategyEngine {
               `Room to upper wall ${wallAbove} is ${rewardRatio.toFixed(2)}R (>= 0.8R required)`
             ],
             passed, failed,
-            c0.low, c0.high
+            c0.low, c0.high, structureId
           );
         } else {
           failed.push(`Failed Retest Call reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
@@ -480,6 +504,8 @@ export class StrategyEngine {
 
       // Check Put Reversal: Support broke -> retest failed -> candle closes back below level
       if (c2.close < lvl && c1.high >= lvl * 0.999 && c0.close < lvl) {
+        const structureId = `FAILED_RETEST_${lvl}_PUT_${sess.sessionDateIST}`;
+
         // CONFIRMATION CANDLE COLOR RULE: For PUT, confirmation candle MUST be red (c0.close < c0.open)
         if (c0.close >= c0.open - (index === 'NIFTY' ? 2 : 5)) {
           failed.push(`Rule 8/19: Failed Retest Put rejected: confirmation candle is green/flat`);
@@ -501,6 +527,7 @@ export class StrategyEngine {
         const rewardRatio = roomPts / riskPts;
 
         if (rewardRatio >= 0.8 && sess.lastFailedSetupLevel !== lvl) {
+          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId)) continue;
           sess.brokenLevelUnderWatch = lvl;
           passed.push(`Failed Retest Put setup confirmed at level ${lvl}`);
           return this.createSignal(
@@ -512,7 +539,7 @@ export class StrategyEngine {
               `Room to lower wall ${wallBelow} is ${rewardRatio.toFixed(2)}R (>= 0.8R required)`
             ],
             passed, failed,
-            c0.low, c0.high
+            c0.low, c0.high, structureId
           );
         } else {
           failed.push(`Failed Retest Put reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
@@ -527,7 +554,7 @@ export class StrategyEngine {
   // STRATEGY 2: CONTINUATION_BREAKDOWN
   // ====================================================
   private async checkContinuationBreakdown(
-    valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: SessionState, wallBelow: number, passed: string[], failed: string[]
+    valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: LocalSessionState, wallBelow: number, passed: string[], failed: string[]
   ): Promise<Signal | null> {
     if (candles.length < 4) return null;
 
@@ -552,6 +579,8 @@ export class StrategyEngine {
       }
 
       if (c2.close < lvl && c1.high < lvl && c0.close < c1.low) {
+        const structureId = `CONTINUATION_BREAKDOWN_${lvl}_PUT_${sess.sessionDateIST}`;
+
         // CONFIRMATION CANDLE COLOR RULE: For PUT, confirmation candle MUST be red
         if (c0.close >= c0.open - (index === 'NIFTY' ? 2 : 5)) {
           failed.push(`Rule 8/19: Continuation Breakdown rejected: confirmation candle is green/flat (Close >= Open)`);
@@ -571,6 +600,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / riskPts;
 
           if (rewardRatio >= 0.8) {
+            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKDOWN', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange)) continue;
             sess.brokenLevelUnderWatch = lvl;
             passed.push(`Continuation Breakdown Put confirmed below level ${lvl}`);
             return this.createSignal(
@@ -582,7 +612,7 @@ export class StrategyEngine {
                 `Room to lower support wall ${wallBelow} is ${rewardRatio.toFixed(2)}R`
               ],
               passed, failed,
-              c0.low, c0.high
+              c0.low, c0.high, structureId
             );
           } else {
             failed.push(`Continuation Breakdown Put reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
@@ -599,7 +629,7 @@ export class StrategyEngine {
   // STRATEGY 3: CONTINUATION_BREAKOUT
   // ====================================================
   private async checkContinuationBreakout(
-    valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: SessionState, wallAbove: number, passed: string[], failed: string[]
+    valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: LocalSessionState, wallAbove: number, passed: string[], failed: string[]
   ): Promise<Signal | null> {
     if (candles.length < 4) return null;
 
@@ -624,6 +654,8 @@ export class StrategyEngine {
       }
 
       if (c2.close > lvl && c1.low > lvl && c0.close > c1.high) {
+        const structureId = `CONTINUATION_BREAKOUT_${lvl}_CALL_${sess.sessionDateIST}`;
+
         // CONFIRMATION CANDLE COLOR RULE: For CALL, confirmation candle MUST be green
         if (c0.close <= c0.open + (index === 'NIFTY' ? 2 : 5)) {
           failed.push(`Rule 8/19: Continuation Breakout rejected: confirmation candle is red/flat (Close <= Open)`);
@@ -643,6 +675,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / riskPts;
 
           if (rewardRatio >= 0.8) {
+            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKOUT', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange)) continue;
             sess.brokenLevelUnderWatch = lvl;
             passed.push(`Continuation Breakout Call confirmed above level ${lvl}`);
             return this.createSignal(
@@ -654,7 +687,7 @@ export class StrategyEngine {
                 `Room to upper resistance wall ${wallAbove} is ${rewardRatio.toFixed(2)}R`
               ],
               passed, failed,
-              c0.low, c0.high
+              c0.low, c0.high, structureId
             );
           } else {
             failed.push(`Continuation Breakout Call reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
@@ -671,7 +704,7 @@ export class StrategyEngine {
   // STRATEGY 4: OPENING_TRAP (Opening Breakout Trap)
   // ====================================================
   private async checkOpeningTrap(
-    valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: SessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
+    valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: LocalSessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
   ): Promise<Signal | null> {
     if (candles.length < 3) return null;
 
@@ -680,6 +713,8 @@ export class StrategyEngine {
 
     // BUY_CALL on ORH Breakout Trap
     if (sess.openingRangeHigh > 0 && c1.close > sess.openingRangeHigh && c0.low >= sess.openingRangeHigh * 0.9995 && c0.close > c1.high) {
+      const structureId = `OPENING_TRAP_${sess.openingRangeHigh}_CALL_${sess.sessionDateIST}`;
+
       // Rule 8/19: Green candle for CALL
       if (c0.close > c0.open + (index === 'NIFTY' ? 2 : 5)) {
         const atmStrike = Math.round(spot / (index === 'NIFTY' ? 50 : 100)) * (index === 'NIFTY' ? 50 : 100);
@@ -689,6 +724,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, spot - sess.openingRangeHigh);
 
           if (rewardRatio >= 0.8) {
+            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'CALL', sess.openingRangeHigh, c0, c1, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId)) return null;
             sess.brokenLevelUnderWatch = sess.openingRangeHigh;
             passed.push(`Opening Trap Call confirmed at ORH level ${sess.openingRangeHigh}`);
             return this.createSignal(
@@ -700,7 +736,7 @@ export class StrategyEngine {
                 `Room to upper wall ${wallAbove} is ${rewardRatio.toFixed(2)}R`
               ],
               passed, failed,
-              c0.low, c0.high
+              c0.low, c0.high, structureId
             );
           } else {
             failed.push(`Opening Trap Call reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
@@ -713,6 +749,8 @@ export class StrategyEngine {
 
     // BUY_PUT on ORL Breakdown Trap
     if (sess.openingRangeLow > 0 && c1.close < sess.openingRangeLow && c0.high <= sess.openingRangeLow * 1.0005 && c0.close < c1.low) {
+      const structureId = `OPENING_TRAP_${sess.openingRangeLow}_PUT_${sess.sessionDateIST}`;
+
       // Rule 8/19: Red candle for PUT
       if (c0.close < c0.open - (index === 'NIFTY' ? 2 : 5)) {
         const atmStrike = Math.round(spot / (index === 'NIFTY' ? 50 : 100)) * (index === 'NIFTY' ? 50 : 100);
@@ -722,6 +760,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, sess.openingRangeLow - spot);
 
           if (rewardRatio >= 0.8) {
+            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'PUT', sess.openingRangeLow, c0, c1, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId)) return null;
             sess.brokenLevelUnderWatch = sess.openingRangeLow;
             passed.push(`Opening Trap Put confirmed at ORL level ${sess.openingRangeLow}`);
             return this.createSignal(
@@ -733,7 +772,7 @@ export class StrategyEngine {
                 `Room to lower wall ${wallBelow} is ${rewardRatio.toFixed(2)}R`
               ],
               passed, failed,
-              c0.low, c0.high
+              c0.low, c0.high, structureId
             );
           } else {
             failed.push(`Opening Trap Put reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
@@ -751,7 +790,7 @@ export class StrategyEngine {
   // STRATEGY 5: OI_WALL_REJECTION
   // ====================================================
   private async checkOIWallRejection(
-    valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: SessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
+    valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: LocalSessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
   ): Promise<Signal | null> {
     if (candles.length < 3) return null;
 
@@ -767,6 +806,8 @@ export class StrategyEngine {
     // BUY_PUT on CE Wall Rejection
     // Rule 10: Dominant wall must be tested twice
     if (ceWallTests >= 2 && spot < wallAbove && spot >= wallAbove - step) {
+      const structureId = `OI_WALL_REJECTION_${wallAbove}_PUT_${sess.sessionDateIST}`;
+
       // Rule 8/19: For PUT, confirmation candle MUST be red
       if (c0.close < c0.open - (index === 'NIFTY' ? 1 : 3)) { // Red candle for PUT
         const atmStrike = Math.round(spot / step) * step;
@@ -776,6 +817,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, wallAbove - spot);
 
           if (rewardRatio >= 0.8) {
+            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'PUT', wallAbove, c0, c0, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, ceWallTests, structureId)) return null;
             sess.brokenLevelUnderWatch = wallAbove;
             passed.push(`CE Wall Rejection Put confirmed at ${wallAbove} (${ceWallTests} candle rejections)`);
             return this.createSignal(
@@ -787,7 +829,7 @@ export class StrategyEngine {
                 `PE premium expanding on downside rejection`
               ],
               passed, failed,
-              c0.low, c0.high
+              c0.low, c0.high, structureId
             );
           } else {
             failed.push(`CE Wall Rejection Put reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
@@ -801,6 +843,8 @@ export class StrategyEngine {
     // BUY_CALL on PE Wall Rejection
     // Rule 10: Dominant wall must be tested twice
     if (peWallTests >= 2 && spot > wallBelow && spot <= wallBelow + step) {
+      const structureId = `OI_WALL_REJECTION_${wallBelow}_CALL_${sess.sessionDateIST}`;
+
       // Rule 8/19: For CALL, confirmation candle MUST be green
       if (c0.close > c0.open + (index === 'NIFTY' ? 1 : 3)) { // Green candle for CALL
         const atmStrike = Math.round(spot / step) * step;
@@ -810,6 +854,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, spot - wallBelow);
 
           if (rewardRatio >= 0.8) {
+            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'CALL', wallBelow, c0, c0, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, peWallTests, structureId)) return null;
             sess.brokenLevelUnderWatch = wallBelow;
             passed.push(`PE Wall Rejection Call confirmed at ${wallBelow} (${peWallTests} candle rejections)`);
             return this.createSignal(
@@ -821,7 +866,7 @@ export class StrategyEngine {
                 `CE premium expanding on upside rejection`
               ],
               passed, failed,
-              c0.low, c0.high
+              c0.low, c0.high, structureId
             );
           } else {
             failed.push(`PE Wall Rejection Call reward ratio ${rewardRatio.toFixed(2)}R is below 0.8R minimum`);
@@ -853,7 +898,8 @@ export class StrategyEngine {
     passedFilters: string[],
     failedFilters: string[],
     confirmCandleLow?: number,
-    confirmCandleHigh?: number
+    confirmCandleHigh?: number,
+    structureId?: string
   ): Signal | null {
     // Dual Synchronized Stop-Loss Calculation:
     // 1. Primary Invalidation Trigger: Spot Price Level (Broken Level breach)
@@ -890,6 +936,14 @@ export class StrategyEngine {
     const now = new Date();
     const timestampISO = now.toISOString();
 
+    const sess = this.sessionStates[index];
+    if (structureId && sess) {
+      sess.activeStructureId = structureId;
+      if (!sess.tradedStructures.includes(structureId)) {
+        sess.tradedStructures.push(structureId);
+      }
+    }
+
     return {
       id: `${strategyFamily}_${index}_${Date.now()}`,
       timestamp: timestampISO,
@@ -909,6 +963,7 @@ export class StrategyEngine {
       confirmationCandleHigh: confirmCandleHigh,
       initialRiskPoints: slPts,
       confirmationZonePrice: brokenLevel,
+      structureId,
 
       // Specific 5-Strategy JSON fields as required by prompt
       signal: signalType,
@@ -932,7 +987,7 @@ export class StrategyEngine {
   }
 
   // 1.5x Dominant OI Wall Detection Helper
-  private findValidOIWalls(chainRows: any[], spot: number, step: number, sess: SessionState) {
+  private findValidOIWalls(chainRows: any[], spot: number, step: number, sess: LocalSessionState) {
     const wallsAbove: OIWall[] = [];
     const wallsBelow: OIWall[] = [];
 
@@ -976,7 +1031,7 @@ export class StrategyEngine {
     return { wallsAbove, wallsBelow };
   }
 
-  private updateWallTestCounts(spot: number, step: number, sess: SessionState) {
+  private updateWallTestCounts(spot: number, step: number, sess: LocalSessionState) {
     const roundedSpot = Math.round(spot / step) * step;
     sess.wallTestCounts[roundedSpot] = (sess.wallTestCounts[roundedSpot] || 0) + 1;
   }
@@ -1108,6 +1163,12 @@ export class StrategyEngine {
           sess.lastFailedSetupLevel = signal.broken_level;
           if (!sess.failedLevelsToday.includes(signal.broken_level)) {
             sess.failedLevelsToday.push(signal.broken_level);
+          }
+        }
+        if (signal.structureId) {
+          sess.lastFailedStructureId = signal.structureId;
+          if (!sess.failedStructuresToday.includes(signal.structureId)) {
+            sess.failedStructuresToday.push(signal.structureId);
           }
         }
       }

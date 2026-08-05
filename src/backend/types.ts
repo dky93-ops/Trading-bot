@@ -46,6 +46,28 @@ export interface AppState {
   winningTrades: number;
 }
 
+export interface StrategySessionState {
+  lastTradeExitTime: number;
+  failedLevelsToday: number[];
+  tradedStructures: string[];
+  failedStructuresToday: string[];
+  activeStructureId: string | null;
+  lastFailedStructureId: string | null;
+  sessionDateIST: string;
+  wallTestCounts: Record<number, number>;
+  prevWallTotalOI: Record<number, number>;
+  wallNegativeOICounts: Record<number, number>;
+  brokenLevelUnderWatch: number | null;
+  retestPendingFlag: boolean;
+  continuationPendingFlag: boolean;
+  tradeTakenFlag: boolean;
+  firstTargetHitFlag: boolean;
+  trailingStopActiveFlag: boolean;
+  lastSignalDirection: 'CALL' | 'PUT' | 'NONE';
+  lastFailedSetupLevel: number | null;
+  lastTradeCandleTime: string | null;
+}
+
 export interface Signal {
   id: string;
   timestamp: string | number;
@@ -75,6 +97,13 @@ export interface Signal {
   confirmationCandleHigh?: number;
   initialRiskPoints?: number;
   confirmationZonePrice?: number;
+  structureId?: string;
+  barsSinceBreakout?: number;
+  barsSinceRetest?: number;
+  premiumTrend?: number[];
+  oiTrend?: number[];
+  impulseRange?: number;
+  structureKey?: string;
 
   // Specific 5-Strategy Engine JSON fields
   signal: 'BUY_CALL' | 'BUY_PUT' | 'NO_TRADE';
