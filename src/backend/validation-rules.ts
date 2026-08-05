@@ -43,6 +43,7 @@ const fail = (reason: string): RuleResult => ({ passed: false, reason });
 
 // RULE 1 — USE ONLY COMPLETED 1-MINUTE CANDLES
 export function rule1CompletedCandles(candles: Candle[], timeObj: Date): RuleResult {
+  if (!candles || candles.length === 0) return fail('FAILED_COMPLETED_CANDLE: No candles available');
   const currentMinuteStart = Math.floor(timeObj.getTime() / 60000) * 60000;
   const hasIncomplete = candles.some(c => new Date(c.timestamp).getTime() >= currentMinuteStart);
   if (hasIncomplete) return fail('FAILED_COMPLETED_CANDLE: Contains incomplete live candles');
@@ -163,18 +164,30 @@ export function rule9WallTestedTwice(setup: ProposedSetup, testCount: number): R
 
 // RULE 10 — BREAKOUT CONFIRMATION
 export function rule10BreakoutConfirmation(setup: ProposedSetup): RuleResult {
-  if (!setup.c2 || !setup.c1 || !setup.c0) return pass(); // Need 3 candles to check properly
+  // If setup inherently requires a breakout sequence, enforce it
+  if (setup.setupType === 'CONTINUATION_BREAKOUT' || setup.setupType === 'CONTINUATION_BREAKDOWN' || setup.setupType === 'FAILED_RETEST') {
+    if (!setup.c2 || !setup.c1 || !setup.c0) return fail('FAILED_BREAKOUT_CONF: Required candles missing');
 
-  if (setup.direction === 'CALL') {
-    if (!(setup.c2.close > setup.level)) return fail('FAILED_BREAKOUT_CONF: c2.close not > level');
-    if (!(setup.c1.low > setup.level)) return fail('FAILED_BREAKOUT_CONF: c1.low not > level');
-    if (!(setup.c0.close > setup.c1.high)) return fail('FAILED_BREAKOUT_CONF: c0.close not > c1.high');
-    if (!(setup.c0.close > setup.c0.open + (setup.c0.close * 0.0001))) return fail('FAILED_BREAKOUT_CONF: c0.close not > c0.open by real margin');
-  } else {
-    if (!(setup.c2.close < setup.level)) return fail('FAILED_BREAKOUT_CONF: c2.close not < level');
-    if (!(setup.c1.high < setup.level)) return fail('FAILED_BREAKOUT_CONF: c1.high not < level');
-    if (!(setup.c0.close < setup.c1.low)) return fail('FAILED_BREAKOUT_CONF: c0.close not < c1.low');
-    if (!(setup.c0.close < setup.c0.open - (setup.c0.close * 0.0001))) return fail('FAILED_BREAKOUT_CONF: c0.close not < c0.open by real margin');
+    if (setup.direction === 'CALL') {
+      if (!(setup.c2.close > setup.level)) return fail('FAILED_BREAKOUT_CONF: c2.close not > level');
+      // For FAILED_RETEST, c1.low <= level. For CONTINUATION, c1.low > level or similar, but strategy logic handles exact positioning. 
+      // Just ensure confirmation candle confirms direction.
+      if (!(setup.c0.close > Math.max(setup.c1.high, setup.level))) return fail('FAILED_BREAKOUT_CONF: c0.close not confirming breakout');
+      if (!(setup.c0.close > setup.c0.open + (setup.c0.close * 0.0001))) return fail('FAILED_BREAKOUT_CONF: c0.close not > c0.open by real margin');
+    } else {
+      if (!(setup.c2.close < setup.level)) return fail('FAILED_BREAKOUT_CONF: c2.close not < level');
+      if (!(setup.c0.close < Math.min(setup.c1.low, setup.level))) return fail('FAILED_BREAKOUT_CONF: c0.close not confirming breakdown');
+      if (!(setup.c0.close < setup.c0.open - (setup.c0.close * 0.0001))) return fail('FAILED_BREAKOUT_CONF: c0.close not < c0.open by real margin');
+    }
+  } else if (setup.setupType === 'OPENING_TRAP') {
+    if (!setup.c1 || !setup.c0) return fail('FAILED_BREAKOUT_CONF: Required candles missing');
+    if (setup.direction === 'CALL') {
+      if (!(setup.c1.close > setup.level)) return fail('FAILED_BREAKOUT_CONF: c1.close not > level');
+      if (!(setup.c0.close > setup.c1.high)) return fail('FAILED_BREAKOUT_CONF: c0.close not > c1.high');
+    } else {
+      if (!(setup.c1.close < setup.level)) return fail('FAILED_BREAKOUT_CONF: c1.close not < level');
+      if (!(setup.c0.close < setup.c1.low)) return fail('FAILED_BREAKOUT_CONF: c0.close not < c1.low');
+    }
   }
 
   return pass();
@@ -289,9 +302,40 @@ export function rule19OverallAgreement(setup: ProposedSetup): RuleResult {
 }
 
 // RULE 20 — FINAL SAFETY CHECK
-export function rule20FinalSafetyCheck(setup: ProposedSetup, spotPrice: number): RuleResult {
-  if (setup.direction === 'CALL' && spotPrice <= setup.stopLoss) return fail('FAILED_FINAL_SAFETY: Spot below stoploss for CALL');
-  if (setup.direction === 'PUT' && spotPrice >= setup.stopLoss) return fail('FAILED_FINAL_SAFETY: Spot above stoploss for PUT');
+export function rule20FinalSafetyCheck(
+  ctx: ValidationContext,
+  setup: ProposedSetup, 
+  validLevels: number[],
+  testCount: number
+): RuleResult {
+  if (setup.direction === 'CALL' && ctx.spotPrice <= setup.stopLoss) return fail('FAILED_FINAL_SAFETY: Spot below stoploss for CALL');
+  if (setup.direction === 'PUT' && ctx.spotPrice >= setup.stopLoss) return fail('FAILED_FINAL_SAFETY: Spot above stoploss for PUT');
+  
+  // Re-verify ALL critical gates
+  const checks = [
+    rule1CompletedCandles(ctx.candles1m, ctx.timeObj),
+    rule2OpeningFilter(ctx.timeStr),
+    rule3OneOpenTrade(ctx.activeSignals),
+    rule4Cooldown(ctx.sessState, ctx.timeObj.getTime()),
+    rule17ChopFilter(ctx),
+    rule5MarketStructure(ctx.sessState, setup),
+    rule6FailedLevel(ctx.sessState, setup),
+    rule7ValidLevels(setup, validLevels),
+    rule8DominantOIWall(ctx, setup),
+    rule9WallTestedTwice(setup, testCount),
+    rule10BreakoutConfirmation(setup),
+    rule11RetestQuality(setup),
+    rule12ConfirmationCandle(setup, ctx.index),
+    rule13PremiumConfirmation(setup),
+    rule14MixedDirection(setup),
+    rule15Overextension(setup, ctx.spotPrice),
+    rule16RoomToTarget(setup, ctx.spotPrice),
+    rule19OverallAgreement(setup)
+  ];
+  for (const check of checks) {
+    if (!check.passed) return fail(`FAILED_FINAL_SAFETY_RECHECK: ${check.reason}`);
+  }
+
   return pass();
 }
 
@@ -324,7 +368,7 @@ export function runSetupValidation(ctx: ValidationContext, setup: ProposedSetup,
     rule15Overextension(setup, ctx.spotPrice),
     rule16RoomToTarget(setup, ctx.spotPrice),
     rule19OverallAgreement(setup),
-    rule20FinalSafetyCheck(setup, ctx.spotPrice)
+    rule20FinalSafetyCheck(ctx, setup, validLevels, testCount)
   ];
   for (const check of checks) {
     if (!check.passed) return check;

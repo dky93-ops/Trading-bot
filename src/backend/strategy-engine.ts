@@ -455,7 +455,7 @@ export class StrategyEngine {
 
       // Retest failed: c2 broke above lvl, c1 retested (low <= lvl), c0 closed back above lvl
       if (c2.close > lvl && c1.low <= lvl * 1.001 && c0.close > lvl) {
-        const structureId = `FAILED_RETEST_${lvl}_CALL_${sess.sessionDateIST}`;
+        const structureId = `FAILED_RETEST_${lvl}_CALL_${new Date(c0.timestamp).getTime()}`;
 
         // Rule 8 & 19: Confirmation candle must match direction (Green for CALL) and cannot be flat
         if (c0.close <= c0.open + (index === 'NIFTY' ? 2 : 5)) {
@@ -504,7 +504,7 @@ export class StrategyEngine {
 
       // Check Put Reversal: Support broke -> retest failed -> candle closes back below level
       if (c2.close < lvl && c1.high >= lvl * 0.999 && c0.close < lvl) {
-        const structureId = `FAILED_RETEST_${lvl}_PUT_${sess.sessionDateIST}`;
+        const structureId = `FAILED_RETEST_${lvl}_PUT_${new Date(c0.timestamp).getTime()}`;
 
         // CONFIRMATION CANDLE COLOR RULE: For PUT, confirmation candle MUST be red (c0.close < c0.open)
         if (c0.close >= c0.open - (index === 'NIFTY' ? 2 : 5)) {
@@ -579,7 +579,7 @@ export class StrategyEngine {
       }
 
       if (c2.close < lvl && c1.high < lvl && c0.close < c1.low) {
-        const structureId = `CONTINUATION_BREAKDOWN_${lvl}_PUT_${sess.sessionDateIST}`;
+        const structureId = `CONTINUATION_BREAKDOWN_${lvl}_PUT_${new Date(c0.timestamp).getTime()}`;
 
         // CONFIRMATION CANDLE COLOR RULE: For PUT, confirmation candle MUST be red
         if (c0.close >= c0.open - (index === 'NIFTY' ? 2 : 5)) {
@@ -654,7 +654,7 @@ export class StrategyEngine {
       }
 
       if (c2.close > lvl && c1.low > lvl && c0.close > c1.high) {
-        const structureId = `CONTINUATION_BREAKOUT_${lvl}_CALL_${sess.sessionDateIST}`;
+        const structureId = `CONTINUATION_BREAKOUT_${lvl}_CALL_${new Date(c0.timestamp).getTime()}`;
 
         // CONFIRMATION CANDLE COLOR RULE: For CALL, confirmation candle MUST be green
         if (c0.close <= c0.open + (index === 'NIFTY' ? 2 : 5)) {
@@ -713,7 +713,7 @@ export class StrategyEngine {
 
     // BUY_CALL on ORH Breakout Trap
     if (sess.openingRangeHigh > 0 && c1.close > sess.openingRangeHigh && c0.low >= sess.openingRangeHigh * 0.9995 && c0.close > c1.high) {
-      const structureId = `OPENING_TRAP_${sess.openingRangeHigh}_CALL_${sess.sessionDateIST}`;
+      const structureId = `OPENING_TRAP_${sess.openingRangeHigh}_CALL_${new Date(c0.timestamp).getTime()}`;
 
       // Rule 8/19: Green candle for CALL
       if (c0.close > c0.open + (index === 'NIFTY' ? 2 : 5)) {
@@ -749,7 +749,7 @@ export class StrategyEngine {
 
     // BUY_PUT on ORL Breakdown Trap
     if (sess.openingRangeLow > 0 && c1.close < sess.openingRangeLow && c0.high <= sess.openingRangeLow * 1.0005 && c0.close < c1.low) {
-      const structureId = `OPENING_TRAP_${sess.openingRangeLow}_PUT_${sess.sessionDateIST}`;
+      const structureId = `OPENING_TRAP_${sess.openingRangeLow}_PUT_${new Date(c0.timestamp).getTime()}`;
 
       // Rule 8/19: Red candle for PUT
       if (c0.close < c0.open - (index === 'NIFTY' ? 2 : 5)) {
@@ -806,7 +806,7 @@ export class StrategyEngine {
     // BUY_PUT on CE Wall Rejection
     // Rule 10: Dominant wall must be tested twice
     if (ceWallTests >= 2 && spot < wallAbove && spot >= wallAbove - step) {
-      const structureId = `OI_WALL_REJECTION_${wallAbove}_PUT_${sess.sessionDateIST}`;
+      const structureId = `OI_WALL_REJECTION_${wallAbove}_PUT_${new Date(c0.timestamp).getTime()}`;
 
       // Rule 8/19: For PUT, confirmation candle MUST be red
       if (c0.close < c0.open - (index === 'NIFTY' ? 1 : 3)) { // Red candle for PUT
@@ -843,7 +843,7 @@ export class StrategyEngine {
     // BUY_CALL on PE Wall Rejection
     // Rule 10: Dominant wall must be tested twice
     if (peWallTests >= 2 && spot > wallBelow && spot <= wallBelow + step) {
-      const structureId = `OI_WALL_REJECTION_${wallBelow}_CALL_${sess.sessionDateIST}`;
+      const structureId = `OI_WALL_REJECTION_${wallBelow}_CALL_${new Date(c0.timestamp).getTime()}`;
 
       // Rule 8/19: For CALL, confirmation candle MUST be green
       if (c0.close > c0.open + (index === 'NIFTY' ? 1 : 3)) { // Green candle for CALL
