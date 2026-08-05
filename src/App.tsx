@@ -528,7 +528,7 @@ export default function App() {
                             </td>
                             <td className="px-4 py-3 text-gray-200 font-bold">₹{sig.entry || sig.entryPrice}</td>
                             <td className="px-4 py-3 text-white font-bold">
-                              ₹{sig.status === 'CLOSED' ? (sig.exitPrice || sig.latestPrice || sig.entryPrice) : (sig.latestPrice || sig.entryPrice)}
+                              ₹{sig.status === 'CLOSED' ? (sig.exitPrice !== undefined ? sig.exitPrice : (sig.latestPrice || sig.entryPrice)) : (sig.latestPrice || sig.entryPrice)}
                             </td>
                             <td className={cn(
                               "px-4 py-3 text-right font-bold font-mono text-xs whitespace-nowrap",

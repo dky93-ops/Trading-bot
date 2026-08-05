@@ -144,6 +144,18 @@ export class UpstoxService {
 
   private async recordOneMinOptionChain() {
     if (!this.settings.accessToken) return;
+
+    // Only record during market hours (09:15 to 15:30 IST)
+    const now = new Date();
+    const istTime = new Date(now.toLocaleString("en-US", {timeZone: "Asia/Kolkata"}));
+    const hours = istTime.getHours();
+    const minutes = istTime.getMinutes();
+    const timeStr = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+    
+    if (timeStr < '09:15' || timeStr >= '15:31') {
+      return; // Outside market hours
+    }
+
     try {
       const niftyExpiry = await this.getNearestExpiry('NSE_INDEX|Nifty 50');
       await this.getOptionChain('NSE_INDEX|Nifty 50', niftyExpiry);
@@ -520,6 +532,9 @@ export class UpstoxService {
           sig.status = 'CLOSED';
           sig.exitPrice = sig.latestPrice || sig.entryPrice;
           sig.exitTime = Date.now();
+          const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
+          const lots = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
+          sig.realizedPnL = Number(((sig.exitPrice - sig.entryPrice) * 75 * lots).toFixed(2));
         }
       }
     }
@@ -544,6 +559,9 @@ export class UpstoxService {
           sig.status = 'CLOSED';
           sig.exitPrice = sig.latestPrice || sig.entryPrice;
           sig.exitTime = Date.now();
+          const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
+          const lots = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
+          sig.realizedPnL = Number(((sig.exitPrice - sig.entryPrice) * 75 * lots).toFixed(2));
         }
       }
     }
@@ -567,7 +585,7 @@ export class UpstoxService {
       const curPrice = sig.latestPrice || sig.entryPrice;
       const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
       const lotConfig = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
-      const qty = 25 * lotConfig;
+      const qty = 75 * lotConfig;
       unrealized += (curPrice - sig.entryPrice) * qty;
     }
 
