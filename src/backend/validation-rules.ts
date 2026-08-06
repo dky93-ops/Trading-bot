@@ -137,14 +137,14 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
       side = 'pe'; // PE wall trapped
       if (setup.level <= ctx.spotPrice) return fail('FAILED_DOMINANT_WALL: Opening Trap level (support) must be above spot after breakdown');
     }
-  } else if (setup.setupType.includes('CONTINUATION_BREAKOUT') || (setup.setupType === 'FAILED_RETEST' && setup.direction === 'CALL')) {
+  } else if (setup.setupType === 'CONTINUATION_BREAKOUT' || (setup.setupType === 'FAILED_RETEST' && setup.direction === 'CALL')) {
     side = 'ce';
     if (setup.level >= ctx.spotPrice) return fail('FAILED_DOMINANT_WALL: Breakout level must be below spot');
-  } else if (setup.setupType.includes('CONTINUATION_BREAKDOWN') || (setup.setupType === 'FAILED_RETEST' && setup.direction === 'PUT')) {
+  } else if (setup.setupType === 'CONTINUATION_BREAKDOWN' || (setup.setupType === 'FAILED_RETEST' && setup.direction === 'PUT')) {
     side = 'pe';
     if (setup.level <= ctx.spotPrice) return fail('FAILED_DOMINANT_WALL: Breakdown level must be above spot');
   } else {
-    side = setup.direction === 'CALL' ? 'pe' : 'ce';
+    return fail('FAILED_DOMINANT_WALL: Unknown setup family contextual wall');
   }
 
   const optData = side === 'pe' ? levelRow.pe : levelRow.ce;
@@ -163,21 +163,17 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
     return fail('FAILED_DOMINANT_WALL: Strike OI is not 1.5x average of surrounding strikes');
   }
 
-  if (optData.oiChange < 0) { // simplified, a strong negative could be < -some_threshold
+  if (optData.oiChange < 0) { 
     return fail('FAILED_DOMINANT_WALL: OI is reversing against the wall');
   }
 
-  if (setup.direction === 'CALL' && setup.level > ctx.spotPrice) {
-    // If buying call, wall should ideally be below spot as support. If setup is breakout, maybe above.
-    // Given standard rules, this should verify correct side. Let's just check if setupType expects it.
-    if (setup.setupType === 'OI_WALL_REJECTION') return fail('FAILED_DOMINANT_WALL: Wall on wrong side of spot');
-  }
-  if (setup.direction === 'PUT' && setup.level < ctx.spotPrice) {
-    if (setup.setupType === 'OI_WALL_REJECTION') return fail('FAILED_DOMINANT_WALL: Wall on wrong side of spot');
-  }
-
-  if (setup.wallTestCount !== undefined && setup.wallTestCount < 1) {
-    return fail('FAILED_DOMINANT_WALL: Wall has not been reacted to before in the session');
+  if (setup.setupType === 'OI_WALL_REJECTION') {
+    if (setup.wallTestCount === undefined || setup.wallTestCount < 2) {
+      return fail('FAILED_DOMINANT_WALL: Wall must have prior spot reaction (>= 2 tests) in current session');
+    }
+  } else {
+    // For other families, the setup structure itself (breakout, retest, trap) is the required reaction.
+    // If we reach here, the structure rules have already confirmed the reaction.
   }
 
   return pass();
@@ -427,68 +423,66 @@ export function rule18BrokenLevelReclaimedInvalidation(ctx: ValidationContext, s
 
 // RULE 19 — OVERALL AGREEMENT
 export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
-  // 1. Check Family Specific Confirmations
+  // 1. Level validity
+  if (setup.level <= 0) return fail('FAILED_OVERALL_AGREEMENT: Invalid level');
+  if (setup.direction === 'CALL' && ctx.spotPrice < setup.level) return fail('FAILED_OVERALL_AGREEMENT: Level no longer intact (spot below support)');
+  if (setup.direction === 'PUT' && ctx.spotPrice > setup.level) return fail('FAILED_OVERALL_AGREEMENT: Level no longer intact (spot above resistance)');
+
+  // 2. Data presence
+  if (!setup.premiumSeriesLast3 || setup.premiumSeriesLast3.length < 3) return fail('FAILED_OVERALL_AGREEMENT: Premium data missing');
+  if (!setup.oiSeriesLast3 || setup.oiSeriesLast3.length < 3) return fail('FAILED_OVERALL_AGREEMENT: OI data missing');
+  if (!setup.oppOiSeriesLast3 || setup.oppOiSeriesLast3.length < 3) return fail('FAILED_OVERALL_AGREEMENT: Opposite OI data missing');
+
+  // 3. Premium Direction
+  const [p1, p2, p3] = setup.premiumSeriesLast3;
+  if (!(p3 > p2 && p2 > p1)) return fail('FAILED_OVERALL_AGREEMENT: Premium not strictly rising');
+
+  // 4. OI Direction
+  const [o1, o2, o3] = setup.oiSeriesLast3;
+  const oiFalling = o3 < o2 && o2 < o1;
+  const [oo1, oo2, oo3] = setup.oppOiSeriesLast3;
+  const oppOiRising = oo3 > oo2 && oo2 > oo1;
+
+  // 5. Family Specific Checks
   if (setup.setupType === 'FAILED_RETEST') {
-    if (setup.barsSinceRetest === undefined || setup.barsSinceRetest < 1 || setup.barsSinceRetest > 5) {
-      return fail('FAILED_OVERALL_AGREEMENT: Retest quality is ambiguous or weak');
-    }
+    if (setup.barsSinceRetest === undefined || setup.barsSinceRetest < 1 || setup.barsSinceRetest > 5) return fail('FAILED_OVERALL_AGREEMENT: Missing or weak retest structure');
+    if (!setup.c1 || !setup.c2) return fail('FAILED_OVERALL_AGREEMENT: Missing FAILED_RETEST structure candles');
+    if (setup.direction === 'CALL' && !oiFalling) return fail('FAILED_OVERALL_AGREEMENT: CE OI must be falling for CALL FAILED_RETEST');
+    if (setup.direction === 'PUT' && !oiFalling) return fail('FAILED_OVERALL_AGREEMENT: PE OI must be falling for PUT FAILED_RETEST');
   } else if (setup.setupType === 'CONTINUATION_BREAKDOWN') {
-    if (setup.barsSinceBreakout === undefined || setup.barsSinceBreakout < 1) {
-      return fail('FAILED_OVERALL_AGREEMENT: Pause below level not confirmed');
-    }
+    if (setup.barsSinceBreakout === undefined || setup.barsSinceBreakout < 1) return fail('FAILED_OVERALL_AGREEMENT: Pause below level not confirmed');
+    if (!setup.c1 || !setup.c2) return fail('FAILED_OVERALL_AGREEMENT: Missing CONTINUATION_BREAKDOWN structure candles');
+    if (setup.direction !== 'PUT') return fail('FAILED_OVERALL_AGREEMENT: CONTINUATION_BREAKDOWN must be PUT');
+    if (!oiFalling) return fail('FAILED_OVERALL_AGREEMENT: PE OI must be falling for PUT CONTINUATION_BREAKDOWN');
   } else if (setup.setupType === 'CONTINUATION_BREAKOUT') {
-    if (setup.barsSinceBreakout === undefined || setup.barsSinceBreakout < 1) {
-      return fail('FAILED_OVERALL_AGREEMENT: Pause above level not confirmed');
-    }
+    if (setup.barsSinceBreakout === undefined || setup.barsSinceBreakout < 1) return fail('FAILED_OVERALL_AGREEMENT: Pause above level not confirmed');
+    if (!setup.c1 || !setup.c2) return fail('FAILED_OVERALL_AGREEMENT: Missing CONTINUATION_BREAKOUT structure candles');
+    if (setup.direction !== 'CALL') return fail('FAILED_OVERALL_AGREEMENT: CONTINUATION_BREAKOUT must be CALL');
+    if (!oiFalling) return fail('FAILED_OVERALL_AGREEMENT: CE OI must be falling for CALL CONTINUATION_BREAKOUT');
   } else if (setup.setupType === 'OPENING_TRAP') {
-    if (!setup.c1 || !setup.c0) {
-      return fail('FAILED_OVERALL_AGREEMENT: Opening range trap structure missing');
-    }
+    if (!setup.c1 || !setup.c0) return fail('FAILED_OVERALL_AGREEMENT: Opening range trap structure missing');
+    if (setup.direction === 'CALL' && !oiFalling) return fail('FAILED_OVERALL_AGREEMENT: CE OI must be falling for CALL OPENING_TRAP');
+    if (setup.direction === 'PUT' && !oiFalling) return fail('FAILED_OVERALL_AGREEMENT: PE OI must be falling for PUT OPENING_TRAP');
   } else if (setup.setupType === 'OI_WALL_REJECTION') {
-    if (setup.wallTestCount === undefined || setup.wallTestCount < 2) {
-      return fail('FAILED_OVERALL_AGREEMENT: Wall rejection requires multiple tests');
-    }
+    if (setup.wallTestCount === undefined || setup.wallTestCount < 2) return fail('FAILED_OVERALL_AGREEMENT: Wall rejection requires multiple tests');
+    if (setup.direction === 'CALL' && !oppOiRising) return fail('FAILED_OVERALL_AGREEMENT: PE OI must be rising for CALL OI_WALL_REJECTION');
+    if (setup.direction === 'PUT' && !oppOiRising) return fail('FAILED_OVERALL_AGREEMENT: CE OI must be rising for PUT OI_WALL_REJECTION');
   } else {
     return fail('FAILED_OVERALL_AGREEMENT: Unknown setup family');
   }
 
-  // 2. Check general direction agreement
-  if (setup.direction === 'CALL') {
-    if (ctx.spotPrice < setup.level) return fail('FAILED_OVERALL_AGREEMENT: Level no longer intact (spot below support)');
-  } else {
-    if (ctx.spotPrice > setup.level) return fail('FAILED_OVERALL_AGREEMENT: Level no longer intact (spot above resistance)');
-  }
-
-  // 3. Direction-aware & Family-aware OI check
-  if (!setup.oiSeriesLast3 || setup.oiSeriesLast3.length < 3) {
-    return fail('FAILED_OVERALL_AGREEMENT: OI data missing');
-  }
-  if (!setup.oppOiSeriesLast3 || setup.oppOiSeriesLast3.length < 3) {
-    return fail('FAILED_OVERALL_AGREEMENT: Opposite OI data missing');
-  }
-
-  const [o1, o2, o3] = setup.oiSeriesLast3;
-  const oiFalling = o3 < o2 && o2 < o1;
-
-  const [oo1, oo2, oo3] = setup.oppOiSeriesLast3;
-  const oppOiRising = oo3 > oo2 && oo2 > oo1;
-
-  if (setup.direction === 'CALL') {
-    if (setup.setupType === 'OI_WALL_REJECTION') {
-      if (!oppOiRising) return fail('FAILED_OVERALL_AGREEMENT: PE OI must be rising for CALL wall rejection');
-    } else {
-      if (!oiFalling) return fail('FAILED_OVERALL_AGREEMENT: CE OI must be falling for CALL breakout/retest');
-    }
-  } else {
-    if (setup.setupType === 'OI_WALL_REJECTION') {
-      if (!oppOiRising) return fail('FAILED_OVERALL_AGREEMENT: CE OI must be rising for PUT wall rejection');
-    } else {
-      if (!oiFalling) return fail('FAILED_OVERALL_AGREEMENT: PE OI must be falling for PUT breakdown/retest');
-    }
-  }
-
+  // 6. Component Confirmations
   const roomResult = rule16RoomToTarget(setup, ctx);
   if (!roomResult.passed) return fail(`FAILED_OVERALL_AGREEMENT: ${roomResult.reason}`);
+
+  const confResult = rule12ConfirmationCandle(setup, ctx.index);
+  if (!confResult.passed) return fail(`FAILED_OVERALL_AGREEMENT: ${confResult.reason}`);
+
+  const breakResult = rule10BreakoutConfirmation(setup);
+  if (!breakResult.passed) return fail(`FAILED_OVERALL_AGREEMENT: ${breakResult.reason}`);
+  
+  const retestResult = rule11RetestQuality(setup);
+  if (!retestResult.passed) return fail(`FAILED_OVERALL_AGREEMENT: ${retestResult.reason}`);
 
   const mixedDirResult = rule14MixedDirection(setup);
   if (!mixedDirResult.passed) return fail(`FAILED_OVERALL_AGREEMENT: ${mixedDirResult.reason}`);
