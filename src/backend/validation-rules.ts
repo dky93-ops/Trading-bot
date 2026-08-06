@@ -198,20 +198,22 @@ export function rule10BreakoutConfirmation(setup: ProposedSetup): RuleResult {
 // RULE 11 — RETEST QUALITY
 export function rule11RetestQuality(setup: ProposedSetup): RuleResult {
   if (setup.setupType.includes('RETEST')) {
-    if (!setup.c2) return pass();
+    if (!setup.c2) return fail('FAILED_RETEST_QUALITY: Missing pre-retest candle (c2)');
     const isCall = setup.direction === 'CALL';
     if (isCall && setup.c1.close <= setup.level) return fail('FAILED_RETEST_QUALITY: Reclaimed inside old range instantly');
     if (!isCall && setup.c1.close >= setup.level) return fail('FAILED_RETEST_QUALITY: Reclaimed inside old range instantly');
     
-    if (setup.barsSinceRetest !== undefined && (setup.barsSinceRetest < 1 || setup.barsSinceRetest > 5)) {
-      return fail('FAILED_RETEST_QUALITY: Retest outside allowed window');
+    if (setup.barsSinceRetest === undefined || setup.barsSinceRetest < 1 || setup.barsSinceRetest > 5) {
+      return fail('FAILED_RETEST_QUALITY: Retest outside allowed window or missing data');
     }
     const c1Range = setup.c1.high - setup.c1.low;
     const c1Body = Math.abs(setup.c1.close - setup.c1.open);
+    if (c1Range === 0) return fail('FAILED_RETEST_QUALITY: Zero range retest candle');
     if (c1Body / c1Range < 0.2) return fail('FAILED_RETEST_QUALITY: Shallow wick-only retest or weak candle');
     
     // Indecisive retest candle check
-    if (c1Range < (setup.impulseRange || 10) * 0.2) return fail('FAILED_RETEST_QUALITY: Weak/indecisive retest candle');
+    if (!setup.impulseRange) return fail('FAILED_RETEST_QUALITY: Missing impulse range for comparison');
+    if (c1Range < setup.impulseRange * 0.2) return fail('FAILED_RETEST_QUALITY: Weak/indecisive retest candle');
   }
   return pass();
 }
@@ -261,19 +263,19 @@ export function rule14MixedDirection(setup: ProposedSetup): RuleResult {
   const { spotMoveFromLevel, premiumSeriesLast3, oiSeriesLast3, oppOiSeriesLast3 } = setup;
 
   if (spotMoveFromLevel === undefined) {
-    return fail('FAILED_MIXED_DIR: Missing spot structure data');
+    return fail('FAILED_MIXED_DIRECTION: Missing spot structure data');
   }
   
   if (!premiumSeriesLast3 || premiumSeriesLast3.length < 3) {
-    return fail('FAILED_MIXED_DIR: Missing premium series data');
+    return fail('FAILED_MIXED_DIRECTION: Missing premium series data');
   }
   
   if (!oiSeriesLast3 || oiSeriesLast3.length < 3) {
-    return fail('FAILED_MIXED_DIR: Missing OI series data');
+    return fail('FAILED_MIXED_DIRECTION: Missing OI series data');
   }
 
   if (!oppOiSeriesLast3 || oppOiSeriesLast3.length < 3) {
-    return fail('FAILED_MIXED_DIR: Missing opposite OI series data');
+    return fail('FAILED_MIXED_DIRECTION: Missing opposite OI series data');
   }
 
   const [p1, p2, p3] = premiumSeriesLast3;
@@ -281,21 +283,16 @@ export function rule14MixedDirection(setup: ProposedSetup): RuleResult {
 
   const [o1, o2, o3] = oiSeriesLast3;
   const oiBullish = o3 > o2 && o2 > o1;
-
-  const [oo1, oo2, oo3] = oppOiSeriesLast3;
-  const oppOiBullish = oo3 > oo2 && oo2 > oo1;
-  const oppOiDominates = oppOiBullish && (oo3 - oo1) > (o3 - o1);
+  const oiBearish = o3 < o2 && o2 < o1;
 
   if (setup.direction === 'CALL') {
-    if (spotMoveFromLevel <= 0) return fail('FAILED_MIXED_DIR: Spot structure not bullish');
-    if (!premiumBullish) return fail('FAILED_MIXED_DIR: CE Premium not strictly bullish');
-    if (!oiBullish) return fail('FAILED_MIXED_DIR: OI does not support bullish move');
-    if (oppOiDominates) return fail('FAILED_MIXED_DIR: Opposite side OI dominates');
+    if (spotMoveFromLevel <= 0) return fail('FAILED_MIXED_DIRECTION: Spot structure not bullish');
+    if (!premiumBullish) return fail('FAILED_MIXED_DIRECTION: CE Premium not strictly bullish');
+    if (!oiBullish) return fail('FAILED_MIXED_DIRECTION: OI not strictly bullish');
   } else {
-    if (spotMoveFromLevel >= 0) return fail('FAILED_MIXED_DIR: Spot structure not bearish');
-    if (!premiumBullish) return fail('FAILED_MIXED_DIR: PE Premium not strictly bullish');
-    if (!oiBullish) return fail('FAILED_MIXED_DIR: OI does not support bearish move');
-    if (oppOiDominates) return fail('FAILED_MIXED_DIR: Opposite side OI dominates');
+    if (spotMoveFromLevel >= 0) return fail('FAILED_MIXED_DIRECTION: Spot structure not bearish');
+    if (!premiumBullish) return fail('FAILED_MIXED_DIRECTION: PE Premium not strictly bullish');
+    if (!oiBearish) return fail('FAILED_MIXED_DIRECTION: OI not strictly bearish');
   }
 
   return pass();
@@ -303,12 +300,12 @@ export function rule14MixedDirection(setup: ProposedSetup): RuleResult {
 
 // RULE 15 — OVEREXTENSION FILTER
 export function rule15Overextension(setup: ProposedSetup, spotPrice: number): RuleResult {
-  const distance = Math.abs(spotPrice - setup.level);
-  if (setup.impulseRange && distance > 1.5 * setup.impulseRange) {
-    return fail('FAILED_OVEREXTENSION: Move from breakout level > 1.5x impulse candle range');
+  if (!setup.impulseRange) {
+    return fail('FAILED_OVEREXTENSION: Impulse range or volatility data is missing');
   }
-  if (!setup.impulseRange && distance > 60) {
-    return fail('FAILED_OVEREXTENSION: Move from breakout level exceeds fixed distance');
+  const distance = Math.abs(spotPrice - setup.level);
+  if (distance > 1.5 * setup.impulseRange) {
+    return fail('FAILED_OVEREXTENSION: Move from breakout level > 1.5x impulse candle range');
   }
   return pass();
 }
@@ -456,11 +453,23 @@ export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSe
     }
   }
 
-  const risk = Math.max(10, Math.abs(ctx.spotPrice - setup.stopLoss));
-  const target1Dist = Math.abs(setup.target1 - ctx.spotPrice);
-  if (target1Dist / risk < 0.8) {
-    return fail('FAILED_OVERALL_AGREEMENT: Reward/risk is weak (< 0.8R)');
-  }
+  const roomResult = rule16RoomToTarget(setup, ctx);
+  if (!roomResult.passed) return fail(`FAILED_OVERALL_AGREEMENT: ${roomResult.reason}`);
+
+  const mixedDirResult = rule14MixedDirection(setup);
+  if (!mixedDirResult.passed) return fail(`FAILED_OVERALL_AGREEMENT: ${mixedDirResult.reason}`);
+
+  const overextResult = rule15Overextension(setup, ctx.spotPrice);
+  if (!overextResult.passed) return fail(`FAILED_OVERALL_AGREEMENT: ${overextResult.reason}`);
+
+  const chopResult = rule17ChopFilter(ctx);
+  if (!chopResult.passed) return fail(`FAILED_OVERALL_AGREEMENT: ${chopResult.reason}`);
+
+  const reclaimResult = rule18BrokenLevelReclaimedInvalidation(ctx, setup);
+  if (!reclaimResult.passed) return fail(`FAILED_OVERALL_AGREEMENT: ${reclaimResult.reason}`);
+
+  const reuseResult = rule6FailedLevel(ctx.sessState, setup);
+  if (!reuseResult.passed) return fail(`FAILED_OVERALL_AGREEMENT: ${reuseResult.reason}`);
 
   return pass();
 }
