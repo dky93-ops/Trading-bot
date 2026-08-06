@@ -299,49 +299,58 @@ export class StrategyEngine {
 
     let selectedSignal: Signal | null = null;
 
-    // ----------------------------------------------------
-    // PRIORITY 1: FAILED_RETEST (Failed Retest Reversal)
-    // ----------------------------------------------------
-    if (!selectedSignal && this.settings.strategies.failedRetest?.enabled && !isStratActive('FAILED_RETEST')) {
-      selectedSignal = await this.checkFailedRetest(
-        valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
-      );
-    }
+    try {
+      // ----------------------------------------------------
+      // PRIORITY 1: FAILED_RETEST (Failed Retest Reversal)
+      // ----------------------------------------------------
+      if (!selectedSignal && this.settings.strategies.failedRetest?.enabled && !isStratActive('FAILED_RETEST')) {
+        selectedSignal = await this.checkFailedRetest(
+          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
+        );
+      }
 
-    // ----------------------------------------------------
-    // PRIORITY 2: CONTINUATION_BREAKDOWN
-    // ----------------------------------------------------
-    if (!selectedSignal && this.settings.strategies.continuationBreakdown?.enabled && !isStratActive('CONTINUATION_BREAKDOWN')) {
-      selectedSignal = await this.checkContinuationBreakdown(
-        valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestPEWallBelow, passedFilters, failedFilters
-      );
-    }
+      // ----------------------------------------------------
+      // PRIORITY 2: CONTINUATION_BREAKDOWN
+      // ----------------------------------------------------
+      if (!selectedSignal && this.settings.strategies.continuationBreakdown?.enabled && !isStratActive('CONTINUATION_BREAKDOWN')) {
+        selectedSignal = await this.checkContinuationBreakdown(
+          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestPEWallBelow, passedFilters, failedFilters
+        );
+      }
 
-    // ----------------------------------------------------
-    // PRIORITY 3: CONTINUATION_BREAKOUT
-    // ----------------------------------------------------
-    if (!selectedSignal && this.settings.strategies.continuationBreakout?.enabled && !isStratActive('CONTINUATION_BREAKOUT')) {
-      selectedSignal = await this.checkContinuationBreakout(
-        valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, passedFilters, failedFilters
-      );
-    }
+      // ----------------------------------------------------
+      // PRIORITY 3: CONTINUATION_BREAKOUT
+      // ----------------------------------------------------
+      if (!selectedSignal && this.settings.strategies.continuationBreakout?.enabled && !isStratActive('CONTINUATION_BREAKOUT')) {
+        selectedSignal = await this.checkContinuationBreakout(
+          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, passedFilters, failedFilters
+        );
+      }
 
-    // ----------------------------------------------------
-    // PRIORITY 4: OPENING_TRAP (Opening Breakout Trap)
-    // ----------------------------------------------------
-    if (!selectedSignal && this.settings.strategies.openingTrap?.enabled && !isStratActive('OPENING_TRAP')) {
-      selectedSignal = await this.checkOpeningTrap(
-        valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
-      );
-    }
+      // ----------------------------------------------------
+      // PRIORITY 4: OPENING_TRAP (Opening Breakout Trap)
+      // ----------------------------------------------------
+      if (!selectedSignal && this.settings.strategies.openingTrap?.enabled && !isStratActive('OPENING_TRAP')) {
+        selectedSignal = await this.checkOpeningTrap(
+          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
+        );
+      }
 
-    // ----------------------------------------------------
-    // PRIORITY 5: OI_WALL_REJECTION
-    // ----------------------------------------------------
-    if (!selectedSignal && this.settings.strategies.oiWallRejection?.enabled && !isStratActive('OI_WALL_REJECTION')) {
-      selectedSignal = await this.checkOIWallRejection(
-        valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
-      );
+      // ----------------------------------------------------
+      // PRIORITY 5: OI_WALL_REJECTION
+      // ----------------------------------------------------
+      if (!selectedSignal && this.settings.strategies.oiWallRejection?.enabled && !isStratActive('OI_WALL_REJECTION')) {
+        selectedSignal = await this.checkOIWallRejection(
+          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
+        );
+      }
+    } catch (err: any) {
+      if (err.message && err.message.includes('FINAL_SAFETY_FAILED')) {
+        failedFilters.push(err.message);
+        selectedSignal = null;
+      } else {
+        throw err;
+      }
     }
 
     if (selectedSignal) {
@@ -422,6 +431,27 @@ export class StrategyEngine {
     const result = runSetupValidation(valCtx, setup, validLevels, testCount);
     if (!result.passed) {
       failed.push(`[STRICT 20-RULE] ${setupType} ${direction} Rejected: ${result.reason}`);
+      if (result.reason && result.reason.includes('FAILED_RECLAIMED_LEVEL')) {
+        localSess.failedLevelsToday = localSess.failedLevelsToday || [];
+        if (!localSess.failedLevelsToday.includes(setup.level)) {
+          localSess.failedLevelsToday.push(setup.level);
+        }
+        localSess.failedStructuresToday = localSess.failedStructuresToday || [];
+        if (setup.structureId && !localSess.failedStructuresToday.includes(setup.structureId)) {
+          localSess.failedStructuresToday.push(setup.structureId);
+        }
+        localSess.lastFailedSetupLevel = setup.level;
+        localSess.lastFailedStructureId = setup.structureId || null;
+        localSess.brokenLevelUnderWatch = null;
+        localSess.retestPendingFlag = false;
+        localSess.continuationPendingFlag = false;
+        if (localSess.activeStructureId === setup.structureId) {
+          localSess.activeStructureId = null;
+        }
+      }
+      if (result.reason && result.reason.includes('FAILED_FINAL_SAFETY_CHECK')) {
+        throw new Error(`FINAL_SAFETY_FAILED: ${result.reason}`);
+      }
       return false;
     }
     return true;
