@@ -33,6 +33,7 @@ export class StrategyEngine {
   private fetchOptionData: FetchOptionDataFn;
   private getOptionChain?: GetOptionChainFn;
   private getNearestExpiry?: GetNearestExpiryFn;
+  private getOptionChainHistory?: () => any[];
 
   private sessionStates: Record<string, LocalSessionState> = {
     'NIFTY': this.createInitialSessionState(),
@@ -43,13 +44,15 @@ export class StrategyEngine {
     state: AppState, 
     fetchOptionData: FetchOptionDataFn,
     getOptionChain?: GetOptionChainFn,
-    getNearestExpiry?: GetNearestExpiryFn
+    getNearestExpiry?: GetNearestExpiryFn,
+    getOptionChainHistory?: () => any[]
   ) {
     this.settings = settings;
     this.state = state;
     this.fetchOptionData = fetchOptionData;
     this.getOptionChain = getOptionChain;
     this.getNearestExpiry = getNearestExpiry;
+    this.getOptionChainHistory = getOptionChainHistory;
   }
 
   private createInitialSessionState() {
@@ -163,6 +166,8 @@ export class StrategyEngine {
 
     const instrumentKey = index === 'NIFTY' ? 'NSE_INDEX|Nifty 50' : 'NSE_INDEX|Nifty Bank';
     const step = index === 'NIFTY' ? 50 : 100;
+    const globalAtmStrike = Math.round(spotPrice / step) * step;
+    const seriesData = this.extractSeries(globalAtmStrike);
 
     // Primary Timeframe: Completed 1-minute live option-chain updates
     let candles1m = await getCandles(index, 1, 60);
@@ -371,8 +376,8 @@ export class StrategyEngine {
       action: 'BUY',
       strategy: 'NO_TRADE',
       entryPrice: 0,
-      stopLoss: 0,
-      target: 0,
+      stoploss: 0,
+      
       status: 'CLOSED',
       signal: 'NO_TRADE',
       strategy_family: 'NONE',
@@ -401,15 +406,83 @@ export class StrategyEngine {
   // STRATEGY 1: FAILED_RETEST (Failed Retest Reversal)
   // ====================================================
 
+  
+  private extractSeries(strike: number) {
+    const empty = {
+      spotSeriesLast3: [],
+      callPremiumSeriesLast3: [],
+      putPremiumSeriesLast3: [],
+      callOiSeriesLast3: [],
+      putOiSeriesLast3: [],
+      oppCallOiSeriesLast3: [],
+      oppPutOiSeriesLast3: [],
+      volumeSeriesLast3: [],
+      ivSeriesLast3: [],
+      deltaSeriesLast3: [],
+      thetaSeriesLast3: [],
+      gammaSeriesLast3: [],
+      vegaSeriesLast3: []
+    };
+
+    if (!this.getOptionChainHistory) return empty;
+    const history = this.getOptionChainHistory();
+    if (!history || history.length < 3) return empty;
+
+    const last3 = history.slice(-3);
+    const result = {
+      spotSeriesLast3: [] as number[],
+      callPremiumSeriesLast3: [] as number[],
+      putPremiumSeriesLast3: [] as number[],
+      callOiSeriesLast3: [] as number[],
+      putOiSeriesLast3: [] as number[],
+      oppCallOiSeriesLast3: [] as number[],
+      oppPutOiSeriesLast3: [] as number[],
+      volumeSeriesLast3: [] as number[],
+      ivSeriesLast3: [] as number[],
+      deltaSeriesLast3: [] as number[],
+      thetaSeriesLast3: [] as number[],
+      gammaSeriesLast3: [] as number[],
+      vegaSeriesLast3: [] as number[]
+    };
+
+    for (const snap of last3) {
+      // Assuming snap contains rows and spot
+      // Wait, we need to find the strike in rows
+      if (snap.spotPrice) {
+        result.spotSeriesLast3.push(snap.spotPrice);
+      }
+      
+      const row = snap.rows?.find((r: any) => r.strike === strike);
+      if (row) {
+        result.callPremiumSeriesLast3.push(row.ce?.ltp || 0);
+        result.putPremiumSeriesLast3.push(row.pe?.ltp || 0);
+        result.callOiSeriesLast3.push(row.ce?.oi || 0);
+        result.putOiSeriesLast3.push(row.pe?.oi || 0);
+        // opposite is same since we pass both, but we can populate them
+        result.oppCallOiSeriesLast3.push(row.ce?.oi || 0);
+        result.oppPutOiSeriesLast3.push(row.pe?.oi || 0);
+        
+        result.volumeSeriesLast3.push((row.ce?.volume || 0) + (row.pe?.volume || 0));
+        result.ivSeriesLast3.push(row.ce?.iv || row.pe?.iv || 0);
+        result.deltaSeriesLast3.push(row.ce?.delta || 0);
+        result.thetaSeriesLast3.push(row.ce?.theta || 0);
+        result.gammaSeriesLast3.push(row.ce?.gamma || 0);
+        result.vegaSeriesLast3.push(row.ce?.vega || 0);
+      }
+    }
+    
+    return result;
+  }
+
   private validateSetup(
     valCtx: ValidationContext, setupType: string, direction: 'CALL' | 'PUT', lvl: number,
-    c0: Candle, c1: Candle, c2: Candle | undefined, target1: number, target2: number, stopLoss: number,
+    c0: Candle, c1: Candle, c2: Candle | undefined, target1: number, target2: number, stoploss: number,
     opt: any, passed: string[], failed: string[], testCount: number = 0, structureId?: string,
     barsSinceBreakout?: number, barsSinceRetest?: number, impulseRange?: number, spotMoveFromLevel?: number,
-    premiumSeriesLast3?: number[], oiSeriesLast3?: number[]
+    seriesData?: any
   ): boolean {
     const setup: ProposedSetup = {
-      direction, level: lvl, setupType, c0, c1, c2, target1, target2, stopLoss,
+      direction, level: lvl, setupType, c0, c1, c2, target1, target2, stoploss,
       ceOpt: direction === 'CALL' ? opt : undefined,
       peOpt: direction === 'PUT' ? opt : undefined,
       structureId,
@@ -417,8 +490,19 @@ export class StrategyEngine {
       barsSinceRetest,
       impulseRange,
       spotMoveFromLevel,
-      premiumSeriesLast3,
-      oiSeriesLast3,
+      spotSeriesLast3: seriesData?.spotSeriesLast3 || [],
+      callPremiumSeriesLast3: seriesData?.callPremiumSeriesLast3 || [],
+      putPremiumSeriesLast3: seriesData?.putPremiumSeriesLast3 || [],
+      callOiSeriesLast3: seriesData?.callOiSeriesLast3 || [],
+      putOiSeriesLast3: seriesData?.putOiSeriesLast3 || [],
+      oppCallOiSeriesLast3: seriesData?.oppCallOiSeriesLast3 || [],
+      oppPutOiSeriesLast3: seriesData?.oppPutOiSeriesLast3 || [],
+      volumeSeriesLast3: seriesData?.volumeSeriesLast3 || [],
+      ivSeriesLast3: seriesData?.ivSeriesLast3 || [],
+      deltaSeriesLast3: seriesData?.deltaSeriesLast3 || [],
+      thetaSeriesLast3: seriesData?.thetaSeriesLast3 || [],
+      gammaSeriesLast3: seriesData?.gammaSeriesLast3 || [],
+      vegaSeriesLast3: seriesData?.vegaSeriesLast3 || [],
       wallTestCount: testCount
     };
     const localSess = valCtx.sessState as LocalSessionState;
@@ -518,7 +602,7 @@ export class StrategyEngine {
         const rewardRatio = roomPts / riskPts;
 
         if (rewardRatio >= 0.8 && sess.lastFailedSetupLevel !== lvl) {
-          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId)) continue;
+          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, seriesData)) continue;
           sess.brokenLevelUnderWatch = lvl;
           passed.push(`Failed Retest Call setup confirmed at level ${lvl}`);
           return this.createSignal(
@@ -562,7 +646,7 @@ export class StrategyEngine {
         const rewardRatio = roomPts / riskPts;
 
         if (rewardRatio >= 0.8 && sess.lastFailedSetupLevel !== lvl) {
-          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId)) continue;
+          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, seriesData)) continue;
           sess.brokenLevelUnderWatch = lvl;
           passed.push(`Failed Retest Put setup confirmed at level ${lvl}`);
           return this.createSignal(
@@ -635,7 +719,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / riskPts;
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKDOWN', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange)) continue;
+            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKDOWN', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange, undefined, seriesData)) continue;
             sess.brokenLevelUnderWatch = lvl;
             passed.push(`Continuation Breakdown Put confirmed below level ${lvl}`);
             return this.createSignal(
@@ -710,7 +794,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / riskPts;
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKOUT', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange)) continue;
+            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKOUT', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange, undefined, seriesData)) continue;
             sess.brokenLevelUnderWatch = lvl;
             passed.push(`Continuation Breakout Call confirmed above level ${lvl}`);
             return this.createSignal(
@@ -759,7 +843,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, spot - sess.openingRangeHigh);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'CALL', sess.openingRangeHigh, c0, c1, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId)) return null;
+            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'CALL', sess.openingRangeHigh, c0, c1, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, seriesData)) return null;
             sess.brokenLevelUnderWatch = sess.openingRangeHigh;
             passed.push(`Opening Trap Call confirmed at ORH level ${sess.openingRangeHigh}`);
             return this.createSignal(
@@ -795,7 +879,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, sess.openingRangeLow - spot);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'PUT', sess.openingRangeLow, c0, c1, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId)) return null;
+            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'PUT', sess.openingRangeLow, c0, c1, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, seriesData)) return null;
             sess.brokenLevelUnderWatch = sess.openingRangeLow;
             passed.push(`Opening Trap Put confirmed at ORL level ${sess.openingRangeLow}`);
             return this.createSignal(
@@ -852,7 +936,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, wallAbove - spot);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'PUT', wallAbove, c0, c0, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, ceWallTests, structureId)) return null;
+            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'PUT', wallAbove, c0, c0, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, ceWallTests, structureId, undefined, undefined, undefined, undefined, seriesData)) return null;
             sess.brokenLevelUnderWatch = wallAbove;
             passed.push(`CE Wall Rejection Put confirmed at ${wallAbove} (${ceWallTests} candle rejections)`);
             return this.createSignal(
@@ -889,7 +973,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, spot - wallBelow);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'CALL', wallBelow, c0, c0, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, peWallTests, structureId)) return null;
+            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'CALL', wallBelow, c0, c0, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, peWallTests, structureId, undefined, undefined, undefined, undefined, seriesData)) return null;
             sess.brokenLevelUnderWatch = wallBelow;
             passed.push(`PE Wall Rejection Call confirmed at ${wallBelow} (${peWallTests} candle rejections)`);
             return this.createSignal(
@@ -990,7 +1074,7 @@ export class StrategyEngine {
       entryPrice: premium,
       latestPrice: premium,
       highestPrice: premium,
-      stopLoss: slPrice,
+      stoploss: slPrice,
       target: target1Price,
       status: 'ACTIVE',
       tradeType: optType,
@@ -1085,7 +1169,7 @@ export class StrategyEngine {
       signal.highestPrice = Math.max(signal.highestPrice || currentOptPrice, currentOptPrice);
 
       const isCall = signal.direction === 'CALL' || signal.signal === 'BUY_CALL';
-      const initialRisk = signal.initialRiskPoints || (signal.entryPrice - signal.stopLoss);
+      const initialRisk = signal.initialRiskPoints || (signal.entryPrice - signal.stoploss);
 
       // ---------------------------------------------------------
       // RULE 1: SPOT LEVEL INVALIDATION
@@ -1107,8 +1191,8 @@ export class StrategyEngine {
       // ---------------------------------------------------------
       // RULE 2: PREMIUM SL BREACH (35%-50% Initial Risk / Stop Loss)
       // ---------------------------------------------------------
-      if (currentOptPrice <= signal.stopLoss) {
-        this.closeSignal(signal, signal.stopLoss, `PREMIUM SL TRIGGERED: Option price ₹${currentOptPrice.toFixed(1)} breached stop-loss level ₹${signal.stopLoss}`);
+      if (currentOptPrice <= signal.stoploss) {
+        this.closeSignal(signal, signal.stoploss, `PREMIUM SL TRIGGERED: Option price ₹${currentOptPrice.toFixed(1)} breached stop-loss level ₹${signal.stoploss}`);
         newSignals.push(signal);
         continue;
       }
@@ -1147,8 +1231,8 @@ export class StrategyEngine {
         signal.breakevenShifted = true;
         signal.trailingStopActiveFlag = true;
         // Shift stop-loss to breakeven (entry price)
-        signal.stopLoss = Math.max(signal.stopLoss, signal.entryPrice);
-        signal.stoploss = signal.stopLoss;
+        signal.stoploss = Math.max(signal.stoploss, signal.entryPrice);
+        signal.stoploss = signal.stoploss;
         signal.reason.push(`TARGET 1 HIT (₹${signal.target1}): Dynamic SL shifted to Breakeven (₹${signal.entryPrice})`);
       }
 
@@ -1162,8 +1246,8 @@ export class StrategyEngine {
       // Trailing Stop Adjustment after Target 1 is active
       if (signal.firstTargetHitFlag && signal.highestPrice > signal.entryPrice) {
         const trailingSL = Number((signal.highestPrice - initialRisk * 0.50).toFixed(2));
-        if (trailingSL > signal.stopLoss) {
-          signal.stopLoss = trailingSL;
+        if (trailingSL > signal.stoploss) {
+          signal.stoploss = trailingSL;
           signal.stoploss = trailingSL;
         }
       }

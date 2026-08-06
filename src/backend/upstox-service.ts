@@ -165,7 +165,8 @@ export class UpstoxService {
       this.state, 
       this.fetchOptionData.bind(this),
       this.getOptionChain.bind(this),
-      this.getNearestExpiry.bind(this)
+      this.getNearestExpiry.bind(this),
+      this.getOptionChainHistory.bind(this)
     );
 
     // Load recorded 1-minute option chain history from disk

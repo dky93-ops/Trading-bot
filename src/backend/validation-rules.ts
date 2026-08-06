@@ -16,7 +16,7 @@ export interface ValidationContext {
 export interface ProposedSetup {
   direction: 'CALL' | 'PUT';
   level: number;
-  setupType: string; // e.g. FAILED_RETEST, CONTINUATION_BREAKDOWN
+  setupType: string;
   c0: Candle;
   c1: Candle;
   c2?: Candle;
@@ -29,10 +29,19 @@ export interface ProposedSetup {
   barsSinceRetest?: number;
   impulseRange?: number;
   spotMoveFromLevel?: number;
-  premiumSeriesLast3?: number[];
-  oppPremiumSeriesLast3?: number[];
-  oiSeriesLast3?: number[];
-  oppOiSeriesLast3?: number[];
+  spotSeriesLast3: number[];
+  callPremiumSeriesLast3: number[];
+  putPremiumSeriesLast3: number[];
+  callOiSeriesLast3: number[];
+  putOiSeriesLast3: number[];
+  oppCallOiSeriesLast3: number[];
+  oppPutOiSeriesLast3: number[];
+  volumeSeriesLast3: number[];
+  ivSeriesLast3: number[];
+  deltaSeriesLast3: number[];
+  thetaSeriesLast3: number[];
+  gammaSeriesLast3: number[];
+  vegaSeriesLast3: number[];
   structureId?: string;
   retestTouchCount?: number;
   wallTestCount?: number;
