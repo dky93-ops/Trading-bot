@@ -119,7 +119,34 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
   if (levelRowIdx === -1) return fail('FAILED_DOMINANT_WALL: Setup level not in chain');
 
   const levelRow = ctx.chainRows[levelRowIdx];
-  const side = setup.direction === 'CALL' ? 'pe' : 'ce'; // For CALL, we need PE wall as support. If we expect resistance, adjust logic based on setupType
+  let side: 'pe' | 'ce';
+
+  if (setup.setupType === 'OI_WALL_REJECTION') {
+    if (setup.direction === 'CALL') {
+      side = 'pe'; // CALL on PE wall rejection
+      if (setup.level >= ctx.spotPrice) return fail('FAILED_DOMINANT_WALL: PE Wall Rejection level must be below spot');
+    } else {
+      side = 'ce'; // PUT on CE wall rejection
+      if (setup.level <= ctx.spotPrice) return fail('FAILED_DOMINANT_WALL: CE Wall Rejection level must be above spot');
+    }
+  } else if (setup.setupType === 'OPENING_TRAP') {
+    if (setup.direction === 'CALL') {
+      side = 'ce'; // CE wall trapped
+      if (setup.level >= ctx.spotPrice) return fail('FAILED_DOMINANT_WALL: Opening Trap level (resistance) must be below spot after breakout');
+    } else {
+      side = 'pe'; // PE wall trapped
+      if (setup.level <= ctx.spotPrice) return fail('FAILED_DOMINANT_WALL: Opening Trap level (support) must be above spot after breakdown');
+    }
+  } else if (setup.setupType.includes('CONTINUATION_BREAKOUT') || (setup.setupType === 'FAILED_RETEST' && setup.direction === 'CALL')) {
+    side = 'ce';
+    if (setup.level >= ctx.spotPrice) return fail('FAILED_DOMINANT_WALL: Breakout level must be below spot');
+  } else if (setup.setupType.includes('CONTINUATION_BREAKDOWN') || (setup.setupType === 'FAILED_RETEST' && setup.direction === 'PUT')) {
+    side = 'pe';
+    if (setup.level <= ctx.spotPrice) return fail('FAILED_DOMINANT_WALL: Breakdown level must be above spot');
+  } else {
+    side = setup.direction === 'CALL' ? 'pe' : 'ce';
+  }
+
   const optData = side === 'pe' ? levelRow.pe : levelRow.ce;
 
   let sumOI = 0;
@@ -260,7 +287,7 @@ export function rule13PremiumConfirmation(setup: ProposedSetup): RuleResult {
 
 // RULE 14 — MIXED DIRECTION FILTER
 export function rule14MixedDirection(setup: ProposedSetup): RuleResult {
-  const { spotMoveFromLevel, premiumSeriesLast3, oiSeriesLast3, oppOiSeriesLast3 } = setup;
+  const { spotMoveFromLevel, premiumSeriesLast3 } = setup;
 
   if (spotMoveFromLevel === undefined) {
     return fail('FAILED_MIXED_DIRECTION: Missing spot structure data');
@@ -270,29 +297,15 @@ export function rule14MixedDirection(setup: ProposedSetup): RuleResult {
     return fail('FAILED_MIXED_DIRECTION: Missing premium series data');
   }
   
-  if (!oiSeriesLast3 || oiSeriesLast3.length < 3) {
-    return fail('FAILED_MIXED_DIRECTION: Missing OI series data');
-  }
-
-  if (!oppOiSeriesLast3 || oppOiSeriesLast3.length < 3) {
-    return fail('FAILED_MIXED_DIRECTION: Missing opposite OI series data');
-  }
-
   const [p1, p2, p3] = premiumSeriesLast3;
   const premiumBullish = p3 > p2 && p2 > p1;
-
-  const [o1, o2, o3] = oiSeriesLast3;
-  const oiBullish = o3 > o2 && o2 > o1;
-  const oiBearish = o3 < o2 && o2 < o1;
 
   if (setup.direction === 'CALL') {
     if (spotMoveFromLevel <= 0) return fail('FAILED_MIXED_DIRECTION: Spot structure not bullish');
     if (!premiumBullish) return fail('FAILED_MIXED_DIRECTION: CE Premium not strictly bullish');
-    if (!oiBullish) return fail('FAILED_MIXED_DIRECTION: OI not strictly bullish');
   } else {
     if (spotMoveFromLevel >= 0) return fail('FAILED_MIXED_DIRECTION: Spot structure not bearish');
     if (!premiumBullish) return fail('FAILED_MIXED_DIRECTION: PE Premium not strictly bullish');
-    if (!oiBearish) return fail('FAILED_MIXED_DIRECTION: OI not strictly bearish');
   }
 
   return pass();
@@ -414,42 +427,63 @@ export function rule18BrokenLevelReclaimedInvalidation(ctx: ValidationContext, s
 
 // RULE 19 — OVERALL AGREEMENT
 export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
-  if (setup.spotMoveFromLevel === undefined) {
-    return fail('FAILED_OVERALL_AGREEMENT: Spot structure missing');
-  }
-  if (setup.direction === 'CALL' && setup.spotMoveFromLevel <= 0) {
-    return fail('FAILED_OVERALL_AGREEMENT: Spot structure not bullish');
-  }
-  if (setup.direction === 'PUT' && setup.spotMoveFromLevel >= 0) {
-    return fail('FAILED_OVERALL_AGREEMENT: Spot structure not bearish');
+  // 1. Check Family Specific Confirmations
+  if (setup.setupType === 'FAILED_RETEST') {
+    if (setup.barsSinceRetest === undefined || setup.barsSinceRetest < 1 || setup.barsSinceRetest > 5) {
+      return fail('FAILED_OVERALL_AGREEMENT: Retest quality is ambiguous or weak');
+    }
+  } else if (setup.setupType === 'CONTINUATION_BREAKDOWN') {
+    if (setup.barsSinceBreakout === undefined || setup.barsSinceBreakout < 1) {
+      return fail('FAILED_OVERALL_AGREEMENT: Pause below level not confirmed');
+    }
+  } else if (setup.setupType === 'CONTINUATION_BREAKOUT') {
+    if (setup.barsSinceBreakout === undefined || setup.barsSinceBreakout < 1) {
+      return fail('FAILED_OVERALL_AGREEMENT: Pause above level not confirmed');
+    }
+  } else if (setup.setupType === 'OPENING_TRAP') {
+    if (!setup.c1 || !setup.c0) {
+      return fail('FAILED_OVERALL_AGREEMENT: Opening range trap structure missing');
+    }
+  } else if (setup.setupType === 'OI_WALL_REJECTION') {
+    if (setup.wallTestCount === undefined || setup.wallTestCount < 2) {
+      return fail('FAILED_OVERALL_AGREEMENT: Wall rejection requires multiple tests');
+    }
+  } else {
+    return fail('FAILED_OVERALL_AGREEMENT: Unknown setup family');
   }
 
-  if (!setup.premiumSeriesLast3 || setup.premiumSeriesLast3.length < 3) {
-    return fail('FAILED_OVERALL_AGREEMENT: Premium data missing');
-  }
-  const [p1, p2, p3] = setup.premiumSeriesLast3;
-  if (!(p3 > p2 && p2 > p1)) {
-    return fail('FAILED_OVERALL_AGREEMENT: Premium direction does not agree');
+  // 2. Check general direction agreement
+  if (setup.direction === 'CALL') {
+    if (ctx.spotPrice < setup.level) return fail('FAILED_OVERALL_AGREEMENT: Level no longer intact (spot below support)');
+  } else {
+    if (ctx.spotPrice > setup.level) return fail('FAILED_OVERALL_AGREEMENT: Level no longer intact (spot above resistance)');
   }
 
+  // 3. Direction-aware & Family-aware OI check
   if (!setup.oiSeriesLast3 || setup.oiSeriesLast3.length < 3) {
     return fail('FAILED_OVERALL_AGREEMENT: OI data missing');
   }
+  if (!setup.oppOiSeriesLast3 || setup.oppOiSeriesLast3.length < 3) {
+    return fail('FAILED_OVERALL_AGREEMENT: Opposite OI data missing');
+  }
+
   const [o1, o2, o3] = setup.oiSeriesLast3;
-  if (!(o3 > o2 && o2 > o1)) {
-    return fail('FAILED_OVERALL_AGREEMENT: OI behavior does not agree');
-  }
+  const oiFalling = o3 < o2 && o2 < o1;
 
-  if (setup.direction === 'CALL' && ctx.spotPrice < setup.level) {
-    return fail('FAILED_OVERALL_AGREEMENT: Level no longer intact (spot below support)');
-  }
-  if (setup.direction === 'PUT' && ctx.spotPrice > setup.level) {
-    return fail('FAILED_OVERALL_AGREEMENT: Level no longer intact (spot above resistance)');
-  }
+  const [oo1, oo2, oo3] = setup.oppOiSeriesLast3;
+  const oppOiRising = oo3 > oo2 && oo2 > oo1;
 
-  if (setup.setupType.includes('RETEST')) {
-    if (setup.barsSinceRetest === undefined || setup.barsSinceRetest < 1 || setup.barsSinceRetest > 5) {
-      return fail('FAILED_OVERALL_AGREEMENT: Retest quality is ambiguous or weak');
+  if (setup.direction === 'CALL') {
+    if (setup.setupType === 'OI_WALL_REJECTION') {
+      if (!oppOiRising) return fail('FAILED_OVERALL_AGREEMENT: PE OI must be rising for CALL wall rejection');
+    } else {
+      if (!oiFalling) return fail('FAILED_OVERALL_AGREEMENT: CE OI must be falling for CALL breakout/retest');
+    }
+  } else {
+    if (setup.setupType === 'OI_WALL_REJECTION') {
+      if (!oppOiRising) return fail('FAILED_OVERALL_AGREEMENT: CE OI must be rising for PUT wall rejection');
+    } else {
+      if (!oiFalling) return fail('FAILED_OVERALL_AGREEMENT: PE OI must be falling for PUT breakdown/retest');
     }
   }
 

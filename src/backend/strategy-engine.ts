@@ -431,17 +431,21 @@ export class StrategyEngine {
     const result = runSetupValidation(valCtx, setup, validLevels, testCount);
     if (!result.passed) {
       failed.push(`[STRICT 20-RULE] ${setupType} ${direction} Rejected: ${result.reason}`);
+      
+      // Update failure memory for ALL failed setups
+      localSess.failedLevelsToday = localSess.failedLevelsToday || [];
+      if (!localSess.failedLevelsToday.includes(setup.level)) {
+        localSess.failedLevelsToday.push(setup.level);
+      }
+      localSess.failedStructuresToday = localSess.failedStructuresToday || [];
+      if (setup.structureId && !localSess.failedStructuresToday.includes(setup.structureId)) {
+        localSess.failedStructuresToday.push(setup.structureId);
+      }
+      localSess.lastFailedSetupLevel = setup.level;
+      localSess.lastFailedStructureId = setup.structureId || null;
+
+      // Reclaim-specific memory updates
       if (result.reason && result.reason.includes('FAILED_RECLAIMED_LEVEL')) {
-        localSess.failedLevelsToday = localSess.failedLevelsToday || [];
-        if (!localSess.failedLevelsToday.includes(setup.level)) {
-          localSess.failedLevelsToday.push(setup.level);
-        }
-        localSess.failedStructuresToday = localSess.failedStructuresToday || [];
-        if (setup.structureId && !localSess.failedStructuresToday.includes(setup.structureId)) {
-          localSess.failedStructuresToday.push(setup.structureId);
-        }
-        localSess.lastFailedSetupLevel = setup.level;
-        localSess.lastFailedStructureId = setup.structureId || null;
         localSess.brokenLevelUnderWatch = null;
         localSess.retestPendingFlag = false;
         localSess.continuationPendingFlag = false;
@@ -449,6 +453,7 @@ export class StrategyEngine {
           localSess.activeStructureId = null;
         }
       }
+      
       if (result.reason && result.reason.includes('FAILED_FINAL_SAFETY_CHECK')) {
         throw new Error(`FINAL_SAFETY_FAILED: ${result.reason}`);
       }
