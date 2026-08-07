@@ -64,9 +64,13 @@ export function rule1CompletedCandles(candles: Candle[], timeObj: Date): RuleRes
 export function rule2OpeningFilter(timeStr: string, setup?: ProposedSetup): RuleResult {
   if (timeStr < '09:15') return fail('FAILED_TIME_FILTER: Pre-market');
   if (timeStr >= '15:30') return fail('FAILED_TIME_FILTER: Post-market');
-  if (timeStr >= '09:15' && timeStr < '09:20') {
-    if (!setup) return pass(); // Allow pre-checks to pass
-    // Only allow if fully confirmed (if it reached here it is)
+  if (timeStr < '09:20' && !setup) {
+    // Soft gate: don't block pre-checks, but require full setup confirmation
+    return pass(); 
+  }
+  if (timeStr < '09:20' && setup) {
+    // Exceptional clarity required
+    if (!setup.c0 || !setup.c1) return fail('FAILED_TIME_FILTER: Pre-09:20 requires exceptional clarity (missing candles)');
   }
   return pass();
 }
@@ -145,6 +149,7 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
     sortedRows[wallRowIndex + 1], sortedRows[wallRowIndex + 2]
   ];
 
+  // For PUT, we buy PUT when rejecting off a CE wall (resistance)
   if (setup.direction === 'PUT') {
     const callOI = row.call_options?.market_data?.oi || 0;
     const callOIChange = row.call_options?.market_data?.oi_change || 0;
@@ -153,6 +158,7 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
     if (surrCallOI === 0 || callOI < 1.5 * surrCallOI) return fail('FAILED_DOMINANT_WALL: CE OI is not 1.5x dominant');
     if (callOIChange < -0.05 * callOI) return fail('FAILED_DOMINANT_WALL: CE OI is rapidly reversing');
   } else {
+    // For CALL, we buy CALL when rejecting off a PE wall (support)
     const putOI = row.put_options?.market_data?.oi || 0;
     const putOIChange = row.put_options?.market_data?.oi_change || 0;
     const surrPutOI = surr.reduce((sum, r) => sum + (r.put_options?.market_data?.oi || 0), 0) / 4;
@@ -161,9 +167,10 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
     if (putOIChange < -0.05 * putOI) return fail('FAILED_DOMINANT_WALL: PE OI is rapidly reversing');
   }
   
+  // Use the actual strike for the test count
   const testCount = ctx.sessState.wallTestCounts[setup.level] || 0;
-  if (testCount < 1) {
-    return fail('FAILED_DOMINANT_WALL: Wall has not been tested in the current session');
+  if (testCount < 2) {
+    return fail('FAILED_DOMINANT_WALL: Wall must be tested at least 2 times for OI_WALL_REJECTION');
   }
 
   return pass();
@@ -184,11 +191,11 @@ export function rule10BreakoutConfirmation(setup: ProposedSetup): RuleResult {
 
     if (setup.direction === 'CALL') {
       if (!(setup.c2.close > setup.level)) return fail('FAILED_BREAKOUT_CONF: c2.close not > level');
-      if (!(setup.c0.close > Math.max(setup.c1.high, setup.level))) return fail('FAILED_BREAKOUT_CONF: c0.close not confirming breakout');
+      if (!(setup.c0.close > setup.level)) return fail('FAILED_BREAKOUT_CONF: c0.close not confirming breakout');
       if (!(setup.c0.close > setup.c0.open)) return fail('FAILED_BREAKOUT_CONF: c0 is not green');
     } else {
       if (!(setup.c2.close < setup.level)) return fail('FAILED_BREAKOUT_CONF: c2.close not < level');
-      if (!(setup.c0.close < Math.min(setup.c1.low, setup.level))) return fail('FAILED_BREAKOUT_CONF: c0.close not confirming breakdown');
+      if (!(setup.c0.close < setup.level)) return fail('FAILED_BREAKOUT_CONF: c0.close not confirming breakdown');
       if (!(setup.c0.close < setup.c0.open)) return fail('FAILED_BREAKOUT_CONF: c0 is not red');
     }
   }
@@ -208,16 +215,6 @@ export function rule11RetestQuality(setup: ProposedSetup): RuleResult {
       return fail('FAILED_RETEST_QUALITY: Failed retest must be within 1-4 candles');
     }
   }
-
-  if (setup.c1) {
-    const c1Range = setup.c1.high - setup.c1.low;
-    const c1Body = Math.abs(setup.c1.close - setup.c1.open);
-    if (c1Range === 0) return fail('FAILED_RETEST_QUALITY: Zero range retest candle');
-    if (c1Body / c1Range < 0.2) return fail('FAILED_RETEST_QUALITY: Shallow wick-only retest or weak candle');
-    if (!setup.impulseRange) return fail('FAILED_RETEST_QUALITY: Missing impulse range for comparison');
-    if (c1Range < setup.impulseRange * 0.2) return fail('FAILED_RETEST_QUALITY: Weak/indecisive retest candle');
-  }
-  
   return pass();
 }
 
@@ -225,9 +222,10 @@ export function rule11RetestQuality(setup: ProposedSetup): RuleResult {
 export function rule12ConfirmationCandle(setup: ProposedSetup, index: string): RuleResult {
   const isCall = setup.direction === 'CALL';
   const c0 = setup.c0;
-  const minBody = index === 'NIFTY' ? 0.5 : 1; 
-  if (isCall && c0.close <= c0.open + minBody) return fail('FAILED_CONFIRMATION_CANDLE: Candle is not solidly GREEN');
-  if (!isCall && c0.close >= c0.open - minBody) return fail('FAILED_CONFIRMATION_CANDLE: Candle is not solidly RED');
+  // Use a smaller, prompt-aligned confirmation threshold
+  const minBody = index === 'NIFTY' ? 0.1 : 0.2; 
+  if (isCall && c0.close <= c0.open + minBody) return fail('FAILED_CONFIRMATION_CANDLE: Candle is not confirming GREEN');
+  if (!isCall && c0.close >= c0.open - minBody) return fail('FAILED_CONFIRMATION_CANDLE: Candle is not confirming RED');
   return pass();
 }
 
@@ -236,6 +234,8 @@ export function rule13PremiumConfirmation(setup: ProposedSetup): RuleResult {
   const premiumSeriesLast3 = setup.direction === 'CALL' ? setup.callPremiumSeriesLast3 : setup.putPremiumSeriesLast3;
   if (!premiumSeriesLast3 || premiumSeriesLast3.length < 3) return fail('FAILED_PREMIUM_CONFIRMATION: Missing premium data');
   const [p1, p2, p3] = premiumSeriesLast3;
+  
+  // Premium is clearly weakening if p3 is substantially lower than p1 (e.g., dropping by 5% or more over the window)
   if (p3 < p1 * 0.95) return fail('FAILED_PREMIUM_CONFIRMATION: Premium is clearly weakening');
   return pass();
 }
@@ -248,14 +248,16 @@ export function rule14MixedDirection(setup: ProposedSetup): RuleResult {
   if (!premiumSeriesLast3 || premiumSeriesLast3.length < 3) return fail('FAILED_MIXED_DIRECTION: Missing premium series data');
   
   const [p1, p2, p3] = premiumSeriesLast3;
-  const premiumConfirming = p3 >= p1;
+  // For both CE and PE, premium should be confirming (not clearly dropping)
+  const premiumConfirming = p3 >= p1 * 0.95;
   
   if (setup.direction === 'CALL') {
     if (spotMoveFromLevel <= 0) return fail('FAILED_MIXED_DIRECTION: Spot structure not bullish');
     if (!premiumConfirming) return fail('FAILED_MIXED_DIRECTION: CE Premium not confirming');
   } else {
+    // For PUT, spot structure is bearish (spot drops), but PE premium is bullish (goes up)
     if (spotMoveFromLevel >= 0) return fail('FAILED_MIXED_DIRECTION: Spot structure not bearish');
-    if (!premiumConfirming) return fail('FAILED_MIXED_DIRECTION: PE Premium not confirming');
+    if (!premiumConfirming) return fail('FAILED_MIXED_DIRECTION: PE Premium not confirming (must rise for a valid PUT setup)');
   }
   return pass();
 }
@@ -285,11 +287,9 @@ export function rule18BrokenLevelReclaimedInvalidation(ctx: ValidationContext, s
   if (!candles || candles.length < 3) return fail('FAILED_RECLAIMED_LEVEL: Insufficient candles to determine reclaim');
   
   let reclaimed = false;
+  let breakoutIdx = -1;
+  
   if (setup.direction === 'CALL') {
-    if (setup.c0.close < setup.level) reclaimed = true;
-    if (setup.c1.close < setup.level && (setup.c2 && setup.c2.close > setup.level)) reclaimed = true;
-    
-    let breakoutIdx = -1;
     for (let i = candles.length - 1; i >= Math.max(1, candles.length - 15); i--) {
       if (candles[i].close > setup.level && candles[i - 1].close <= setup.level) {
         breakoutIdx = i;
@@ -306,10 +306,6 @@ export function rule18BrokenLevelReclaimedInvalidation(ctx: ValidationContext, s
       }
     }
   } else {
-    if (setup.c0.close > setup.level) reclaimed = true;
-    if (setup.c1.close > setup.level && (setup.c2 && setup.c2.close < setup.level)) reclaimed = true;
-    
-    let breakoutIdx = -1;
     for (let i = candles.length - 1; i >= Math.max(1, candles.length - 15); i--) {
       if (candles[i].close < setup.level && candles[i - 1].close >= setup.level) {
         breakoutIdx = i;
@@ -336,16 +332,23 @@ export function rule18BrokenLevelReclaimedInvalidation(ctx: ValidationContext, s
 // RULE 19
 export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
   const isCall = setup.direction === 'CALL';
-  const spotMove = setup.spotMoveFromLevel || 0;
+  const spotMove = setup.spotMoveFromLevel;
   
-  if (isCall && spotMove < 0) return fail('FAILED_OVERALL_AGREEMENT: CALL signal but spot structure is bearish');
-  if (!isCall && spotMove > 0) return fail('FAILED_OVERALL_AGREEMENT: PUT signal but spot structure is bullish');
+  if (spotMove !== undefined) {
+    if (isCall && spotMove < 0) return fail('FAILED_OVERALL_AGREEMENT: CALL signal but spot structure is bearish');
+    if (!isCall && spotMove > 0) return fail('FAILED_OVERALL_AGREEMENT: PUT signal but spot structure is bullish');
+  }
 
   const premiumLast3 = isCall ? setup.callPremiumSeriesLast3 : setup.putPremiumSeriesLast3;
   if (premiumLast3 && premiumLast3.length === 3) {
     const [p1, p2, p3] = premiumLast3;
-    if (p3 < p1) return fail('FAILED_OVERALL_AGREEMENT: Premium series is moving against the intended direction');
+    // Premium must not be clearly moving against intended direction
+    if (p3 < p1 * 0.9) return fail('FAILED_OVERALL_AGREEMENT: Premium series is moving against the intended direction');
   }
+  
+  // Cross check families
+  if (setup.setupType === 'CONTINUATION_BREAKOUT' && !isCall) return fail('FAILED_OVERALL_AGREEMENT: Breakout must be CALL');
+  if (setup.setupType === 'CONTINUATION_BREAKDOWN' && isCall) return fail('FAILED_OVERALL_AGREEMENT: Breakdown must be PUT');
   
   return pass();
 }
