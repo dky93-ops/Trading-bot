@@ -1,4 +1,6 @@
-import { Candle, StrategySessionState, InternalSignal } from './types.js';
+const fs = require('fs');
+
+let valCode = `import { Candle, StrategySessionState, InternalSignal } from './types.js';
 
 export interface ValidationContext {
   activeSignals: Map<string, InternalSignal>;
@@ -38,11 +40,6 @@ export interface ProposedSetup {
   oppPutOiSeriesLast3: number[];
   volumeSeriesLast3: number[];
   ivSeriesLast3: number[];
-  deltaSeriesLast3?: number[];
-  thetaSeriesLast3?: number[];
-  gammaSeriesLast3?: number[];
-  vegaSeriesLast3?: number[];
-  wallTestCount?: number;
   structureId?: string;
 }
 
@@ -98,7 +95,7 @@ export function rule17ChopFilter(ctx: ValidationContext): RuleResult {
 // RULE 5
 export function rule5MarketStructure(sessState: StrategySessionState, setup: ProposedSetup): RuleResult {
   if (setup.structureId && sessState.tradedStructures && sessState.tradedStructures.includes(setup.structureId)) {
-    return fail(`FAILED_MARKET_STRUCTURE: Already traded structure ${setup.structureId} today`);
+    return fail(\`FAILED_MARKET_STRUCTURE: Already traded structure \${setup.structureId} today\`);
   }
   return pass();
 }
@@ -106,13 +103,13 @@ export function rule5MarketStructure(sessState: StrategySessionState, setup: Pro
 // RULE 6
 export function rule6FailedLevel(sessState: StrategySessionState, setup: ProposedSetup): RuleResult {
   if (sessState.failedLevelsToday && sessState.failedLevelsToday.includes(setup.level)) {
-    return fail(`FAILED_FAILED_LEVEL: Level ${setup.level} failed earlier today`);
+    return fail(\`FAILED_FAILED_LEVEL: Level \${setup.level} failed earlier today\`);
   }
   if (sessState.lastFailedSetupLevel === setup.level) {
-    return fail(`FAILED_FAILED_LEVEL: Level ${setup.level} failed earlier today`);
+    return fail(\`FAILED_FAILED_LEVEL: Level \${setup.level} failed earlier today\`);
   }
   if (setup.structureId && sessState.failedStructuresToday && sessState.failedStructuresToday.includes(setup.structureId)) {
-    return fail(`FAILED_FAILED_STRUCTURE: Structure ${setup.structureId} failed earlier today`);
+    return fail(\`FAILED_FAILED_STRUCTURE: Structure \${setup.structureId} failed earlier today\`);
   }
   return pass();
 }
@@ -379,7 +376,7 @@ export function rule20FinalSafetyCheck(
     rule19OverallAgreement(ctx, setup)
   ];
   for (const check of checks) {
-    if (!check.passed) return fail(`FAILED_FINAL_SAFETY_CHECK: ${check.reason}`);
+    if (!check.passed) return fail(\`FAILED_FINAL_SAFETY_CHECK: \${check.reason}\`);
   }
   return pass();
 }
@@ -421,3 +418,6 @@ export function runSetupValidation(ctx: ValidationContext, setup: ProposedSetup,
   }
   return pass();
 }
+`;
+
+fs.writeFileSync('src/backend/validation-rules.ts', valCode);

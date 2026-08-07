@@ -292,14 +292,14 @@ export class StrategyEngine {
 
     // Find valid OI Walls (1.5x rule & test count reaction)
     const { wallsAbove, wallsBelow } = this.findValidOIWalls(chainRows, spotPrice, step, sessState);
-    const nearestCeWallAbove = wallsAbove.length > 0 ? wallsAbove[0].strike : spotPrice + step * 4;
-    const nearestPeWallBelow = wallsBelow.length > 0 ? wallsBelow[0].strike : spotPrice - step * 4;
+    const nearestCeWallAbove = wallsAbove.length > 0 ? wallsAbove[0].strike : 0;
+    const nearestPeWallBelow = wallsBelow.length > 0 ? wallsBelow[0].strike : 0;
 
     sessState.nearestCeWallAbove = nearestCeWallAbove;
     sessState.nearestPeWallBelow = nearestPeWallBelow;
 
     // Track wall reaction counts
-    this.updateWallTestCounts(spotPrice, step, sessState);
+    this.updateWallTestCounts(spotPrice, step, sessState, todayCandles, wallsAbove, wallsBelow);
 
     // Apply strict Global 20-Rule Pipeline pre-checks (Rules 1-4, 17)
     const valCtx: ValidationContext = {
@@ -555,18 +555,6 @@ export class StrategyEngine {
     if (!result.passed) {
       failed.push(`[STRICT 20-RULE] ${setupType} ${direction} Rejected: ${result.reason}`);
       
-      // Update failure memory for ALL failed setups
-      localSess.failedLevelsToday = localSess.failedLevelsToday || [];
-      if (!localSess.failedLevelsToday.includes(setup.level)) {
-        localSess.failedLevelsToday.push(setup.level);
-      }
-      localSess.failedStructuresToday = localSess.failedStructuresToday || [];
-      if (setup.structureId && !localSess.failedStructuresToday.includes(setup.structureId)) {
-        localSess.failedStructuresToday.push(setup.structureId);
-      }
-      localSess.lastFailedSetupLevel = setup.level;
-      localSess.lastFailedStructureId = setup.structureId || null;
-
       // Reclaim-specific memory updates
       if (result.reason && result.reason.includes('FAILED_RECLAIMED_LEVEL')) {
         localSess.brokenLevelUnderWatch = null;
@@ -575,6 +563,17 @@ export class StrategyEngine {
         if (localSess.activeStructureId === setup.structureId) {
           localSess.activeStructureId = null;
         }
+        
+        localSess.failedLevelsToday = localSess.failedLevelsToday || [];
+        if (!localSess.failedLevelsToday.includes(setup.level)) {
+          localSess.failedLevelsToday.push(setup.level);
+        }
+        localSess.failedStructuresToday = localSess.failedStructuresToday || [];
+        if (setup.structureId && !localSess.failedStructuresToday.includes(setup.structureId)) {
+          localSess.failedStructuresToday.push(setup.structureId);
+        }
+        localSess.lastFailedSetupLevel = setup.level;
+        localSess.lastFailedStructureId = setup.structureId || null;
       }
       
       if (result.reason && result.reason.includes('FAILED_FINAL_SAFETY_CHECK')) {
@@ -956,10 +955,9 @@ export class StrategyEngine {
     const tolerance = step * 0.25;
     const c0 = candles[candles.length - 1]; // confirmation candle
 
-    // Count how many recent 3m candles reached wallAbove and closed below it
-    const ceWallTests = candles.filter(c => c.high >= wallAbove - tolerance && c.close < wallAbove).length;
-    // Count how many recent 3m candles reached wallBelow and closed above it
-    const peWallTests = candles.filter(c => c.low <= wallBelow + tolerance && c.close > wallBelow).length;
+    // Get the session-wide test counts against the actual wall strike
+    const ceWallTests = sess.wallTestCounts[wallAbove] || 0;
+    const peWallTests = sess.wallTestCounts[wallBelow] || 0;
 
     // BUY_PUT on CE Wall Rejection
     // Rule 10: Dominant wall must be tested twice
@@ -1078,14 +1076,13 @@ export class StrategyEngine {
     const reward2 = target2Price - premium;
     const rrTarget2 = risk > 0 ? reward2 / risk : 0;
 
-    // STRICT R:R GUARDRAIL: Minimum 1.5R required for Target 2
-    if (rrTarget2 < 1.5) {
-      failedFilters.push(`Reward-to-risk to Target 2 (${rrTarget2.toFixed(2)}R) is less than strict 1.50R minimum required`);
-      return null;
-    }
-
     let finalConfidence = initialConfidence;
-    passedFilters.push(`Reward-to-risk to Target 2 is ${rrTarget2.toFixed(2)}R (>= 1.5R threshold passed)`);
+    if (rrTarget2 < 1.5) {
+      failedFilters.push(`Reward-to-risk to Target 2 (${rrTarget2.toFixed(2)}R) is < 1.5R (confidence reduced)`);
+      finalConfidence = Math.max(10, finalConfidence - 20);
+    } else {
+      passedFilters.push(`Reward-to-risk to Target 2 is ${rrTarget2.toFixed(2)}R (>= 1.5R threshold passed)`);
+    }
 
     passedFilters.push(`Dual SL Active: Primary Spot Level (${brokenLevel}) + Secondary Option Premium SL (₹${slPrice})`);
     passedFilters.push(`Dynamic Stop & Emergency Exit Rules Enforced`);
@@ -1178,9 +1175,21 @@ export class StrategyEngine {
     return { wallsAbove, wallsBelow };
   }
 
-  private updateWallTestCounts(spot: number, step: number, sess: LocalSessionState) {
-    const roundedSpot = Math.round(spot / step) * step;
-    sess.wallTestCounts[roundedSpot] = (sess.wallTestCounts[roundedSpot] || 0) + 1;
+  private updateWallTestCounts(spot: number, step: number, sess: LocalSessionState, candles: Candle[], wallsAbove: OIWall[], wallsBelow: OIWall[]) {
+    if (candles.length === 0) return;
+    const c0 = candles[candles.length - 1];
+    const tolerance = step * 0.25;
+
+    for (const wall of wallsAbove) {
+      if (c0.high >= wall.strike - tolerance && c0.close < wall.strike) {
+        sess.wallTestCounts[wall.strike] = (sess.wallTestCounts[wall.strike] || 0) + 1;
+      }
+    }
+    for (const wall of wallsBelow) {
+      if (c0.low <= wall.strike + tolerance && c0.close > wall.strike) {
+        sess.wallTestCounts[wall.strike] = (sess.wallTestCounts[wall.strike] || 0) + 1;
+      }
+    }
   }
 
   private manageActiveTrades(newSignals: InternalSignal[]) {
