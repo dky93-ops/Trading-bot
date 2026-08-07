@@ -160,26 +160,26 @@ export class StrategyEngine {
     return decisions;
   }
 
-  private mapToPublicDecision(sig: InternalSignal): EngineDecision {
+  private mapToPublicDecision(sig: InternalSignal | any): EngineDecision {
     return {
-      timestamp: sig.timestamp,
-      signal: sig.signal,
-      strategy_family: sig.strategy_family,
-      direction: sig.direction,
-      spot: sig.spot,
-      broken_level: sig.broken_level,
-      wall_above: sig.wall_above,
-      wall_below: sig.wall_below,
-      option_type: sig.option_type,
-      strike: sig.strike,
-      entry: sig.entry,
-      stoploss: sig.stoploss,
-      target1: sig.target1,
-      target2: sig.target2,
-      confidence: sig.confidence,
-      reason: sig.reason,
-      fake_signal_filters_passed: sig.fake_signal_filters_passed,
-      fake_signal_filters_failed: sig.fake_signal_filters_failed
+      timestamp: sig.timestamp || new Date().toISOString(),
+      signal: sig.signal || 'NO_TRADE',
+      strategy_family: sig.strategy_family || 'NONE',
+      direction: sig.direction || 'NONE',
+      spot: sig.spot || 0,
+      broken_level: sig.broken_level || 0,
+      wall_above: sig.wall_above || 0,
+      wall_below: sig.wall_below || 0,
+      option_type: sig.option_type || 'NONE',
+      strike: sig.strike || 0,
+      entry: sig.entry || 0,
+      stoploss: sig.stoploss || 0,
+      target1: sig.target1 || 0,
+      target2: sig.target2 || 0,
+      confidence: sig.confidence || 0,
+      reason: sig.reason || [],
+      fake_signal_filters_passed: sig.fake_signal_filters_passed || [],
+      fake_signal_filters_failed: sig.fake_signal_filters_failed || []
     };
   }
 
@@ -303,13 +303,13 @@ export class StrategyEngine {
 
     // Apply strict Global 20-Rule Pipeline pre-checks (Rules 1-4, 17)
     const valCtx: ValidationContext = {
+      activeSignals: this.activeSignals,
       index,
       spotPrice,
       timeObj,
       timeStr,
-      activeSignals: this.activeSignals,
       sessState,
-      candles1m, // passed original array before slicing
+      candles1m,
       chainRows,
       nearestCeWallAbove,
       nearestPeWallBelow
@@ -417,15 +417,7 @@ export class StrategyEngine {
 
     // NO_TRADE Decision Output
     return {
-      id: `NO_TRADE_${index}_${Date.now()}`,
       timestamp: timestampISO,
-      index,
-      contract: `${index} SP: ${spotPrice.toFixed(1)}`,
-      action: 'BUY',
-      strategy: 'NO_TRADE',
-      entryPrice: 0,
-      
-      status: 'CLOSED',
       signal: 'NO_TRADE',
       strategy_family: 'NONE',
       direction: 'NONE',
@@ -446,7 +438,7 @@ export class StrategyEngine {
       ],
       fake_signal_filters_passed: passedFilters,
       fake_signal_filters_failed: failedFilters
-    };
+    } as any;
   }
 
   // ====================================================
@@ -1111,43 +1103,34 @@ export class StrategyEngine {
     }
 
     return {
-      id: `${strategyFamily}_${index}_${Date.now()}`,
-      timestamp: timestampISO,
+      id: crypto.randomUUID(),
       index,
-      contract: `${index} ${strike} ${optType}`,
+      contract: instrumentKey,
       instrumentKey,
       action: 'BUY',
       strategy: strategyFamily,
       entryPrice: premium,
-      latestPrice: premium,
-      highestPrice: premium,
       stoploss: slPrice,
+      target1: target1Price,
+      target2: target2Price,
       status: 'ACTIVE',
-      tradeType: optType,
-      confirmationCandleLow: confirmCandleLow,
-      confirmationCandleHigh: confirmCandleHigh,
-      initialRiskPoints: slPts,
-      confirmationZonePrice: brokenLevel,
-      structureId,
-
-      // Specific 5-Strategy JSON fields as required by prompt
+      timestamp: timestampISO,
+      confidence: finalConfidence,
+      reason: reasons,
+      direction: signalType === 'BUY_CALL' ? 'CALL' : 'PUT',
+      fake_signal_filters_passed: passedFilters,
+      fake_signal_filters_failed: failedFilters,
+      // EngineDecision required fields:
       signal: signalType,
       strategy_family: strategyFamily,
-      direction: optType === 'CE' ? 'CALL' : 'PUT',
-      spot: Number(spot.toFixed(2)),
+      spot: spot,
       broken_level: brokenLevel,
       wall_above: wallAbove,
       wall_below: wallBelow,
       option_type: optType,
-      strike,
-      entry: premium,
-      target1: target1Price,
-      target2: target2Price,
-      confidence: finalConfidence,
-      reason: reasons,
-      fake_signal_filters_passed: passedFilters,
-      fake_signal_filters_failed: failedFilters
-    };
+      strike: strike,
+      entry: premium
+    } as InternalSignal;
   }
 
   // 1.5x Dominant OI Wall Detection Helper
