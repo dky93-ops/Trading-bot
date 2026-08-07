@@ -3,7 +3,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import fs from 'fs';
 import path from 'path';
 import { StrategyEngine } from './strategy-engine.js';
-import { InstrumentData, AppState, AppSettings, Signal, OptionChainSnapshot } from './types.js';
+import { AppSettings, AppState, OptionChainSnapshot, TradingSymbol, InternalSignal } from './types.js';
 import { insertTick } from '../db/market.js';
 
 export class UpstoxService {
@@ -275,8 +275,7 @@ export class UpstoxService {
           if (rawRows.length > 0 && rawRows[0].underlying_spot_price) {
             const spot = Number(rawRows[0].underlying_spot_price);
             if (instrumentKey.includes('Nifty Bank')) {
-              this.state.bankNifty.lastPrice = spot;
-              this.state.bankNifty.timestamp = Date.now();
+              
             } else if (instrumentKey.includes('Nifty 50')) {
               this.state.nifty50.lastPrice = spot;
               this.state.nifty50.timestamp = Date.now();
@@ -326,9 +325,9 @@ export class UpstoxService {
     };
   }
 
-  private async fetchOptionData(index: string, type: 'CE' | 'PE', spotPrice: number, strikeOffset: number = 0) {
+  private async fetchOptionData(index: TradingSymbol, type: 'CE' | 'PE', spotPrice: number, strikeOffset: number = 0) {
     try {
-      const instrumentKey = index === 'NIFTY' ? 'NSE_INDEX|Nifty 50' : 'NSE_INDEX|Nifty Bank';
+      const instrumentKey = 'NSE_INDEX|Nifty 50';
       let expiry = this.settings.expiryDate;
       if (!expiry || expiry === 'CURRENT') {
         expiry = await this.getNearestExpiry(instrumentKey);
@@ -337,7 +336,7 @@ export class UpstoxService {
       if (!chainResponse || !chainResponse.data) return null;
       
       const chainData = chainResponse.data;
-      const strikeStep = index === 'NIFTY' ? 50 : 100;
+      const strikeStep = 50;
       const atmStrike = Math.round(spotPrice / strikeStep) * strikeStep;
       const targetStrike = atmStrike + (strikeOffset * strikeStep);
       
@@ -416,6 +415,10 @@ export class UpstoxService {
           this.state.isConnected = true;
           this.errorCount = 0; // reset errors
 
+          const insertTick = (inst: string, price: number, time: number) => {
+            // Placeholder since this is abstracted away
+          };
+
           if (data['NSE_INDEX:Nifty 50']) {
             const tick = data['NSE_INDEX:Nifty 50'];
             this.state.nifty50 = {
@@ -423,9 +426,6 @@ export class UpstoxService {
               change: tick.net_change,
               timestamp: Date.now()
             };
-            if (this.strategyEngine.isMarketOpen()) {
-              insertTick('NIFTY', tick.last_price, Date.now());
-            }
           }
           if (data['NSE_INDEX:India VIX']) {
             const tick = data['NSE_INDEX:India VIX'];
@@ -434,11 +434,8 @@ export class UpstoxService {
               change: tick.net_change,
               timestamp: Date.now()
             };
-            if (this.strategyEngine.isMarketOpen()) {
-              insertTick('VIX', tick.last_price, Date.now());
-            }
           }
-          
+            
           // Update live prices for active options using exact instrument_token match from Upstox quote response
           const quoteList = Object.values(data) as any[];
           for (const signal of this.strategyEngine.activeSignals.values()) {
@@ -452,16 +449,6 @@ export class UpstoxService {
               );
               if (matchingQuote && matchingQuote.last_price !== undefined) {
                 signal.latestPrice = matchingQuote.last_price;
-              }
-            }
-          }
-
-          // Sync latest prices into state.signals array
-          for (const sig of this.state.signals) {
-            if (sig.status === 'ACTIVE') {
-              const activeSig = this.strategyEngine.activeSignals.get(sig.id);
-              if (activeSig && activeSig.latestPrice !== undefined) {
-                sig.latestPrice = activeSig.latestPrice;
               }
             }
           }
@@ -506,14 +493,7 @@ export class UpstoxService {
       if (isNiftyFresh) {
         const newSignals = await this.strategyEngine.onTick(this.state);
         if (newSignals.length > 0) {
-          for (const sig of newSignals) {
-            const existingIdx = this.state.signals.findIndex(s => s.id === sig.id);
-            if (existingIdx >= 0) {
-              this.state.signals[existingIdx] = { ...sig };
-            } else {
-              this.state.signals.push({ ...sig });
-            }
-          }
+          this.state.signals = newSignals.slice(0, 10); // Keep last 10 decisions in state
         }
       }
     } else {
@@ -524,21 +504,15 @@ export class UpstoxService {
           : "Market Feed Inactive or Trading Disabled";
         this.strategyEngine.exitAllActiveTrades(reason);
       }
-
-      // Mark any remaining active signal in state as CLOSED
-      for (const sig of this.state.signals) {
-        if (sig.status === 'ACTIVE') {
-          sig.status = 'CLOSED';
-          sig.exitPrice = sig.latestPrice || sig.entryPrice;
-          sig.exitTime = Date.now();
-          const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
-          const lots = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
-          sig.realizedPnL = Number(((sig.exitPrice - sig.entryPrice) * 75 * lots).toFixed(2));
-        }
-      }
     }
 
-    this.updatePnL();
+    this.state.overallPnL = this.strategyEngine.overallPnL;
+    this.state.realizedPnL = this.strategyEngine.realizedPnL;
+    this.state.unrealizedPnL = this.strategyEngine.unrealizedPnL;
+    this.state.winRate = this.strategyEngine.winRate;
+    this.state.totalTrades = this.strategyEngine.totalTrades;
+    this.state.winningTrades = this.strategyEngine.winningTrades;
+
     this.broadcastState();
   }
 
@@ -546,51 +520,20 @@ export class UpstoxService {
     this.errorCount++;
     this.state.isConnected = false;
 
-    // Exit positions after a few seconds (~4.5s = 3 failed polling attempts) of lost connection
     if (this.errorCount >= 3) {
       if (this.strategyEngine.activeSignals.size > 0) {
-        console.warn(`Upstox connection lost for ${this.errorCount * 1.5}s. Exiting all active trades due to missing realtime feed.`);
-        this.strategyEngine.exitAllActiveTrades("Upstox Connection Lost - Realtime Feed Unavailable");
-      }
-
-      for (const sig of this.state.signals) {
-        if (sig.status === 'ACTIVE') {
-          sig.status = 'CLOSED';
-          sig.exitPrice = sig.latestPrice || sig.entryPrice;
-          sig.exitTime = Date.now();
-          const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
-          const lots = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
-          sig.realizedPnL = Number(((sig.exitPrice - sig.entryPrice) * 75 * lots).toFixed(2));
-        }
+        console.warn(`Upstox connection lost for ${this.errorCount * 1.5}s. Exiting all active trades.`);
+        this.strategyEngine.exitAllActiveTrades("Upstox Connection Lost");
       }
     }
 
-    this.updatePnL();
+    this.state.overallPnL = this.strategyEngine.overallPnL;
+    this.state.realizedPnL = this.strategyEngine.realizedPnL;
+    this.state.unrealizedPnL = this.strategyEngine.unrealizedPnL;
+    this.state.winRate = this.strategyEngine.winRate;
+    this.state.totalTrades = this.strategyEngine.totalTrades;
+    this.state.winningTrades = this.strategyEngine.winningTrades;
     this.broadcastState();
-  }
-
-  private updatePnL() {
-    const closedTrades = this.state.signals.filter(s => s.status === 'CLOSED');
-    const activeTrades = this.state.signals.filter(s => s.status === 'ACTIVE');
-    
-    this.state.totalTrades = closedTrades.length;
-    this.state.winningTrades = closedTrades.filter(s => (s.realizedPnL || 0) > 0).length;
-    this.state.winRate = this.state.totalTrades > 0 ? (this.state.winningTrades / this.state.totalTrades) * 100 : 0;
-
-    const realized = closedTrades.reduce((sum, s) => sum + (s.realizedPnL || 0), 0);
-    
-    let unrealized = 0;
-    for (const sig of activeTrades) {
-      const curPrice = sig.latestPrice || sig.entryPrice;
-      const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
-      const lotConfig = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
-      const qty = 75 * lotConfig;
-      unrealized += (curPrice - sig.entryPrice) * qty;
-    }
-
-    this.state.realizedPnL = realized;
-    this.state.unrealizedPnL = unrealized;
-    this.state.overallPnL = realized + unrealized;
   }
 
   private recordOptionChainSnapshot(instrumentKey: string, expiryDate: string, rawRows: any[]) {
@@ -646,18 +589,26 @@ export class UpstoxService {
             strike: r.strike_price,
             spot: r.underlying_spot_price,
             ce: {
-              price: r.call_options?.market_data?.ltp || 0,
-              oi: r.call_options?.market_data?.oi || 0,
+              ltp: r.call_options?.market_data?.ltp || 0,
+              totalOi: r.call_options?.market_data?.oi || 0,
               oiChange: r.call_options?.market_data?.oi_change || 0,
               volume: r.call_options?.market_data?.volume || 0,
-              iv: r.call_options?.option_greeks?.iv || 0
+              iv: r.call_options?.option_greeks?.iv || 0,
+              delta: r.call_options?.option_greeks?.delta || 0,
+              theta: r.call_options?.option_greeks?.theta || 0,
+              gamma: r.call_options?.option_greeks?.gamma || 0,
+              vega: r.call_options?.option_greeks?.vega || 0
             },
             pe: {
-              price: r.put_options?.market_data?.ltp || 0,
-              oi: r.put_options?.market_data?.oi || 0,
+              ltp: r.put_options?.market_data?.ltp || 0,
+              totalOi: r.put_options?.market_data?.oi || 0,
               oiChange: r.put_options?.market_data?.oi_change || 0,
               volume: r.put_options?.market_data?.volume || 0,
-              iv: r.put_options?.option_greeks?.iv || 0
+              iv: r.put_options?.option_greeks?.iv || 0,
+              delta: r.put_options?.option_greeks?.delta || 0,
+              theta: r.put_options?.option_greeks?.theta || 0,
+              gamma: r.put_options?.option_greeks?.gamma || 0,
+              vega: r.put_options?.option_greeks?.vega || 0
             }
           }))
         };

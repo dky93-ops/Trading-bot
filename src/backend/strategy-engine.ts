@@ -1,4 +1,4 @@
-import { AppSettings, AppState, Signal, Candle, StrategySessionState } from './types.js';
+import { AppSettings, AppState, Candle, OptionChainSnapshot, StrategySessionState, EngineDecision, TradingSymbol, InternalSignal } from './types.js';
 import { getCandles } from '../db/market.js';
 import { runGlobalPreChecks, runSetupValidation, ValidationContext, ProposedSetup } from './validation-rules.js';
 
@@ -21,15 +21,21 @@ type LocalSessionState = StrategySessionState & {
   previousDayLow: number;
   openingRangeHigh: number;
   openingRangeLow: number;
-  nearestCEWallAbove: number;
-  nearestPEWallBelow: number;
+  nearestCeWallAbove: number;
+  nearestPeWallBelow: number;
   lastTradeCandleTime: string | null;
 };
 
 export class StrategyEngine {
   private settings: AppSettings;
   private state: AppState;
-  public activeSignals: Map<string, Signal> = new Map();
+  public activeSignals: Map<string, InternalSignal> = new Map();
+  public overallPnL: number = 0;
+  public realizedPnL: number = 0;
+  public unrealizedPnL: number = 0;
+  public winRate: number = 0;
+  public totalTrades: number = 0;
+  public winningTrades: number = 0;
   private fetchOptionData: FetchOptionDataFn;
   private getOptionChain?: GetOptionChainFn;
   private getNearestExpiry?: GetNearestExpiryFn;
@@ -63,8 +69,8 @@ export class StrategyEngine {
       previousDayLow: 0,
       openingRangeHigh: 0,
       openingRangeLow: 0,
-      nearestCEWallAbove: 0,
-      nearestPEWallBelow: 0,
+      nearestCeWallAbove: 0,
+      nearestPeWallBelow: 0,
       brokenLevelUnderWatch: null,
       retestPendingFlag: false,
       continuationPendingFlag: false,
@@ -106,9 +112,10 @@ export class StrategyEngine {
     }
   }
 
-  public async onTick(newState: AppState): Promise<Signal[]> {
+  public async onTick(newState: AppState): Promise<EngineDecision[]> {
     this.state = newState;
-    const newSignals: Signal[] = [];
+    const newSignals: InternalSignal[] = [];
+    const decisions: EngineDecision[] = [];
 
     // If global trading toggle is disabled or market is closed, exit active trades and return
     if (!this.settings.isTradingEnabled || !this.isMarketOpen()) {
@@ -119,23 +126,64 @@ export class StrategyEngine {
             : "Market Closed (Outside NSE Trading Hours 09:15 - 15:30 IST)"
         );
       }
-      return newSignals;
+      return decisions;
     }
 
     // Manage active trades first
     this.manageActiveTrades(newSignals);
 
     // Evaluate NIFTY ONLY
-    if (this.settings.nifty50Enabled && this.state.nifty50.lastPrice > 0) {
+    if (this.state.nifty50.lastPrice > 0) {
       const sig = await this.evaluateIndex('NIFTY', this.state.nifty50.lastPrice);
-      if (sig && sig.signal !== 'NO_TRADE') newSignals.push(sig);
+      if (sig) {
+        if (sig.signal !== 'NO_TRADE') {
+          newSignals.push(sig);
+          decisions.push(this.mapToPublicDecision(sig));
+        } else {
+          decisions.push(this.mapToPublicDecision(sig));
+        }
+      }
     }
 
     newSignals.forEach(s => this.activeSignals.set(s.id, s));
-    return newSignals;
+    
+    // Calculate unrealized PnL
+    this.unrealizedPnL = 0;
+    for (const sig of this.activeSignals.values()) {
+      const curPrice = sig.latestPrice || sig.entryPrice;
+      const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
+      const lotConfig = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
+      const qty = 75 * lotConfig;
+      this.unrealizedPnL += (curPrice - sig.entryPrice) * qty;
+    }
+    this.overallPnL = this.realizedPnL + this.unrealizedPnL;
+    return decisions;
   }
 
-  private async evaluateIndex(index: string, spotPrice: number): Promise<Signal | null> {
+  private mapToPublicDecision(sig: InternalSignal): EngineDecision {
+    return {
+      timestamp: sig.timestamp,
+      signal: sig.signal,
+      strategy_family: sig.strategy_family,
+      direction: sig.direction,
+      spot: sig.spot,
+      broken_level: sig.broken_level,
+      wall_above: sig.wall_above,
+      wall_below: sig.wall_below,
+      option_type: sig.option_type,
+      strike: sig.strike,
+      entry: sig.entry,
+      stoploss: sig.stoploss,
+      target1: sig.target1,
+      target2: sig.target2,
+      confidence: sig.confidence,
+      reason: sig.reason,
+      fake_signal_filters_passed: sig.fake_signal_filters_passed,
+      fake_signal_filters_failed: sig.fake_signal_filters_failed
+    };
+  }
+
+  private async evaluateIndex(index: string, spotPrice: number): Promise<InternalSignal | null> {
     const timeObj = new Date();
     const timeStr = timeObj.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
     const timestampISO = timeObj.toISOString();
@@ -244,11 +292,11 @@ export class StrategyEngine {
 
     // Find valid OI Walls (1.5x rule & test count reaction)
     const { wallsAbove, wallsBelow } = this.findValidOIWalls(chainRows, spotPrice, step, sessState);
-    const nearestCEWallAbove = wallsAbove.length > 0 ? wallsAbove[0].strike : spotPrice + step * 4;
-    const nearestPEWallBelow = wallsBelow.length > 0 ? wallsBelow[0].strike : spotPrice - step * 4;
+    const nearestCeWallAbove = wallsAbove.length > 0 ? wallsAbove[0].strike : spotPrice + step * 4;
+    const nearestPeWallBelow = wallsBelow.length > 0 ? wallsBelow[0].strike : spotPrice - step * 4;
 
-    sessState.nearestCEWallAbove = nearestCEWallAbove;
-    sessState.nearestPEWallBelow = nearestPEWallBelow;
+    sessState.nearestCeWallAbove = nearestCeWallAbove;
+    sessState.nearestPeWallBelow = nearestPeWallBelow;
 
     // Track wall reaction counts
     this.updateWallTestCounts(spotPrice, step, sessState);
@@ -263,12 +311,12 @@ export class StrategyEngine {
       sessState,
       candles1m, // passed original array before slicing
       chainRows,
-      nearestCEWallAbove,
-      nearestPEWallBelow
+      nearestCeWallAbove,
+      nearestPeWallBelow
     };
     const globalPreCheckResult = runGlobalPreChecks(valCtx);
     if (!globalPreCheckResult.passed) {
-      console.log(`[GLOBAL RULES] Signal Rejected: ${globalPreCheckResult.reason}`);
+      console.log(`[GLOBAL RULES] InternalSignal Rejected: ${globalPreCheckResult.reason}`);
       return null;
     }
 
@@ -302,7 +350,7 @@ export class StrategyEngine {
     // 4. OPENING_TRAP (Opening Breakout Trap)
     // 5. OI_WALL_REJECTION (OI Wall Rejection)
 
-    let selectedSignal: Signal | null = null;
+    let selectedSignal: InternalSignal | null = null;
 
     try {
       // ----------------------------------------------------
@@ -310,7 +358,7 @@ export class StrategyEngine {
       // ----------------------------------------------------
       if (!selectedSignal && this.settings.strategies.failedRetest?.enabled && !isStratActive('FAILED_RETEST')) {
         selectedSignal = await this.checkFailedRetest(
-          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
+          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCeWallAbove, nearestPeWallBelow, passedFilters, failedFilters
         );
       }
 
@@ -319,7 +367,7 @@ export class StrategyEngine {
       // ----------------------------------------------------
       if (!selectedSignal && this.settings.strategies.continuationBreakdown?.enabled && !isStratActive('CONTINUATION_BREAKDOWN')) {
         selectedSignal = await this.checkContinuationBreakdown(
-          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestPEWallBelow, passedFilters, failedFilters
+          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestPeWallBelow, passedFilters, failedFilters
         );
       }
 
@@ -328,7 +376,7 @@ export class StrategyEngine {
       // ----------------------------------------------------
       if (!selectedSignal && this.settings.strategies.continuationBreakout?.enabled && !isStratActive('CONTINUATION_BREAKOUT')) {
         selectedSignal = await this.checkContinuationBreakout(
-          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, passedFilters, failedFilters
+          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCeWallAbove, passedFilters, failedFilters
         );
       }
 
@@ -337,7 +385,7 @@ export class StrategyEngine {
       // ----------------------------------------------------
       if (!selectedSignal && this.settings.strategies.openingTrap?.enabled && !isStratActive('OPENING_TRAP')) {
         selectedSignal = await this.checkOpeningTrap(
-          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
+          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCeWallAbove, nearestPeWallBelow, passedFilters, failedFilters
         );
       }
 
@@ -346,7 +394,7 @@ export class StrategyEngine {
       // ----------------------------------------------------
       if (!selectedSignal && this.settings.strategies.oiWallRejection?.enabled && !isStratActive('OI_WALL_REJECTION')) {
         selectedSignal = await this.checkOIWallRejection(
-          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCEWallAbove, nearestPEWallBelow, passedFilters, failedFilters
+          valCtx, index, spotPrice, todayCandles, chainRows, sessState, nearestCeWallAbove, nearestPeWallBelow, passedFilters, failedFilters
         );
       }
     } catch (err: any) {
@@ -376,7 +424,6 @@ export class StrategyEngine {
       action: 'BUY',
       strategy: 'NO_TRADE',
       entryPrice: 0,
-      stoploss: 0,
       
       status: 'CLOSED',
       signal: 'NO_TRADE',
@@ -384,8 +431,8 @@ export class StrategyEngine {
       direction: 'NONE',
       spot: spotPrice,
       broken_level: sessState.brokenLevelUnderWatch || 0,
-      wall_above: nearestCEWallAbove,
-      wall_below: nearestPEWallBelow,
+      wall_above: nearestCeWallAbove,
+      wall_below: nearestPeWallBelow,
       option_type: 'NONE',
       strike: Math.round(spotPrice / step) * step,
       entry: 0,
@@ -482,7 +529,7 @@ export class StrategyEngine {
     seriesData?: any
   ): boolean {
     const setup: ProposedSetup = {
-      direction, level: lvl, setupType, c0, c1, c2, target1, target2, stoploss,
+      direction, level: lvl, setupType, c0, c1, c2, target1, target2, stopLoss: stoploss,
       ceOpt: direction === 'CALL' ? opt : undefined,
       peOpt: direction === 'PUT' ? opt : undefined,
       structureId,
@@ -510,7 +557,7 @@ export class StrategyEngine {
       localSess.openingRangeHigh, localSess.openingRangeLow,
       localSess.previousDayHigh, localSess.previousDayLow,
       localSess.sessionHigh, localSess.sessionLow,
-      valCtx.nearestCEWallAbove, valCtx.nearestPEWallBelow
+      valCtx.nearestCeWallAbove, valCtx.nearestPeWallBelow
     ].filter(l => l > 0);
     const result = runSetupValidation(valCtx, setup, validLevels, testCount);
     if (!result.passed) {
@@ -548,7 +595,7 @@ export class StrategyEngine {
 
   private async checkFailedRetest(
     valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: LocalSessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
-  ): Promise<Signal | null> {
+  ): Promise<InternalSignal | null> {
     if (candles.length < 4) return null;
 
     const levels = [
@@ -602,7 +649,7 @@ export class StrategyEngine {
         const rewardRatio = roomPts / riskPts;
 
         if (rewardRatio >= 0.8 && sess.lastFailedSetupLevel !== lvl) {
-          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, seriesData)) continue;
+          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) continue;
           sess.brokenLevelUnderWatch = lvl;
           passed.push(`Failed Retest Call setup confirmed at level ${lvl}`);
           return this.createSignal(
@@ -646,7 +693,7 @@ export class StrategyEngine {
         const rewardRatio = roomPts / riskPts;
 
         if (rewardRatio >= 0.8 && sess.lastFailedSetupLevel !== lvl) {
-          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, seriesData)) continue;
+          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) continue;
           sess.brokenLevelUnderWatch = lvl;
           passed.push(`Failed Retest Put setup confirmed at level ${lvl}`);
           return this.createSignal(
@@ -674,7 +721,7 @@ export class StrategyEngine {
   // ====================================================
   private async checkContinuationBreakdown(
     valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: LocalSessionState, wallBelow: number, passed: string[], failed: string[]
-  ): Promise<Signal | null> {
+  ): Promise<InternalSignal | null> {
     if (candles.length < 4) return null;
 
     const levels = [sess.openingRangeLow, sess.previousDayLow, sess.sessionLow, wallBelow].filter(l => l > 0);
@@ -719,7 +766,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / riskPts;
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKDOWN', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange, undefined, seriesData)) continue;
+            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKDOWN', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange, undefined, this.extractSeries(atmStrike))) continue;
             sess.brokenLevelUnderWatch = lvl;
             passed.push(`Continuation Breakdown Put confirmed below level ${lvl}`);
             return this.createSignal(
@@ -749,7 +796,7 @@ export class StrategyEngine {
   // ====================================================
   private async checkContinuationBreakout(
     valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: LocalSessionState, wallAbove: number, passed: string[], failed: string[]
-  ): Promise<Signal | null> {
+  ): Promise<InternalSignal | null> {
     if (candles.length < 4) return null;
 
     const levels = [sess.openingRangeHigh, sess.previousDayHigh, sess.sessionHigh, wallAbove].filter(l => l > 0);
@@ -794,7 +841,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / riskPts;
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKOUT', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange, undefined, seriesData)) continue;
+            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKOUT', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange, undefined, this.extractSeries(atmStrike))) continue;
             sess.brokenLevelUnderWatch = lvl;
             passed.push(`Continuation Breakout Call confirmed above level ${lvl}`);
             return this.createSignal(
@@ -824,7 +871,7 @@ export class StrategyEngine {
   // ====================================================
   private async checkOpeningTrap(
     valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: LocalSessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
-  ): Promise<Signal | null> {
+  ): Promise<InternalSignal | null> {
     if (candles.length < 3) return null;
 
     const c0 = candles[candles.length - 1]; // confirmation candle
@@ -843,7 +890,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, spot - sess.openingRangeHigh);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'CALL', sess.openingRangeHigh, c0, c1, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, seriesData)) return null;
+            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'CALL', sess.openingRangeHigh, c0, c1, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
             sess.brokenLevelUnderWatch = sess.openingRangeHigh;
             passed.push(`Opening Trap Call confirmed at ORH level ${sess.openingRangeHigh}`);
             return this.createSignal(
@@ -879,7 +926,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, sess.openingRangeLow - spot);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'PUT', sess.openingRangeLow, c0, c1, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, seriesData)) return null;
+            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'PUT', sess.openingRangeLow, c0, c1, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
             sess.brokenLevelUnderWatch = sess.openingRangeLow;
             passed.push(`Opening Trap Put confirmed at ORL level ${sess.openingRangeLow}`);
             return this.createSignal(
@@ -910,7 +957,7 @@ export class StrategyEngine {
   // ====================================================
   private async checkOIWallRejection(
     valCtx: ValidationContext, index: string, spot: number, candles: Candle[], chainRows: any[], sess: LocalSessionState, wallAbove: number, wallBelow: number, passed: string[], failed: string[]
-  ): Promise<Signal | null> {
+  ): Promise<InternalSignal | null> {
     if (candles.length < 3) return null;
 
     const step = index === 'NIFTY' ? 50 : 100;
@@ -936,7 +983,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, wallAbove - spot);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'PUT', wallAbove, c0, c0, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, ceWallTests, structureId, undefined, undefined, undefined, undefined, seriesData)) return null;
+            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'PUT', wallAbove, c0, c0, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, ceWallTests, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
             sess.brokenLevelUnderWatch = wallAbove;
             passed.push(`CE Wall Rejection Put confirmed at ${wallAbove} (${ceWallTests} candle rejections)`);
             return this.createSignal(
@@ -973,7 +1020,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, spot - wallBelow);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'CALL', wallBelow, c0, c0, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, peWallTests, structureId, undefined, undefined, undefined, undefined, seriesData)) return null;
+            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'CALL', wallBelow, c0, c0, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, peWallTests, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
             sess.brokenLevelUnderWatch = wallBelow;
             passed.push(`PE Wall Rejection Call confirmed at ${wallBelow} (${peWallTests} candle rejections)`);
             return this.createSignal(
@@ -999,7 +1046,7 @@ export class StrategyEngine {
     return null;
   }
 
-  // Helper to create Signal object matching required format
+  // Helper to create InternalSignal object matching required format
   private createSignal(
     index: string,
     strategyFamily: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION',
@@ -1019,7 +1066,7 @@ export class StrategyEngine {
     confirmCandleLow?: number,
     confirmCandleHigh?: number,
     structureId?: string
-  ): Signal | null {
+  ): InternalSignal | null {
     // Dual Synchronized Stop-Loss Calculation:
     // 1. Primary Invalidation Trigger: Spot Price Level (Broken Level breach)
     // 2. Secondary Invalidation Trigger: Option Premium (LTP) Delta-Linked SL (~0.50 ATM Delta)
@@ -1075,7 +1122,6 @@ export class StrategyEngine {
       latestPrice: premium,
       highestPrice: premium,
       stoploss: slPrice,
-      target: target1Price,
       status: 'ACTIVE',
       tradeType: optType,
       confirmationCandleLow: confirmCandleLow,
@@ -1095,7 +1141,6 @@ export class StrategyEngine {
       option_type: optType,
       strike,
       entry: premium,
-      stoploss: slPrice,
       target1: target1Price,
       target2: target2Price,
       confidence: finalConfidence,
@@ -1155,7 +1200,7 @@ export class StrategyEngine {
     sess.wallTestCounts[roundedSpot] = (sess.wallTestCounts[roundedSpot] || 0) + 1;
   }
 
-  private manageActiveTrades(newSignals: Signal[]) {
+  private manageActiveTrades(newSignals: InternalSignal[]) {
     for (const [id, signal] of this.activeSignals.entries()) {
       if (signal.status === 'CLOSED') {
         this.activeSignals.delete(id);
@@ -1163,7 +1208,7 @@ export class StrategyEngine {
       }
 
       const currentOptPrice = signal.latestPrice || signal.entryPrice;
-      const currentSpot = signal.index === 'NIFTY' ? this.state.nifty50.lastPrice : this.state.bankNifty?.lastPrice || 0;
+      const currentSpot = this.state.nifty50.lastPrice;
 
       // Track peak option price achieved during trade
       signal.highestPrice = Math.max(signal.highestPrice || currentOptPrice, currentOptPrice);
@@ -1261,7 +1306,7 @@ export class StrategyEngine {
     }
   }
 
-  private closeSignal(signal: Signal, exitPrice: number, reason: string) {
+  private closeSignal(signal: InternalSignal, exitPrice: number, reason: string) {
     signal.status = 'CLOSED';
     signal.exitPrice = exitPrice;
     signal.exitTime = Date.now();
@@ -1273,6 +1318,10 @@ export class StrategyEngine {
     const qty = lotQuantity * lots;
 
     signal.realizedPnL = (exitPrice - signal.entryPrice) * qty;
+    this.realizedPnL += signal.realizedPnL;
+    this.totalTrades += 1;
+    if (signal.realizedPnL > 0) this.winningTrades += 1;
+    this.winRate = this.totalTrades > 0 ? (this.winningTrades / this.totalTrades) * 100 : 0;
 
     const sess = this.sessionStates[signal.index];
     if (sess) {

@@ -1,4 +1,6 @@
-export type TradingSymbol = 'NIFTY';
+const fs = require('fs');
+
+const typesCode = `export type TradingSymbol = 'NIFTY';
 
 export interface AppSettings {
   apiKey: string;
@@ -114,8 +116,6 @@ export interface InternalSignal extends EngineDecision {
   partialExit?: boolean;
   leg?: 'MAIN' | 'HEDGE';
   isStraddle?: boolean;
-  firstTargetHitFlag?: boolean;
-  trailingStopActiveFlag?: boolean;
   breakevenShifted?: boolean;
   timeStop?: string;
   tradeType?: 'CE' | 'PE';
@@ -189,3 +189,6 @@ export interface ValidationSeries {
   gammaSeriesLast3: number[];
   vegaSeriesLast3: number[];
 }
+`;
+
+fs.writeFileSync('src/backend/types.ts', typesCode);

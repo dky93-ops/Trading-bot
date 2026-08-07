@@ -1,16 +1,17 @@
-import { Candle, Signal, StrategySessionState } from './types.js';
+import { Candle, StrategySessionState, InternalSignal } from './types.js';
 
 export interface ValidationContext {
+  activeSignals?: Map<string, InternalSignal>;
   index: string;
   spotPrice: number;
   timeObj: Date;
   timeStr: string;
-  activeSignals: Map<string, Signal>;
+  activeSignals: Map<string, InternalSignal>;
   sessState: StrategySessionState;
   candles1m: Candle[];
   chainRows: any[];
-  nearestCEWallAbove: number;
-  nearestPEWallBelow: number;
+  nearestCeWallAbove: number;
+  nearestPeWallBelow: number;
 }
 
 export interface ProposedSetup {
@@ -68,8 +69,8 @@ export function rule2OpeningFilter(timeStr: string): RuleResult {
 }
 
 // RULE 3 — ONE OPEN TRADE ONLY
-export function rule3OneOpenTrade(activeSignals: Map<string, Signal>): RuleResult {
-  if (activeSignals.size >= 1) return fail('FAILED_MAX_TRADES: A trade is already active');
+export function rule3OneOpenTrade(activeSignals: Map<string, InternalSignal>): RuleResult {
+  if (activeInternalSignals.size >= 1) return fail('FAILED_MAX_TRADES: A trade is already active');
   return pass();
 }
 
@@ -83,7 +84,7 @@ export function rule4Cooldown(sessState: StrategySessionState, nowMs: number): R
 
 // RULE 17 — CHOP FILTER
 export function rule17ChopFilter(ctx: ValidationContext): RuleResult {
-  const distance = ctx.nearestCEWallAbove - ctx.nearestPEWallBelow;
+  const distance = ctx.nearestCeWallAbove - ctx.nearestPeWallBelow;
   const threshold = ctx.index === 'NIFTY' ? 60 : 120;
   if (distance > 0 && distance <= threshold) {
     return fail('FAILED_CHOP_FILTER: Price is trapped between nearby CE and PE walls');
@@ -263,7 +264,8 @@ export function rule12ConfirmationCandle(setup: ProposedSetup, index: string): R
 
 // RULE 13 — PREMIUM CONFIRMATION
 export function rule13PremiumConfirmation(setup: ProposedSetup): RuleResult {
-  const { premiumSeriesLast3, oppPremiumSeriesLast3 } = setup;
+  const premiumSeriesLast3 = setup.direction === 'CALL' ? setup.callPremiumSeriesLast3 : setup.putPremiumSeriesLast3;
+  const oppPremiumSeriesLast3 = setup.direction === 'CALL' ? setup.putPremiumSeriesLast3 : setup.callPremiumSeriesLast3;
 
   if (!premiumSeriesLast3 || premiumSeriesLast3.length < 3) {
     return fail('FAILED_PREMIUM_CONFIRMATION: Missing 3 closed premium points');
@@ -293,7 +295,8 @@ export function rule13PremiumConfirmation(setup: ProposedSetup): RuleResult {
 
 // RULE 14 — MIXED DIRECTION FILTER
 export function rule14MixedDirection(setup: ProposedSetup): RuleResult {
-  const { spotMoveFromLevel, premiumSeriesLast3 } = setup;
+  const spotMoveFromLevel = setup.spotMoveFromLevel;
+  const premiumSeriesLast3 = setup.direction === 'CALL' ? setup.callPremiumSeriesLast3 : setup.putPremiumSeriesLast3;
 
   if (spotMoveFromLevel === undefined) {
     return fail('FAILED_MIXED_DIRECTION: Missing spot structure data');
@@ -336,7 +339,7 @@ export function rule16RoomToTarget(setup: ProposedSetup, ctx: ValidationContext)
   
   if (setup.direction === 'CALL') {
     const candidates = [
-      ctx.nearestCEWallAbove,
+      ctx.nearestCeWallAbove,
       sess.sessionHigh,
       sess.previousDayHigh,
       sess.openingRangeHigh
@@ -352,7 +355,7 @@ export function rule16RoomToTarget(setup: ProposedSetup, ctx: ValidationContext)
     }
   } else {
     const candidates = [
-      ctx.nearestPEWallBelow,
+      ctx.nearestPeWallBelow,
       sess.sessionLow,
       sess.previousDayLow,
       sess.openingRangeLow
@@ -439,16 +442,20 @@ export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSe
   if (setup.direction === 'CALL' && ctx.spotPrice < setup.level) return fail('FAILED_OVERALL_AGREEMENT: Level no longer intact (spot below support)');
   if (setup.direction === 'PUT' && ctx.spotPrice > setup.level) return fail('FAILED_OVERALL_AGREEMENT: Level no longer intact (spot above resistance)');
 
-  if (!setup.premiumSeriesLast3 || setup.premiumSeriesLast3.length < 3) return fail('FAILED_OVERALL_AGREEMENT: Premium data missing');
-  if (!setup.oiSeriesLast3 || setup.oiSeriesLast3.length < 3) return fail('FAILED_OVERALL_AGREEMENT: OI data missing');
-  if (!setup.oppOiSeriesLast3 || setup.oppOiSeriesLast3.length < 3) return fail('FAILED_OVERALL_AGREEMENT: Opposite OI data missing');
+  const premiumSeriesLast3 = setup.direction === 'CALL' ? setup.callPremiumSeriesLast3 : setup.putPremiumSeriesLast3;
+  const oiSeriesLast3 = setup.direction === 'CALL' ? setup.callOiSeriesLast3 : setup.putOiSeriesLast3;
+  const oppOiSeriesLast3 = setup.direction === 'CALL' ? setup.oppCallOiSeriesLast3 : setup.oppPutOiSeriesLast3;
 
-  const [p1, p2, p3] = setup.premiumSeriesLast3;
+  if (!premiumSeriesLast3 || premiumSeriesLast3.length < 3) return fail('FAILED_OVERALL_AGREEMENT: Premium data missing');
+  if (!oiSeriesLast3 || oiSeriesLast3.length < 3) return fail('FAILED_OVERALL_AGREEMENT: OI data missing');
+  if (!oppOiSeriesLast3 || oppOiSeriesLast3.length < 3) return fail('FAILED_OVERALL_AGREEMENT: Opposite OI data missing');
+
+  const [p1, p2, p3] = premiumSeriesLast3;
   if (!(p3 > p2 && p2 > p1)) return fail('FAILED_OVERALL_AGREEMENT: Premium not strictly rising');
 
-  const [o1, o2, o3] = setup.oiSeriesLast3;
+  const [o1, o2, o3] = oiSeriesLast3;
   const oiFalling = o3 < o2 && o2 < o1;
-  const [oo1, oo2, oo3] = setup.oppOiSeriesLast3;
+  const [oo1, oo2, oo3] = oppOiSeriesLast3;
   const oppOiRising = oo3 > oo2 && oo2 > oo1;
 
   if (setup.setupType === 'FAILED_RETEST') {
@@ -549,7 +556,7 @@ export function rule20FinalSafetyCheck(
   const checks = [
     rule1CompletedCandles(ctx.candles1m, ctx.timeObj),
     rule2OpeningFilter(ctx.timeStr),
-    rule3OneOpenTrade(ctx.activeSignals),
+    rule3OneOpenTrade(ctx.activeInternalSignals),
     rule4Cooldown(ctx.sessState, ctx.timeObj.getTime()),
     rule5MarketStructure(ctx.sessState, setup),
     rule6FailedLevel(ctx.sessState, setup),
@@ -578,7 +585,7 @@ export function runGlobalPreChecks(ctx: ValidationContext): RuleResult {
   const checks = [
     rule1CompletedCandles(ctx.candles1m, ctx.timeObj),
     rule2OpeningFilter(ctx.timeStr),
-    rule3OneOpenTrade(ctx.activeSignals),
+    rule3OneOpenTrade(ctx.activeInternalSignals),
     rule4Cooldown(ctx.sessState, ctx.timeObj.getTime()),
     rule17ChopFilter(ctx)
   ];
