@@ -1,4 +1,6 @@
+const fs = require('fs');
 
+const content = `
 import { StrategySessionState, Candle, InternalSignal } from './types.js';
 
 export interface ProposedSetup {
@@ -145,24 +147,19 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
   ];
 
   if (setup.direction === 'PUT') {
-    // Rejected from CE Wall above, buying PUT
     const callOI = row.call_options?.market_data?.oi || 0;
+    const callOIChange = row.call_options?.market_data?.oi_change || 0;
     const surrCallOI = surr.reduce((sum, r) => sum + (r.call_options?.market_data?.oi || 0), 0) / 4;
     
     if (surrCallOI === 0 || callOI < 1.5 * surrCallOI) return fail('FAILED_WALL_DOMINANCE: CE OI is not 1.5x dominant');
-    
-    // Check weakening using session state
-    if (ctx.sessState.wallOIWeakeningConfirmed[setup.level]) return fail('FAILED_WALL_DOMINANCE: CE OI is rapidly weakening (>= 5% drop)');
-    if (ctx.sessState.wallNegativeOICounts[setup.level] >= 2) return fail('FAILED_WALL_DOMINANCE: CE OI dropped for 2 consecutive ticks');
+    if (callOIChange < -0.05 * callOI) return fail('FAILED_WALL_DOMINANCE: CE OI is rapidly reversing');
   } else {
-    // Rejected from PE Wall below, buying CALL
     const putOI = row.put_options?.market_data?.oi || 0;
+    const putOIChange = row.put_options?.market_data?.oi_change || 0;
     const surrPutOI = surr.reduce((sum, r) => sum + (r.put_options?.market_data?.oi || 0), 0) / 4;
     
     if (surrPutOI === 0 || putOI < 1.5 * surrPutOI) return fail('FAILED_WALL_DOMINANCE: PE OI is not 1.5x dominant');
-
-    if (ctx.sessState.wallOIWeakeningConfirmed[setup.level]) return fail('FAILED_WALL_DOMINANCE: PE OI is rapidly weakening (>= 5% drop)');
-    if (ctx.sessState.wallNegativeOICounts[setup.level] >= 2) return fail('FAILED_WALL_DOMINANCE: PE OI dropped for 2 consecutive ticks');
+    if (putOIChange < -0.05 * putOI) return fail('FAILED_WALL_DOMINANCE: PE OI is rapidly reversing');
   }
   
   return pass();
@@ -170,8 +167,11 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
 
 export function rule9WallTestedTwice(setup: ProposedSetup): RuleResult {
   if (setup.setupType === 'OI_WALL_REJECTION') {
-    if ((setup.wallTestCount || 0) < 2) {
+    if (!setup.hasTwoDistinctWallTests) {
       return fail('FAILED_WALL_TEST_COUNT: Wall was not tested at least 2 distinct times');
+    }
+    if (!setup.hasSessionReaction) {
+      return fail('FAILED_WALL_SESSION_REACTION: Wall has no session reaction');
     }
   }
   return pass();
@@ -216,12 +216,11 @@ export function rule11RetestQuality(setup: ProposedSetup): RuleResult {
 export function rule12ConfirmationCandle(setup: ProposedSetup, index: string): RuleResult {
   const isCall = setup.direction === 'CALL';
   const c0 = setup.c0;
-  const minBody = index === 'NIFTY' ? 0.1 : 0.2;
   
   if (isCall) {
-    if (c0.close <= c0.open + minBody) return fail('FAILED_CONFIRMATION_CANDLE: Confirmation candle must be bullish');
+    if (!setup.confirmationCandleGreen) return fail('FAILED_CONFIRMATION_CANDLE: Confirmation candle must be bullish');
   } else {
-    if (c0.close >= c0.open - minBody) return fail('FAILED_CONFIRMATION_CANDLE: Confirmation candle must be bearish');
+    if (!setup.confirmationCandleRed) return fail('FAILED_CONFIRMATION_CANDLE: Confirmation candle must be bearish');
   }
   return pass();
 }
@@ -271,10 +270,10 @@ export function rule14MixedDirection(setup: ProposedSetup): RuleResult {
   const isCall = setup.direction === 'CALL';
   const c0 = setup.c0;
   
-  if (isCall && c0.close <= c0.open) {
+  if (isCall && !setup.confirmationCandleGreen) {
     return fail('FAILED_MIXED_DIRECTION: CALL requires bullish confirmation');
   }
-  if (!isCall && c0.close >= c0.open) {
+  if (!isCall && !setup.confirmationCandleRed) {
     return fail('FAILED_MIXED_DIRECTION: PUT requires bearish confirmation');
   }
   return pass();
@@ -290,7 +289,7 @@ export function rule15Overextension(setup: ProposedSetup): RuleResult {
 }
 
 export function rule16RoomToTarget(setup: ProposedSetup): RuleResult {
-  if (!setup.target1 || setup.target1 <= 0 || !setup.stopLoss || setup.stopLoss <= 0 || !setup.level || setup.level <= 0) return fail('FAILED_ROOM_TO_TARGET: Missing target, stopLoss, or level data');
+  if (!setup.target1 || !setup.stopLoss || !setup.level) return fail('FAILED_ROOM_TO_TARGET: Missing target, stopLoss, or level data');
   const risk = Math.abs(setup.level - setup.stopLoss);
   const reward1 = Math.abs(setup.target1 - setup.level);
   if (risk > 0 && (reward1 / risk) < 0.8) return fail('FAILED_ROOM_TO_TARGET: Target 1 is less than 0.8R');
@@ -298,45 +297,7 @@ export function rule16RoomToTarget(setup: ProposedSetup): RuleResult {
 }
 
 export function rule18BrokenLevelReclaimedInvalidation(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
-  const candles = ctx.candles1m;
-  if (!candles || candles.length < 3 || !setup.level) return pass();
-  
-  let reclaimed = false;
-  let breakoutIdx = -1;
-  
-  if (setup.direction === 'CALL') {
-    for (let i = candles.length - 1; i >= Math.max(1, candles.length - 15); i--) {
-      if (candles[i].close > setup.level && candles[i - 1].close <= setup.level) {
-        breakoutIdx = i;
-        break;
-      }
-    }
-    if (breakoutIdx !== -1) {
-      for (let j = breakoutIdx + 1; j < candles.length; j++) {
-        if (candles[j].close < setup.level) {
-          reclaimed = true;
-          break;
-        }
-      }
-    }
-  } else {
-    for (let i = candles.length - 1; i >= Math.max(1, candles.length - 15); i--) {
-      if (candles[i].close < setup.level && candles[i - 1].close >= setup.level) {
-        breakoutIdx = i;
-        break;
-      }
-    }
-    if (breakoutIdx !== -1) {
-      for (let j = breakoutIdx + 1; j < candles.length; j++) {
-        if (candles[j].close > setup.level) {
-          reclaimed = true;
-          break;
-        }
-      }
-    }
-  }
-  
-  if (reclaimed) {
+  if (ctx.sessState.lastConfirmedReclaimLevel === setup.level) {
     return fail('FAILED_RECLAIM: Broken level was reclaimed by a closed candle');
   }
   return pass();
@@ -353,8 +314,11 @@ export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSe
   }
 
   if (setup.setupType === 'OI_WALL_REJECTION') {
-     if ((setup.wallTestCount || 0) < 2) return fail('FAILED_OVERALL_AGREEMENT: OI Wall Rejection requires at least 2 tests');
-     
+     if (!setup.hasTwoDistinctWallTests) return fail('FAILED_OVERALL_AGREEMENT: OI Wall Rejection requires at least 2 tests');
+     if (!setup.hasSessionReaction) return fail('FAILED_OVERALL_AGREEMENT: OI Wall Rejection requires session reaction');
+     if (setup.wallOIWeakeningPercent !== undefined && setup.wallOIWeakeningPercent < 5 && (setup.wallNegativeOIConsecutive || 0) < 2) {
+       return fail('FAILED_WALL_WEAKENING: OI Wall did not weaken');
+     }
   }
   
   return pass();
@@ -383,3 +347,5 @@ export function runSetupValidation(ctx: ValidationContext, setup: ProposedSetup,
   }
   return pass();
 }
+`
+fs.writeFileSync('src/backend/validation-rules.ts', content);

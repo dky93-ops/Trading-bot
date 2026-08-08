@@ -54,18 +54,27 @@ export interface StrategySessionState {
   activeStructureId: string | null;
   lastFailedStructureId: string | null;
   sessionDateIST: string;
+
   wallTestCounts: Record<number, number>;
+  wallTestCandleKeys: Record<number, string[]>;
+  wallReactionCandleKeys: Record<number, string[]>;
+  wallLastSeenOI: Record<number, number>;
+  wallOIWeakeningConfirmed: Record<number, boolean>;
+  
   prevWallTotalOI: Record<number, number>;
   wallNegativeOICounts: Record<number, number>;
+
   brokenLevelUnderWatch: number | null;
   retestPendingFlag: boolean;
   continuationPendingFlag: boolean;
+  
   tradeTakenFlag: boolean;
   firstTargetHitFlag: boolean;
   trailingStopActiveFlag: boolean;
   lastSignalDirection: 'CALL' | 'PUT' | 'NONE';
   lastFailedSetupLevel: number | null;
   lastTradeCandleTime: string | null;
+  
   sessionHigh: number;
   sessionLow: number;
   previousDayHigh: number;
@@ -74,6 +83,18 @@ export interface StrategySessionState {
   openingRangeLow: number;
   nearestCeWallAbove: number;
   nearestPeWallBelow: number;
+
+  confirmedBreakoutTimestamp: string | null;
+  confirmedBreakoutLevel: number | null;
+  confirmedBreakoutDirection: 'CALL' | 'PUT' | null;
+
+  retestTimestamp: string | null;
+  retestLevel: number | null;
+  retestDirection: 'CALL' | 'PUT' | null;
+  
+  lastProcessedCandleTimestamp: string | null;
+  currentStrategyFamily: string | null;
+  lastConfirmedReclaimLevel: number | null;
 }
 
 export interface EngineDecision {

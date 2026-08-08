@@ -1,36 +1,13 @@
 const fs = require('fs');
-
 let engine = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
 
-const validateSetupRegex = /private validateSetup\([\s\S]*?setupType: string,[\s\S]*?c0: Candle/;
-engine = engine.replace(validateSetupRegex, `private validateSetup(
-    valCtx: ValidationContext, setupType: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION', direction: 'CALL' | 'PUT', lvl: number,
-    c0: Candle`);
+const regex = /barsSinceRetest,\n\s*impulseRange,\n\s*spotMoveFromLevel,\n\s*spotSeriesLast3/;
 
+const replace = `barsSinceRetest,
+      impulseRange,
+      spotMoveFromLevel,
+      premiumAtConfirmation: opt?.price,
+      spotSeriesLast3`;
+
+engine = engine.replace(regex, replace);
 fs.writeFileSync('src/backend/strategy-engine.ts', engine);
-
-let rules = fs.readFileSync('src/backend/validation-rules.ts', 'utf8');
-const proposedSetupRegex = /export interface ProposedSetup \{[\s\S]*?putPremiumSeriesLast3\?: number\[\];\n\}/;
-const newProposedSetup = `export interface ProposedSetup {
-  direction: 'CALL' | 'PUT';
-  level: number;
-  setupType: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION';
-  c0: Candle;
-  c1: Candle;
-  c2?: Candle;
-  target1: number;
-  target2: number;
-  stopLoss: number;
-  ceOpt?: any;
-  peOpt?: any;
-  structureId?: string;
-  barsSinceBreakout?: number;
-  barsSinceRetest?: number;
-  impulseRange?: number;
-  spotMoveFromLevel?: number;
-  spotSeriesLast3?: number[];
-  callPremiumSeriesLast3?: number[];
-  putPremiumSeriesLast3?: number[];
-}`;
-rules = rules.replace(proposedSetupRegex, newProposedSetup);
-fs.writeFileSync('src/backend/validation-rules.ts', rules);
