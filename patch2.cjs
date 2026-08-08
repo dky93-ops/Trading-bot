@@ -1,37 +1,78 @@
 const fs = require('fs');
-let code = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
+let code = fs.readFileSync('src/backend/validation-rules.ts', 'utf8');
 
-const badReclaim = `      // Reclaim-specific memory updates
-      if (result.reason && result.reason.includes('FAILED_RECLAIMED_LEVEL')) {
-        localSess.brokenLevelUnderWatch = null;
-        localSess.retestPendingFlag = false;
-        localSess.continuationPendingFlag = false;
-        if (localSess.activeStructureId === setup.structureId) {
-          localSess.activeStructureId = null;
-        }
-      }`;
+const r19Old = `// RULE 19
+export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
+  const isCall = setup.direction === 'CALL';
+  const spotMove = setup.spotMoveFromLevel;
+  
+  if (spotMove !== undefined) {
+    if (isCall && spotMove < 0) return fail('FAILED_OVERALL_AGREEMENT: CALL signal but spot structure is bearish');
+    if (!isCall && spotMove > 0) return fail('FAILED_OVERALL_AGREEMENT: PUT signal but spot structure is bullish');
+  }
 
-const fixReclaim = `      // Reclaim-specific memory updates
-      if (result.reason && result.reason.includes('FAILED_RECLAIMED_LEVEL')) {
-        localSess.brokenLevelUnderWatch = null;
-        localSess.retestPendingFlag = false;
-        localSess.continuationPendingFlag = false;
-        if (localSess.activeStructureId === setup.structureId) {
-          localSess.activeStructureId = null;
-        }
-        
-        localSess.failedLevelsToday = localSess.failedLevelsToday || [];
-        if (!localSess.failedLevelsToday.includes(setup.level)) {
-          localSess.failedLevelsToday.push(setup.level);
-        }
-        localSess.failedStructuresToday = localSess.failedStructuresToday || [];
-        if (setup.structureId && !localSess.failedStructuresToday.includes(setup.structureId)) {
-          localSess.failedStructuresToday.push(setup.structureId);
-        }
-        localSess.lastFailedSetupLevel = setup.level;
-        localSess.lastFailedStructureId = setup.structureId || null;
-      }`;
+  const premiumLast3 = isCall ? setup.callPremiumSeriesLast3 : setup.putPremiumSeriesLast3;
+  if (premiumLast3 && premiumLast3.length === 3) {
+    const [p1, p2, p3] = premiumLast3;
+    // Premium must not be clearly moving against intended direction
+    if (p3 < p1 * 0.9) return fail('FAILED_OVERALL_AGREEMENT: Premium series is moving against the intended direction');
+  }
+  
+  // Cross check families
+  if (setup.setupType === 'CONTINUATION_BREAKOUT' && !isCall) return fail('FAILED_OVERALL_AGREEMENT: Breakout must be CALL');
+  if (setup.setupType === 'CONTINUATION_BREAKDOWN' && isCall) return fail('FAILED_OVERALL_AGREEMENT: Breakdown must be PUT');
+  
+  return pass();
+}`;
 
-code = code.replace(badReclaim, fixReclaim);
+const r19New = `// RULE 19
+export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
+  const isCall = setup.direction === 'CALL';
+  const spotMove = setup.spotMoveFromLevel;
+  
+  // Directional coherence
+  if (spotMove !== undefined) {
+    if (isCall && spotMove < 0) return fail('FAILED_OVERALL_AGREEMENT: CALL signal but spot structure is bearish');
+    if (!isCall && spotMove > 0) return fail('FAILED_OVERALL_AGREEMENT: PUT signal but spot structure is bullish');
+  }
 
-fs.writeFileSync('src/backend/strategy-engine.ts', code);
+  // Premium coherence
+  const premiumLast3 = isCall ? setup.callPremiumSeriesLast3 : setup.putPremiumSeriesLast3;
+  if (premiumLast3 && premiumLast3.length === 3) {
+    const [p1, p2, p3] = premiumLast3;
+    if (p3 < p1 * 0.9) return fail('FAILED_OVERALL_AGREEMENT: Premium series is moving against the intended direction');
+  }
+  
+  // Cross check families & specific requirements
+  if (setup.setupType === 'CONTINUATION_BREAKOUT' && !isCall) return fail('FAILED_OVERALL_AGREEMENT: Breakout must be CALL');
+  if (setup.setupType === 'CONTINUATION_BREAKDOWN' && isCall) return fail('FAILED_OVERALL_AGREEMENT: Breakdown must be PUT');
+  
+  // Retest timing check
+  if (['FAILED_RETEST', 'OPENING_TRAP'].includes(setup.setupType)) {
+    if (setup.barsSinceRetest === undefined) return fail('FAILED_OVERALL_AGREEMENT: Missing retest sequence data');
+    if (setup.setupType === 'OPENING_TRAP' && (setup.barsSinceRetest < 1 || setup.barsSinceRetest > 3)) {
+      return fail('FAILED_OVERALL_AGREEMENT: Opening trap retest must be within 1-3 candles');
+    }
+    if (setup.setupType === 'FAILED_RETEST' && (setup.barsSinceRetest < 1 || setup.barsSinceRetest > 4)) {
+      return fail('FAILED_OVERALL_AGREEMENT: Failed retest must be within 1-4 candles');
+    }
+  }
+
+  // Stretched / Late setup
+  if (setup.impulseRange && ctx.spotPrice) {
+    const distance = Math.abs(ctx.spotPrice - setup.level);
+    if (distance > 1.5 * setup.impulseRange) {
+      return fail('FAILED_OVERALL_AGREEMENT: Move from breakout level > 1.5x impulse candle range');
+    }
+  }
+
+  return pass();
+}`;
+
+if (code.includes(r19Old)) {
+  code = code.replace(r19Old, r19New);
+} else {
+  console.log("Could not find old rule19");
+}
+
+fs.writeFileSync('src/backend/validation-rules.ts', code);

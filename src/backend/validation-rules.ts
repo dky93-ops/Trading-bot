@@ -64,13 +64,13 @@ export function rule1CompletedCandles(candles: Candle[], timeObj: Date): RuleRes
 export function rule2OpeningFilter(timeStr: string, setup?: ProposedSetup): RuleResult {
   if (timeStr < '09:15') return fail('FAILED_TIME_FILTER: Pre-market');
   if (timeStr >= '15:30') return fail('FAILED_TIME_FILTER: Post-market');
-  if (timeStr < '09:20' && !setup) {
-    // Soft gate: don't block pre-checks, but require full setup confirmation
-    return pass(); 
-  }
-  if (timeStr < '09:20' && setup) {
-    // Exceptional clarity required
-    if (!setup.c0 || !setup.c1) return fail('FAILED_TIME_FILTER: Pre-09:20 requires exceptional clarity (missing candles)');
+  
+  if (setup) {
+    if (timeStr < '09:20') {
+      if (!setup.c0 || !setup.c1 || !setup.c2) return fail('FAILED_TIME_FILTER: Pre-09:20 requires exceptional clarity and full confirmation');
+    } else if (timeStr < '09:30') {
+      if (!setup.c0 || !setup.c1) return fail('FAILED_TIME_FILTER: 09:20-09:30 requires genuinely strong fully confirmed setup');
+    }
   }
   return pass();
 }
@@ -284,7 +284,7 @@ export function rule16RoomToTarget(setup: ProposedSetup): RuleResult {
 // RULE 18
 export function rule18BrokenLevelReclaimedInvalidation(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
   const candles = ctx.candles1m;
-  if (!candles || candles.length < 3) return fail('FAILED_RECLAIMED_LEVEL: Insufficient candles to determine reclaim');
+  if (!candles || candles.length < 3) return fail('FAILED_HISTORY: Insufficient candles to determine reclaim');
   
   let reclaimed = false;
   let breakoutIdx = -1;
@@ -334,22 +334,42 @@ export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSe
   const isCall = setup.direction === 'CALL';
   const spotMove = setup.spotMoveFromLevel;
   
+  // Directional coherence
   if (spotMove !== undefined) {
     if (isCall && spotMove < 0) return fail('FAILED_OVERALL_AGREEMENT: CALL signal but spot structure is bearish');
     if (!isCall && spotMove > 0) return fail('FAILED_OVERALL_AGREEMENT: PUT signal but spot structure is bullish');
   }
 
+  // Premium coherence
   const premiumLast3 = isCall ? setup.callPremiumSeriesLast3 : setup.putPremiumSeriesLast3;
   if (premiumLast3 && premiumLast3.length === 3) {
     const [p1, p2, p3] = premiumLast3;
-    // Premium must not be clearly moving against intended direction
     if (p3 < p1 * 0.9) return fail('FAILED_OVERALL_AGREEMENT: Premium series is moving against the intended direction');
   }
   
-  // Cross check families
+  // Cross check families & specific requirements
   if (setup.setupType === 'CONTINUATION_BREAKOUT' && !isCall) return fail('FAILED_OVERALL_AGREEMENT: Breakout must be CALL');
   if (setup.setupType === 'CONTINUATION_BREAKDOWN' && isCall) return fail('FAILED_OVERALL_AGREEMENT: Breakdown must be PUT');
   
+  // Retest timing check
+  if (['FAILED_RETEST', 'OPENING_TRAP'].includes(setup.setupType)) {
+    if (setup.barsSinceRetest === undefined) return fail('FAILED_OVERALL_AGREEMENT: Missing retest sequence data');
+    if (setup.setupType === 'OPENING_TRAP' && (setup.barsSinceRetest < 1 || setup.barsSinceRetest > 3)) {
+      return fail('FAILED_OVERALL_AGREEMENT: Opening trap retest must be within 1-3 candles');
+    }
+    if (setup.setupType === 'FAILED_RETEST' && (setup.barsSinceRetest < 1 || setup.barsSinceRetest > 4)) {
+      return fail('FAILED_OVERALL_AGREEMENT: Failed retest must be within 1-4 candles');
+    }
+  }
+
+  // Stretched / Late setup
+  if (setup.impulseRange && ctx.spotPrice) {
+    const distance = Math.abs(ctx.spotPrice - setup.level);
+    if (distance > 1.5 * setup.impulseRange) {
+      return fail('FAILED_OVERALL_AGREEMENT: Move from breakout level > 1.5x impulse candle range');
+    }
+  }
+
   return pass();
 }
 
