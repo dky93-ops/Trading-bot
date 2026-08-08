@@ -438,29 +438,14 @@ export class StrategyEngine {
     }
 
     // NO_TRADE Decision Output
-    return {
-      timestamp: timestampISO,
-      signal: 'NO_TRADE',
-      strategy_family: 'NONE',
-      direction: 'NONE',
-      spot: spotPrice,
-      broken_level: sessState.brokenLevelUnderWatch || 0,
-      wall_above: nearestCeWallAbove,
-      wall_below: nearestPeWallBelow,
-      option_type: 'NONE',
-      strike: Math.round(spotPrice / step) * step,
-      entry: 0,
-      stoploss: 0,
-      target1: 0,
-      target2: 0,
-      confidence: 0,
-      reason: [
-        `No valid high-probability strategy signal found on ${index}.`,
-        failedFilters.length > 0 ? `Failed filter checks: ${failedFilters.join('; ')}` : 'Awaiting clean breakout/retest structure and OI confirmation.'
-      ],
-      fake_signal_filters_passed: passedFilters,
-      fake_signal_filters_failed: failedFilters
-    } as any;
+    const reasons = [
+      `No valid high-probability strategy signal found on ${index}.`,
+      failedFilters.length > 0 ? `Failed filter checks: ${failedFilters.join('; ')}` : 'Awaiting clean breakout/retest structure and OI confirmation.'
+    ];
+    const noTradeSig = this.createNoTrade(index, spotPrice, reasons.join(' | '));
+    noTradeSig.fake_signal_filters_passed = passedFilters;
+    noTradeSig.fake_signal_filters_failed = failedFilters;
+    return noTradeSig;
   }
 
   // ====================================================
@@ -536,7 +521,7 @@ export class StrategyEngine {
   }
 
   private validateSetup(
-    valCtx: ValidationContext, setupType: string, direction: 'CALL' | 'PUT', lvl: number,
+    valCtx: ValidationContext, setupType: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION', direction: 'CALL' | 'PUT', lvl: number,
     c0: Candle, c1: Candle, c2: Candle | undefined, target1: number, target2: number, stoploss: number,
     opt: any, passed: string[], failed: string[], testCount: number = 0, structureId?: string,
     barsSinceBreakout?: number, barsSinceRetest?: number, impulseRange?: number, spotMoveFromLevel?: number,

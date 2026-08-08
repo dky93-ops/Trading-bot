@@ -1,13 +1,15 @@
+const fs = require('fs');
 
+const rulesContent = `
 import { StrategySessionState, Candle, InternalSignal } from './types.js';
 
 export interface ProposedSetup {
   direction: 'CALL' | 'PUT';
   level: number;
   setupType: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION';
-  c0: Candle;
-  c1: Candle;
-  c2?: Candle;
+  c0: Candle; // Confirmation candle (current)
+  c1: Candle; // Previous
+  c2?: Candle; // Pre-previous
   target1: number;
   target2: number;
   stopLoss: number;
@@ -18,10 +20,8 @@ export interface ProposedSetup {
   barsSinceRetest?: number;
   impulseRange?: number;
   spotMoveFromLevel?: number;
-  spotSeriesLast3?: number[];
   callPremiumSeriesLast3?: number[];
   putPremiumSeriesLast3?: number[];
-  [key: string]: any; // Allow other dynamically added properties without TS errors
 }
 
 export interface ValidationContext {
@@ -340,3 +340,6 @@ export function runSetupValidation(ctx: ValidationContext, setup: ProposedSetup,
   }
   return pass();
 }
+`;
+
+fs.writeFileSync('src/backend/validation-rules.ts', rulesContent);

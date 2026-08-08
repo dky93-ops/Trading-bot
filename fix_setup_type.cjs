@@ -1,14 +1,5 @@
 const fs = require('fs');
 
-let engine = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
-
-const validateSetupRegex = /private validateSetup\([\s\S]*?setupType: string,[\s\S]*?c0: Candle/;
-engine = engine.replace(validateSetupRegex, `private validateSetup(
-    valCtx: ValidationContext, setupType: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION', direction: 'CALL' | 'PUT', lvl: number,
-    c0: Candle`);
-
-fs.writeFileSync('src/backend/strategy-engine.ts', engine);
-
 let rules = fs.readFileSync('src/backend/validation-rules.ts', 'utf8');
 const proposedSetupRegex = /export interface ProposedSetup \{[\s\S]*?putPremiumSeriesLast3\?: number\[\];\n\}/;
 const newProposedSetup = `export interface ProposedSetup {
@@ -31,6 +22,7 @@ const newProposedSetup = `export interface ProposedSetup {
   spotSeriesLast3?: number[];
   callPremiumSeriesLast3?: number[];
   putPremiumSeriesLast3?: number[];
+  [key: string]: any; // Allow other dynamically added properties without TS errors
 }`;
 rules = rules.replace(proposedSetupRegex, newProposedSetup);
 fs.writeFileSync('src/backend/validation-rules.ts', rules);
