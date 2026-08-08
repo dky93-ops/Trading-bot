@@ -183,6 +183,29 @@ export class StrategyEngine {
     };
   }
 
+  private createNoTrade(index: string, spot: number, reason: string): any {
+    return {
+      timestamp: new Date().toISOString(),
+      signal: 'NO_TRADE',
+      strategy_family: 'NONE',
+      direction: 'NONE',
+      spot: spot,
+      broken_level: 0,
+      wall_above: 0,
+      wall_below: 0,
+      option_type: 'NONE',
+      strike: 0,
+      entry: 0,
+      stoploss: 0,
+      target1: 0,
+      target2: 0,
+      confidence: 0,
+      reason: [reason],
+      fake_signal_filters_passed: [],
+      fake_signal_filters_failed: []
+    } as any;
+  }
+
   private async evaluateIndex(index: string, spotPrice: number): Promise<InternalSignal | null> {
     const timeObj = new Date();
     const timeStr = timeObj.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
@@ -234,7 +257,7 @@ export class StrategyEngine {
       return cTime < currentMinuteStart;
     });
 
-    if (candles1m.length === 0) return null;
+    if (candles1m.length === 0) return this.createNoTrade(index, spotPrice, 'No candles available');
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -317,7 +340,7 @@ export class StrategyEngine {
     const globalPreCheckResult = runGlobalPreChecks(valCtx);
     if (!globalPreCheckResult.passed) {
       console.log(`[GLOBAL RULES] InternalSignal Rejected: ${globalPreCheckResult.reason}`);
-      return null;
+      return this.createNoTrade(index, spotPrice, globalPreCheckResult.reason);
     }
 
     // Filter Passed/Failed trackers for UI
@@ -335,9 +358,10 @@ export class StrategyEngine {
       const c0 = todayCandles[todayCandles.length - 1];
       const c0TimeStr = new Date(c0.timestamp).toISOString();
       if (sessState.lastTradeCandleTime && c0TimeStr === sessState.lastTradeCandleTime) {
-        failedFilters.push(`Setup already evaluated and traded on candle timestamp ${c0TimeStr}. Waiting for next completed candle.`);
-        return null;
-      }
+      const reason = `Setup already evaluated and traded on candle timestamp ${c0TimeStr}. Waiting for next completed candle.`;
+      failedFilters.push(reason);
+      return this.createNoTrade(index, spotPrice, reason);
+    }
     }
 
     // Helper to check if a strategy family is already active on this index
@@ -566,13 +590,13 @@ export class StrategyEngine {
         
         localSess.failedLevelsToday = localSess.failedLevelsToday || [];
         if (!localSess.failedLevelsToday.includes(setup.level)) {
-          localSess.failedLevelsToday.push(setup.level);
+          // REMOVED: Do not poison level on validation failure
         }
         localSess.failedStructuresToday = localSess.failedStructuresToday || [];
         if (setup.structureId && !localSess.failedStructuresToday.includes(setup.structureId)) {
           localSess.failedStructuresToday.push(setup.structureId);
         }
-        localSess.lastFailedSetupLevel = setup.level;
+        // REMOVED: Do not poison level on validation failure
         localSess.lastFailedStructureId = setup.structureId || null;
       }
       
@@ -640,7 +664,7 @@ export class StrategyEngine {
         const rewardRatio = roomPts / riskPts;
 
         if (rewardRatio >= 0.8 && sess.lastFailedSetupLevel !== lvl) {
-          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) continue;
+          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, c1, c2, wallAbove, 0, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) continue;
           sess.brokenLevelUnderWatch = lvl;
           passed.push(`Failed Retest Call setup confirmed at level ${lvl}`);
           return this.createSignal(
@@ -684,7 +708,7 @@ export class StrategyEngine {
         const rewardRatio = roomPts / riskPts;
 
         if (rewardRatio >= 0.8 && sess.lastFailedSetupLevel !== lvl) {
-          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) continue;
+          if (!this.validateSetup(valCtx, 'FAILED_RETEST', 'PUT', lvl, c0, c1, c2, wallBelow, 0, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) continue;
           sess.brokenLevelUnderWatch = lvl;
           passed.push(`Failed Retest Put setup confirmed at level ${lvl}`);
           return this.createSignal(
@@ -757,7 +781,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / riskPts;
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKDOWN', 'PUT', lvl, c0, c1, c2, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange, undefined, this.extractSeries(atmStrike))) continue;
+            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKDOWN', 'PUT', lvl, c0, c1, c2, wallBelow, 0, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange, undefined, this.extractSeries(atmStrike))) continue;
             sess.brokenLevelUnderWatch = lvl;
             passed.push(`Continuation Breakdown Put confirmed below level ${lvl}`);
             return this.createSignal(
@@ -832,7 +856,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / riskPts;
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKOUT', 'CALL', lvl, c0, c1, c2, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange, undefined, this.extractSeries(atmStrike))) continue;
+            if (!this.validateSetup(valCtx, 'CONTINUATION_BREAKOUT', 'CALL', lvl, c0, c1, c2, wallAbove, 0, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, impulseRange, undefined, this.extractSeries(atmStrike))) continue;
             sess.brokenLevelUnderWatch = lvl;
             passed.push(`Continuation Breakout Call confirmed above level ${lvl}`);
             return this.createSignal(
@@ -881,7 +905,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, spot - sess.openingRangeHigh);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'CALL', sess.openingRangeHigh, c0, c1, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
+            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'CALL', sess.openingRangeHigh, c0, c1, undefined, wallAbove, 0, c0.low, ceOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
             sess.brokenLevelUnderWatch = sess.openingRangeHigh;
             passed.push(`Opening Trap Call confirmed at ORH level ${sess.openingRangeHigh}`);
             return this.createSignal(
@@ -917,7 +941,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, sess.openingRangeLow - spot);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'PUT', sess.openingRangeLow, c0, c1, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
+            if (!this.validateSetup(valCtx, 'OPENING_TRAP', 'PUT', sess.openingRangeLow, c0, c1, undefined, wallBelow, 0, c0.high, peOpt, passed, failed, 0, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
             sess.brokenLevelUnderWatch = sess.openingRangeLow;
             passed.push(`Opening Trap Put confirmed at ORL level ${sess.openingRangeLow}`);
             return this.createSignal(
@@ -973,7 +997,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, wallAbove - spot);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'PUT', wallAbove, c0, c0, undefined, wallBelow, wallBelow - 50, c0.high, peOpt, passed, failed, ceWallTests, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
+            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'PUT', wallAbove, c0, c0, undefined, wallBelow, 0, c0.high, peOpt, passed, failed, ceWallTests, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
             sess.brokenLevelUnderWatch = wallAbove;
             passed.push(`CE Wall Rejection Put confirmed at ${wallAbove} (${ceWallTests} candle rejections)`);
             return this.createSignal(
@@ -1010,7 +1034,7 @@ export class StrategyEngine {
           const rewardRatio = roomPts / Math.max(10, spot - wallBelow);
 
           if (rewardRatio >= 0.8) {
-            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'CALL', wallBelow, c0, c0, undefined, wallAbove, wallAbove + 50, c0.low, ceOpt, passed, failed, peWallTests, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
+            if (!this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'CALL', wallBelow, c0, c0, undefined, wallAbove, 0, c0.low, ceOpt, passed, failed, peWallTests, structureId, undefined, undefined, undefined, undefined, this.extractSeries(atmStrike))) return null;
             sess.brokenLevelUnderWatch = wallBelow;
             passed.push(`PE Wall Rejection Call confirmed at ${wallBelow} (${peWallTests} candle rejections)`);
             return this.createSignal(
