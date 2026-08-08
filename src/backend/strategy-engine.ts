@@ -138,10 +138,8 @@ export class StrategyEngine {
       if (sig) {
         if (sig.signal !== 'NO_TRADE') {
           newSignals.push(sig);
-          decisions.push(this.mapToPublicDecision(sig));
-        } else {
-          decisions.push(this.mapToPublicDecision(sig));
         }
+        decisions.push(this.mapToPublicDecision(sig));
       }
     }
 
@@ -183,7 +181,7 @@ export class StrategyEngine {
     };
   }
 
-  private createNoTrade(index: string, spot: number, reason: string): any {
+  private createNoTrade(index: string, spot: number, reason: string): InternalSignal {
     return {
       timestamp: new Date().toISOString(),
       signal: 'NO_TRADE',
@@ -203,10 +201,10 @@ export class StrategyEngine {
       reason: [reason],
       fake_signal_filters_passed: [],
       fake_signal_filters_failed: []
-    } as any;
+    } as InternalSignal;
   }
 
-  private async evaluateIndex(index: string, spotPrice: number): Promise<InternalSignal | null> {
+  private async evaluateIndex(index: string, spotPrice: number): Promise<InternalSignal> {
     const timeObj = new Date();
     const timeStr = timeObj.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
     const timestampISO = timeObj.toISOString();
@@ -1080,22 +1078,15 @@ export class StrategyEngine {
     confirmCandleLow?: number,
     confirmCandleHigh?: number,
     structureId?: string
-  ): InternalSignal | null {
-    // Dual Synchronized Stop-Loss Calculation:
-    // 1. Primary Invalidation Trigger: Spot Price Level (Broken Level breach)
-    // 2. Secondary Invalidation Trigger: Option Premium (LTP) Delta-Linked SL (~0.50 ATM Delta)
+  ): InternalSignal {
     const spotSLDistance = Math.max(15, Math.abs(spot - brokenLevel));
-    const deltaLinkedOptPoints = Math.round(spotSLDistance * 0.50); // ATM Delta ~0.50
-    const slPts = Math.max(12, Math.min(25, deltaLinkedOptPoints)); // 35%-50% of initial risk
+    const deltaLinkedOptPoints = Math.round(spotSLDistance * 0.50);
+    const slPts = Math.max(12, Math.min(25, deltaLinkedOptPoints));
     const slPrice = Number(Math.max(1, premium - slPts).toFixed(2));
 
-    // Target 1: Nearby OI wall / swing level (~35% gain target / 0.8R to 1.0R)
     const target1Price = Number((premium + Math.max(15, Math.round(premium * 0.35))).toFixed(2));
-
-    // Target 2: Major OI wall / stronger swing level (~60% gain target / >= 1.5R)
     const target2Price = Number((premium + Math.max(30, Math.round(premium * 0.60))).toFixed(2));
 
-    // Reward-to-risk calculation
     const risk = premium - slPrice;
     const reward2 = target2Price - premium;
     const rrTarget2 = risk > 0 ? reward2 / risk : 0;
@@ -1111,7 +1102,6 @@ export class StrategyEngine {
     passedFilters.push(`Dual SL Active: Primary Spot Level (${brokenLevel}) + Secondary Option Premium SL (₹${slPrice})`);
     passedFilters.push(`Dynamic Stop & Emergency Exit Rules Enforced`);
 
-    // Format human-readable time
     const now = new Date();
     const timestampISO = now.toISOString();
 
@@ -1141,7 +1131,6 @@ export class StrategyEngine {
       direction: signalType === 'BUY_CALL' ? 'CALL' : 'PUT',
       fake_signal_filters_passed: passedFilters,
       fake_signal_filters_failed: failedFilters,
-      // EngineDecision required fields:
       signal: signalType,
       strategy_family: strategyFamily,
       spot: spot,
@@ -1161,7 +1150,7 @@ export class StrategyEngine {
 
     if (!chainRows || chainRows.length < 5) return { wallsAbove, wallsBelow };
 
-    const sortedRows = [...chainRows].sort((a, b) => a.strike_price - b.strike_price);
+const sortedRows = [...chainRows].sort((a, b) => a.strike_price - b.strike_price);
 
     for (let i = 2; i < sortedRows.length - 2; i++) {
       const row = sortedRows[i];

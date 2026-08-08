@@ -412,8 +412,7 @@ export function runGlobalPreChecks(ctx: ValidationContext): RuleResult {
     rule1CompletedCandles(ctx.candles1m, ctx.timeObj),
     rule2OpeningFilter(ctx.timeStr),
     rule3OneOpenTrade(ctx.activeSignals),
-    rule4Cooldown(ctx.sessState, ctx.timeObj.getTime()),
-    rule17ChopFilter(ctx)
+    rule4Cooldown(ctx.sessState, ctx.timeObj.getTime())
   ];
   for (const check of checks) {
     if (!check.passed) return check;
