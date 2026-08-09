@@ -55,6 +55,8 @@ export interface StrategySessionState {
   lastFailedStructureId: string | null;
   sessionDateIST: string;
 
+  candidateCEWalls: Record<number, boolean>;
+  candidatePEWalls: Record<number, boolean>;
   wallTestCounts: Record<number, number>;
   wallTestCandleKeys: Record<number, string[]>;
   wallReactionCandleKeys: Record<number, string[]>;

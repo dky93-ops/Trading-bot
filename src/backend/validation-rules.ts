@@ -152,8 +152,7 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
     if (surrCallOI === 0 || callOI < 1.5 * surrCallOI) return fail('FAILED_WALL_DOMINANCE: CE OI is not 1.5x dominant');
     
     // Check weakening using session state
-    if (ctx.sessState.wallOIWeakeningConfirmed[setup.level]) return fail('FAILED_WALL_DOMINANCE: CE OI is rapidly weakening (>= 5% drop)');
-    if (ctx.sessState.wallNegativeOICounts[setup.level] >= 2) return fail('FAILED_WALL_DOMINANCE: CE OI dropped for 2 consecutive ticks');
+    
   } else {
     // Rejected from PE Wall below, buying CALL
     const putOI = row.put_options?.market_data?.oi || 0;
@@ -161,8 +160,7 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
     
     if (surrPutOI === 0 || putOI < 1.5 * surrPutOI) return fail('FAILED_WALL_DOMINANCE: PE OI is not 1.5x dominant');
 
-    if (ctx.sessState.wallOIWeakeningConfirmed[setup.level]) return fail('FAILED_WALL_DOMINANCE: PE OI is rapidly weakening (>= 5% drop)');
-    if (ctx.sessState.wallNegativeOICounts[setup.level] >= 2) return fail('FAILED_WALL_DOMINANCE: PE OI dropped for 2 consecutive ticks');
+    
   }
   
   return pass();
