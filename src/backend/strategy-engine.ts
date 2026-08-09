@@ -12,6 +12,7 @@ interface OIWall {
   avgSurroundingOI: number;
   oiRatio: number;
   type: 'CE' | 'PE';
+  oiChange?: number;
 }
 
 type LocalSessionState = StrategySessionState & {
@@ -84,7 +85,7 @@ export class StrategyEngine {
       failedStructuresToday: [],
       activeStructureId: null,
       lastFailedStructureId: null,
-      sessionDateIST: new Date().toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' }),
+      sessionDateIST: new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }),
       wallTestCounts: {},
       prevWallTotalOI: {},
       wallNegativeOICounts: {},
@@ -93,6 +94,7 @@ export class StrategyEngine {
       wallTestCandleKeys: {},
       wallReactionCandleKeys: {},
       wallLastSeenOI: {},
+      wallLastProcessedSnapshotKey: {},
       wallOIWeakeningConfirmed: {},
       confirmedBreakoutTimestamp: null,
       confirmedBreakoutLevel: null,
@@ -221,7 +223,7 @@ export class StrategyEngine {
     const timeObj = new Date();
     const timeStr = timeObj.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
     const timestampISO = timeObj.toISOString();
-    const currentDateIST = timeObj.toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
+    const currentDateIST = this.getISTDateKey(timeObj);
 
     const sessState = this.sessionStates[index];
     
@@ -270,11 +272,19 @@ export class StrategyEngine {
 
     if (candles1m.length === 0) return this.createNoTrade(index, spotPrice, 'No candles available');
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    
+    const currentISTDate = this.getISTDateKey(timeObj);
+    
+    // Reset session state if it's a new day
+    if (sessState.sessionDateIST !== currentISTDate) {
+      this.sessionStates[index] = this.createInitialSessionState();
+      this.sessionStates[index].sessionDateIST = currentISTDate;
+      // Copy over prev day values logic below will populate them
+    }
 
-    const todayCandles = candles1m.filter(c => new Date(c.timestamp).getTime() >= today.getTime());
-    const prevCandles = candles1m.filter(c => new Date(c.timestamp).getTime() < today.getTime());
+    const todayCandles = candles1m.filter(c => this.getISTDateKey(c.timestamp) === currentISTDate);
+    const prevCandles = candles1m.filter(c => this.getISTDateKey(c.timestamp) < currentISTDate);
+
 
     // Rolling history buffers based on completed 1-minute updates
     const last3Updates = todayCandles.slice(-3);   // Breakout / Retest confirmation
@@ -325,7 +335,8 @@ export class StrategyEngine {
     }
 
     // Find valid OI Walls (1.5x rule & test count reaction)
-    const { wallsAbove, wallsBelow } = this.findValidOIWalls(chainRows, spotPrice, step, sessState);
+    const snapshotKey = candles1m.length > 0 ? new Date(candles1m[candles1m.length - 1].timestamp).toISOString() : '';
+    const { wallsAbove, wallsBelow, rawWallsAbove, rawWallsBelow } = this.findValidOIWalls(chainRows, spotPrice, step, sessState, snapshotKey);
     const nearestCeWallAbove = wallsAbove.length > 0 ? wallsAbove[0].strike : 0;
     const nearestPeWallBelow = wallsBelow.length > 0 ? wallsBelow[0].strike : 0;
 
@@ -333,7 +344,7 @@ export class StrategyEngine {
     sessState.nearestPeWallBelow = nearestPeWallBelow;
 
     // Track wall reaction counts
-    this.updateWallTestCounts(spotPrice, step, sessState, todayCandles, wallsAbove, wallsBelow);
+    this.updateWallTestCounts(spotPrice, step, sessState, todayCandles, rawWallsAbove || [], rawWallsBelow || []);
 
     // Apply strict Global 20-Rule Pipeline pre-checks (Rules 1-4, 17)
     const valCtx: ValidationContext = {
@@ -496,6 +507,13 @@ export class StrategyEngine {
     return undefined;
   }
 
+
+  private getISTDateKey(timestamp: any): string {
+    return new Date(timestamp).toLocaleDateString('en-CA', {
+      timeZone: 'Asia/Kolkata'
+    });
+  }
+
   private extractSeries(strike: number) {
     const empty = {
       spotSeriesLast3: [],
@@ -568,6 +586,7 @@ export class StrategyEngine {
     c0: Candle, c1: Candle, c2: Candle | undefined, target1: number, target2: number, stoploss: number,
     opt: any, passed: string[], failed: string[], testCount: number = 0, structureId?: string,
     barsSinceBreakout?: number, barsSinceRetest?: number, impulseRange?: number, spotMoveFromLevel?: number,
+    breakCandleIndex?: number, retestCandleIndex?: number, confirmationCandleIndex?: number,
     seriesData?: any
   ): boolean {
     const setup: ProposedSetup = {
@@ -580,6 +599,9 @@ export class StrategyEngine {
       impulseRange,
       spotMoveFromLevel,
       premiumAtConfirmation: opt?.price,
+      breakCandleIndex,
+      retestCandleIndex,
+      confirmationCandleIndex,
       spotSeriesLast3: seriesData?.spotSeriesLast3 || [],
       callPremiumSeriesLast3: seriesData?.callPremiumSeriesLast3 || [],
       putPremiumSeriesLast3: seriesData?.putPremiumSeriesLast3 || [],
@@ -691,7 +713,7 @@ export class StrategyEngine {
                  // We will skip the hard premium check in validateSetup by supplying same price if not available, OR we must use the series.
                  // We'll extract series.
                  const series = this.extractSeries(atmStrike);
-                 if (this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, candles[callRetestIdx], candles[callBreakIdx], wallAbove, 0, candles[callRetestIdx].low, ceOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - lvl, series)) {
+                 if (this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, candles[callRetestIdx], candles[callBreakIdx], wallAbove, 0, candles[callRetestIdx].low, ceOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - lvl, callBreakIdx, callRetestIdx, c0Index, series)) {
                     // Populate missing premium fields directly to pass rule13
                     // We must simulate them carefully, but prompt says "do not invent".
                     // Wait, validation-rules will fail if premiumAtConfirmation is not set correctly.
@@ -737,7 +759,7 @@ export class StrategyEngine {
                if (peOpt && peOpt.price > 0) {
                  const structureId = `FAILED_RETEST_${lvl}_PUT_${new Date(candles[putBreakIdx].timestamp).getTime()}`;
                  const series = this.extractSeries(atmStrike);
-                 if (this.validateSetup(valCtx, 'FAILED_RETEST', 'PUT', lvl, c0, candles[putRetestIdx], candles[putBreakIdx], wallBelow, 0, candles[putRetestIdx].high, peOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - lvl, series)) {
+                 if (this.validateSetup(valCtx, 'FAILED_RETEST', 'PUT', lvl, c0, candles[putRetestIdx], candles[putBreakIdx], wallBelow, 0, candles[putRetestIdx].high, peOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - lvl, putBreakIdx, putRetestIdx, c0Index, series)) {
                     return this.createSignal(index, 'FAILED_RETEST', 'BUY_PUT', 'PE', spot, lvl, wallAbove, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey || '', 75, ['Retest sequence validated'], passed, failed, undefined, candles[putRetestIdx].high, structureId);
                  }
                }
@@ -786,7 +808,7 @@ export class StrategyEngine {
                // First impulse range
                const impulseRange = candles[putBreakIdx].high - candles[putBreakIdx].low;
                
-               if (this.validateSetup(valCtx, 'CONTINUATION_BREAKDOWN', 'PUT', lvl, c0, candles[c0Index-1], candles[putBreakIdx], wallBelow, 0, candles[putBreakIdx].high, peOpt, passed, failed, 0, structureId, barsSinceBreak, undefined, impulseRange, spot - lvl, series)) {
+               if (this.validateSetup(valCtx, 'CONTINUATION_BREAKDOWN', 'PUT', lvl, c0, candles[c0Index-1], candles[putBreakIdx], wallBelow, 0, candles[putBreakIdx].high, peOpt, passed, failed, 0, structureId, barsSinceBreak, undefined, impulseRange, spot - lvl, putBreakIdx, undefined, c0Index, series)) {
                   return this.createSignal(index, 'CONTINUATION_BREAKDOWN', 'BUY_PUT', 'PE', spot, lvl, 0, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey || '', 75, ['Continuation Breakdown validated'], passed, failed, undefined, candles[putBreakIdx].high, structureId);
                }
              }
@@ -832,7 +854,7 @@ export class StrategyEngine {
                
                const impulseRange = candles[callBreakIdx].high - candles[callBreakIdx].low;
                
-               if (this.validateSetup(valCtx, 'CONTINUATION_BREAKOUT', 'CALL', lvl, c0, candles[c0Index-1], candles[callBreakIdx], wallAbove, 0, candles[callBreakIdx].low, ceOpt, passed, failed, 0, structureId, barsSinceBreak, undefined, impulseRange, spot - lvl, series)) {
+               if (this.validateSetup(valCtx, 'CONTINUATION_BREAKOUT', 'CALL', lvl, c0, candles[c0Index-1], candles[callBreakIdx], wallAbove, 0, candles[callBreakIdx].low, ceOpt, passed, failed, 0, structureId, barsSinceBreak, undefined, impulseRange, spot - lvl, callBreakIdx, undefined, c0Index, series)) {
                   return this.createSignal(index, 'CONTINUATION_BREAKOUT', 'BUY_CALL', 'CE', spot, lvl, wallAbove, 0, atmStrike, ceOpt.price, ceOpt.instrumentKey || '', 75, ['Continuation Breakout validated'], passed, failed, candles[callBreakIdx].low, undefined, structureId);
                }
              }
@@ -881,7 +903,7 @@ export class StrategyEngine {
                if (ceOpt && ceOpt.price > 0) {
                  const structureId = `OPENING_TRAP_${sess.openingRangeHigh}_CALL_${new Date(candles[callBreakIdx].timestamp).getTime()}`;
                  const series = this.extractSeries(atmStrike);
-                 if (this.validateSetup(valCtx, 'OPENING_TRAP', 'CALL', sess.openingRangeHigh, c0, candles[callRetestIdx], candles[callBreakIdx], wallAbove, 0, candles[callRetestIdx].low, ceOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - sess.openingRangeHigh, series)) {
+                 if (this.validateSetup(valCtx, 'OPENING_TRAP', 'CALL', sess.openingRangeHigh, c0, candles[callRetestIdx], candles[callBreakIdx], wallAbove, 0, candles[callRetestIdx].low, ceOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - sess.openingRangeHigh, callBreakIdx, callRetestIdx, c0Index, series)) {
                     return this.createSignal(index, 'OPENING_TRAP', 'BUY_CALL', 'CE', spot, sess.openingRangeHigh, wallAbove, wallBelow, atmStrike, ceOpt.price, ceOpt.instrumentKey || '', 80, ['Opening Trap CALL validated'], passed, failed, candles[callRetestIdx].low, undefined, structureId);
                  }
                }
@@ -922,7 +944,7 @@ export class StrategyEngine {
                if (peOpt && peOpt.price > 0) {
                  const structureId = `OPENING_TRAP_${sess.openingRangeLow}_PUT_${new Date(candles[putBreakIdx].timestamp).getTime()}`;
                  const series = this.extractSeries(atmStrike);
-                 if (this.validateSetup(valCtx, 'OPENING_TRAP', 'PUT', sess.openingRangeLow, c0, candles[putRetestIdx], candles[putBreakIdx], wallBelow, 0, candles[putRetestIdx].high, peOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - sess.openingRangeLow, series)) {
+                 if (this.validateSetup(valCtx, 'OPENING_TRAP', 'PUT', sess.openingRangeLow, c0, candles[putRetestIdx], candles[putBreakIdx], wallBelow, 0, candles[putRetestIdx].high, peOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - sess.openingRangeLow, putBreakIdx, putRetestIdx, c0Index, series)) {
                     return this.createSignal(index, 'OPENING_TRAP', 'BUY_PUT', 'PE', spot, sess.openingRangeLow, wallAbove, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey || '', 80, ['Opening Trap PUT validated'], passed, failed, undefined, candles[putRetestIdx].high, structureId);
                  }
                }
@@ -942,13 +964,14 @@ export class StrategyEngine {
     const atmStrike = Math.round(spot / (index === 'NIFTY' ? 50 : 100)) * (index === 'NIFTY' ? 50 : 100);
 
     if (wallAbove > 0 && c0.high >= wallAbove * 0.9995 && c0.close < wallAbove) {
-      const tests = sess.wallTestCounts[wallAbove] || 0;
+      const c0Index = candles.length - 1;
+          const tests = sess.wallTestCounts[wallAbove] || 0;
       if (tests >= 2 && !sess.wallOIWeakeningConfirmed[wallAbove] && (sess.wallNegativeOICounts[wallAbove] || 0) < 2) {
         const peOpt = await this.fetchOptionData(index, 'PE', spot, 0);
         if (peOpt && peOpt.price > 0) {
           const structureId = `OI_WALL_REJECTION_${wallAbove}_PUT_${new Date(c0.timestamp).getTime()}`;
           const series = this.extractSeries(atmStrike);
-          if (this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'PUT', wallAbove, c0, c0, undefined, wallBelow, 0, c0.high, peOpt, passed, failed, tests, structureId, undefined, undefined, undefined, spot - wallAbove, series)) {
+          if (this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'PUT', wallAbove, c0, c0, undefined, wallBelow, 0, c0.high, peOpt, passed, failed, tests, structureId, undefined, undefined, undefined, spot - wallAbove, undefined, undefined, c0Index, series)) {
             return this.createSignal(index, 'OI_WALL_REJECTION', 'BUY_PUT', 'PE', spot, wallAbove, wallAbove, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey || '', 85, ['OI Wall Rejection PUT validated'], passed, failed, undefined, c0.high, structureId);
           }
         }
@@ -956,13 +979,14 @@ export class StrategyEngine {
     }
 
     if (wallBelow > 0 && c0.low <= wallBelow * 1.0005 && c0.close > wallBelow) {
-      const tests = sess.wallTestCounts[wallBelow] || 0;
+      const c0Index = candles.length - 1;
+          const tests = sess.wallTestCounts[wallBelow] || 0;
       if (tests >= 2 && !sess.wallOIWeakeningConfirmed[wallBelow] && (sess.wallNegativeOICounts[wallBelow] || 0) < 2) {
         const ceOpt = await this.fetchOptionData(index, 'CE', spot, 0);
         if (ceOpt && ceOpt.price > 0) {
           const structureId = `OI_WALL_REJECTION_${wallBelow}_CALL_${new Date(c0.timestamp).getTime()}`;
           const series = this.extractSeries(atmStrike);
-          if (this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'CALL', wallBelow, c0, c0, undefined, wallAbove, 0, c0.low, ceOpt, passed, failed, tests, structureId, undefined, undefined, undefined, spot - wallBelow, series)) {
+          if (this.validateSetup(valCtx, 'OI_WALL_REJECTION', 'CALL', wallBelow, c0, c0, undefined, wallAbove, 0, c0.low, ceOpt, passed, failed, tests, structureId, undefined, undefined, undefined, spot - wallBelow, undefined, undefined, c0Index, series)) {
             return this.createSignal(index, 'OI_WALL_REJECTION', 'BUY_CALL', 'CE', spot, wallBelow, wallAbove, wallBelow, atmStrike, ceOpt.price, ceOpt.instrumentKey || '', 85, ['OI Wall Rejection CALL validated'], passed, failed, c0.low, undefined, structureId);
           }
         }
@@ -1055,109 +1079,131 @@ private createSignal(
   }
 
   // 1.5x Dominant OI Wall Detection Helper
-  private findValidOIWalls(chainRows: any[], spot: number, step: number, sess: LocalSessionState) {
-    const wallsAbove: OIWall[] = [];
-    const wallsBelow: OIWall[] = [];
+  private findValidOIWalls(chainRows: any[], spot: number, step: number, sess: LocalSessionState, snapshotKey: string) {
+    const rawWallsAbove: OIWall[] = [];
+    const rawWallsBelow: OIWall[] = [];
 
-    if (!chainRows || chainRows.length < 5) return { wallsAbove, wallsBelow };
+    if (!chainRows || chainRows.length < 5) return { wallsAbove: [], wallsBelow: [] };
 
-const sortedRows = [...chainRows].sort((a, b) => a.strike_price - b.strike_price);
+    const sortedRows = [...chainRows].sort((a, b) => a.strike_price - b.strike_price);
 
     for (let i = 2; i < sortedRows.length - 2; i++) {
       const row = sortedRows[i];
       const strike = row.strike_price;
+      const surr = [sortedRows[i - 2], sortedRows[i - 1], sortedRows[i + 1], sortedRows[i + 2]];
 
-      // Surrounding 2 strikes above and 2 strikes below
-      const surr = [
-        sortedRows[i - 2], sortedRows[i - 1], sortedRows[i + 1], sortedRows[i + 2]
-      ];
-
-      // Call side wall check: OI must be >= 1.5x surrounding strikes AND stable (not rapidly unwinding)
       const callOI = row.call_options?.market_data?.oi || 0;
       const callOIChange = row.call_options?.market_data?.oi_change || 0;
       const surrCallOI = surr.reduce((sum, r) => sum + (r.call_options?.market_data?.oi || 0), 0) / 4;
       if (surrCallOI > 0 && callOI >= 1.5 * surrCallOI && callOIChange >= -0.05 * callOI) {
         if (strike > spot) {
-          wallsAbove.push({ strike, totalOI: callOI, avgSurroundingOI: surrCallOI, oiRatio: callOI / surrCallOI, type: 'CE' });
+          rawWallsAbove.push({ strike, totalOI: callOI, avgSurroundingOI: surrCallOI, oiRatio: callOI / surrCallOI, type: 'CE', oiChange: callOIChange });
         }
       }
 
-      // Put side wall check: OI must be >= 1.5x surrounding strikes AND stable (not rapidly unwinding)
       const putOI = row.put_options?.market_data?.oi || 0;
       const putOIChange = row.put_options?.market_data?.oi_change || 0;
       const surrPutOI = surr.reduce((sum, r) => sum + (r.put_options?.market_data?.oi || 0), 0) / 4;
       if (surrPutOI > 0 && putOI >= 1.5 * surrPutOI && putOIChange >= -0.05 * putOI) {
         if (strike < spot) {
-          wallsBelow.push({ strike, totalOI: putOI, avgSurroundingOI: surrPutOI, oiRatio: putOI / surrPutOI, type: 'PE' });
+          rawWallsBelow.push({ strike, totalOI: putOI, avgSurroundingOI: surrPutOI, oiRatio: putOI / surrPutOI, type: 'PE', oiChange: putOIChange });
         }
       }
     }
+
+    if (!sess.wallLastSeenOI) sess.wallLastSeenOI = {};
+    if (!sess.wallLastProcessedSnapshotKey) sess.wallLastProcessedSnapshotKey = {};
+    if (!sess.wallOIWeakeningConfirmed) sess.wallOIWeakeningConfirmed = {};
+    if (!sess.wallNegativeOICounts) sess.wallNegativeOICounts = {};
+
+    const processWeakening = (strike: number, currentOI: number, oiChange: number) => {
+      if (sess.wallLastProcessedSnapshotKey[strike] === snapshotKey) return;
+      sess.wallLastProcessedSnapshotKey[strike] = snapshotKey;
+
+      if (!sess.wallLastSeenOI[strike]) {
+        sess.wallLastSeenOI[strike] = currentOI;
+      }
+
+      const refOI = sess.wallLastSeenOI[strike];
+      
+      if (currentOI <= refOI * 0.95) {
+        sess.wallOIWeakeningConfirmed[strike] = true;
+      }
+
+      if (oiChange < 0) {
+        sess.wallNegativeOICounts[strike] = (sess.wallNegativeOICounts[strike] || 0) + 1;
+        if (sess.wallNegativeOICounts[strike] >= 2) {
+          sess.wallOIWeakeningConfirmed[strike] = true;
+        }
+      } else {
+        sess.wallNegativeOICounts[strike] = 0;
+      }
+    };
+
+    const wallsAbove = rawWallsAbove.filter(w => {
+      processWeakening(w.strike, w.totalOI, w.oiChange || 0);
+      const reactionCount = sess.wallReactionCandleKeys?.[w.strike]?.length || 0;
+      return reactionCount >= 1;
+    });
+
+    const wallsBelow = rawWallsBelow.filter(w => {
+      processWeakening(w.strike, w.totalOI, w.oiChange || 0);
+      const reactionCount = sess.wallReactionCandleKeys?.[w.strike]?.length || 0;
+      return reactionCount >= 1;
+    });
 
     wallsAbove.sort((a, b) => a.strike - b.strike);
     wallsBelow.sort((a, b) => b.strike - a.strike);
 
-    return { wallsAbove, wallsBelow };
+    return { wallsAbove, wallsBelow, rawWallsAbove, rawWallsBelow };
   }
 
-  private updateWallTestCounts(spot: number, step: number, sess: LocalSessionState, candles: Candle[], wallsAbove: OIWall[], wallsBelow: OIWall[]) {
-    if (candles.length === 0) return;
-    const c0 = candles[candles.length - 1];
-    const c0Time = new Date(c0.timestamp).toISOString();
-    
-    // Only process a completed candle once for wall testing
-    if (sess.lastProcessedCandleTimestamp === c0Time) return;
-    sess.lastProcessedCandleTimestamp = c0Time;
+  private updateWallTestCounts(
+  spot: number,
+  step: number,
+  sess: LocalSessionState,
+  candles: Candle[],
+  wallsAbove: OIWall[],
+  wallsBelow: OIWall[]
+) {
+  if (!candles || candles.length === 0) return;
 
-    const tolerance = step * 0.25;
+  const c0 = candles[candles.length - 1];
+  const candleKey = new Date(c0.timestamp).toISOString();
+  const tolerance = step * 0.25;
 
-    for (const wall of wallsAbove) {
-      if (c0.high >= wall.strike - tolerance && c0.close < wall.strike) {
-        sess.wallTestCandleKeys[wall.strike] = sess.wallTestCandleKeys[wall.strike] || [];
-        if (!sess.wallTestCandleKeys[wall.strike].includes(c0Time)) {
-          sess.wallTestCandleKeys[wall.strike].push(c0Time);
-          sess.wallTestCounts[wall.strike] = sess.wallTestCandleKeys[wall.strike].length;
-        }
-      }
-      
-      const currentOI = wall.totalOI;
-      const prevOI = sess.prevWallTotalOI[wall.strike];
-      
-      if (prevOI !== undefined && currentOI < prevOI * 0.95) {
-        sess.wallOIWeakeningConfirmed[wall.strike] = true;
-      }
-      if (prevOI !== undefined && currentOI < prevOI) {
-        sess.wallNegativeOICounts[wall.strike] = (sess.wallNegativeOICounts[wall.strike] || 0) + 1;
-      } else {
-        sess.wallNegativeOICounts[wall.strike] = 0;
-      }
-      sess.prevWallTotalOI[wall.strike] = currentOI;
-      sess.wallLastSeenOI[wall.strike] = currentOI;
+  if (!sess.wallTestCandleKeys) sess.wallTestCandleKeys = {};
+  if (!sess.wallReactionCandleKeys) sess.wallReactionCandleKeys = {};
+
+  const recordWallEvent = (wall: OIWall, isAbove: boolean) => {
+    const strike = wall.strike;
+
+    if (!sess.wallTestCandleKeys[strike]) {
+      sess.wallTestCandleKeys[strike] = [];
     }
-    
-    for (const wall of wallsBelow) {
-      if (c0.low <= wall.strike + tolerance && c0.close > wall.strike) {
-        sess.wallTestCandleKeys[wall.strike] = sess.wallTestCandleKeys[wall.strike] || [];
-        if (!sess.wallTestCandleKeys[wall.strike].includes(c0Time)) {
-          sess.wallTestCandleKeys[wall.strike].push(c0Time);
-          sess.wallTestCounts[wall.strike] = sess.wallTestCandleKeys[wall.strike].length;
-        }
-      }
-      
-      const currentOI = wall.totalOI;
-      const prevOI = sess.prevWallTotalOI[wall.strike];
-      
-      if (prevOI !== undefined && currentOI < prevOI * 0.95) {
-        sess.wallOIWeakeningConfirmed[wall.strike] = true;
-      }
-      if (prevOI !== undefined && currentOI < prevOI) {
-        sess.wallNegativeOICounts[wall.strike] = (sess.wallNegativeOICounts[wall.strike] || 0) + 1;
-      } else {
-        sess.wallNegativeOICounts[wall.strike] = 0;
-      }
-      sess.prevWallTotalOI[wall.strike] = currentOI;
-      sess.wallLastSeenOI[wall.strike] = currentOI;
+    if (!sess.wallReactionCandleKeys[strike]) {
+      sess.wallReactionCandleKeys[strike] = [];
     }
-  }
+
+    const touchedAbove = isAbove
+      ? c0.high >= strike - tolerance && c0.close < strike
+      : c0.low <= strike + tolerance && c0.close > strike;
+
+    if (!touchedAbove) return;
+
+    if (!sess.wallTestCandleKeys[strike].includes(candleKey)) {
+      sess.wallTestCandleKeys[strike].push(candleKey);
+      sess.wallTestCounts[strike] = sess.wallTestCandleKeys[strike].length;
+    }
+
+    if (!sess.wallReactionCandleKeys[strike].includes(candleKey)) {
+      sess.wallReactionCandleKeys[strike].push(candleKey);
+    }
+  };
+
+  for (const wall of wallsAbove) recordWallEvent(wall, true);
+  for (const wall of wallsBelow) recordWallEvent(wall, false);
+}
 
   private manageActiveTrades(newSignals: InternalSignal[]) {
     for (const [id, signal] of this.activeSignals.entries()) {

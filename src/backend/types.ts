@@ -59,6 +59,7 @@ export interface StrategySessionState {
   wallTestCandleKeys: Record<number, string[]>;
   wallReactionCandleKeys: Record<number, string[]>;
   wallLastSeenOI: Record<number, number>;
+  wallLastProcessedSnapshotKey: Record<number, string>;
   wallOIWeakeningConfirmed: Record<number, boolean>;
   
   prevWallTotalOI: Record<number, number>;
