@@ -87,6 +87,7 @@ export function runGlobalPreChecks(ctx: ValidationContext): RuleResult {
     return fail('FAILED_COOLDOWN: Under 2-minute post-trade cooldown');
   }
   
+  
   return pass();
 }
 
@@ -101,6 +102,7 @@ export function rule2OpeningFilter(timeStr: string, setup: ProposedSetup): RuleR
   } else if (timeStr < '09:30') {
     if (!setup.c0 || !setup.c1) return fail('FAILED_OPENING_FILTER: 09:20-09:30 requires genuinely strong fully confirmed setup');
   }
+  
   return pass();
 }
 
@@ -108,6 +110,7 @@ export function rule5MarketStructure(sessState: StrategySessionState, setup: Pro
   if (setup.structureId && sessState.failedStructuresToday && sessState.failedStructuresToday.includes(setup.structureId)) {
     return fail('FAILED_MARKET_STRUCTURE: Structure already failed today');
   }
+  
   return pass();
 }
 
@@ -115,6 +118,7 @@ export function rule6FailedLevel(sessState: StrategySessionState, setup: Propose
   if (setup.level && sessState.failedLevelsToday && sessState.failedLevelsToday.includes(setup.level)) {
     return fail('FAILED_LEVEL: Level has already failed today');
   }
+  
   return pass();
 }
 
@@ -122,6 +126,7 @@ export function rule7ValidLevels(setup: ProposedSetup, validLevels: number[]): R
   if (setup.setupType !== 'OI_WALL_REJECTION' && setup.level && !validLevels.includes(setup.level)) {
     return fail('FAILED_VALID_LEVEL: Level is not a recognized ORH/ORL/PDH/PDL/Wall');
   }
+  
   return pass();
 }
 
@@ -163,6 +168,7 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
     
   }
   
+  
   return pass();
 }
 
@@ -172,6 +178,7 @@ export function rule9WallTestedTwice(setup: ProposedSetup): RuleResult {
       return fail('FAILED_WALL_TEST_COUNT: Wall was not tested at least 2 distinct times');
     }
   }
+  
   return pass();
 }
 
@@ -179,6 +186,7 @@ export function rule10BreakoutConfirmation(setup: ProposedSetup): RuleResult {
   if (setup.setupType === 'CONTINUATION_BREAKOUT' || setup.setupType === 'CONTINUATION_BREAKDOWN' || setup.setupType === 'FAILED_RETEST' || setup.setupType === 'OPENING_TRAP') {
     if (setup.breakCandleIndex === undefined) return fail('FAILED_BREAKOUT_CONF: Missing breakout history');
   }
+  
   return pass();
 }
 
@@ -208,6 +216,7 @@ export function rule11RetestQuality(setup: ProposedSetup): RuleResult {
        return fail('FAILED_RETEST_SEQUENCE: No valid 1-4 candle pause found');
      }
   }
+  
   return pass();
 }
 
@@ -221,6 +230,7 @@ export function rule12ConfirmationCandle(setup: ProposedSetup, index: string): R
   } else {
     if (c0.close >= c0.open - minBody) return fail('FAILED_CONFIRMATION_CANDLE: Confirmation candle must be bearish');
   }
+  
   return pass();
 }
 
@@ -262,6 +272,7 @@ export function rule13PremiumConfirmation(setup: ProposedSetup): RuleResult {
        return fail('FAILED_PREMIUM_CONFIRMATION: Premium did not expand after rejection');
      }
   }
+  
   return pass();
 }
 
@@ -275,6 +286,7 @@ export function rule14MixedDirection(setup: ProposedSetup): RuleResult {
   if (!isCall && c0.close >= c0.open) {
     return fail('FAILED_MIXED_DIRECTION: PUT requires bearish confirmation');
   }
+  
   return pass();
 }
 
@@ -284,6 +296,7 @@ export function rule15Overextension(setup: ProposedSetup): RuleResult {
       return fail('FAILED_OVEREXTENSION: Move from breakout level > 1.5x impulse candle range');
     }
   }
+  
   return pass();
 }
 
@@ -292,6 +305,7 @@ export function rule16RoomToTarget(setup: ProposedSetup): RuleResult {
   const risk = Math.abs(setup.level - setup.stopLoss);
   const reward1 = Math.abs(setup.target1 - setup.level);
   if (risk > 0 && (reward1 / risk) < 0.8) return fail('FAILED_ROOM_TO_TARGET: Target 1 is less than 0.8R');
+  
   return pass();
 }
 
@@ -337,6 +351,7 @@ export function rule18BrokenLevelReclaimedInvalidation(ctx: ValidationContext, s
   if (reclaimed) {
     return fail('FAILED_RECLAIM: Broken level was reclaimed by a closed candle');
   }
+  
   return pass();
 }
 
@@ -395,6 +410,7 @@ export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSe
     return fail('FAILED_OVERALL_AGREEMENT: Level was reclaimed');
   }
 
+  
   return pass();
 }
 
@@ -419,5 +435,6 @@ export function runSetupValidation(ctx: ValidationContext, setup: ProposedSetup,
   for (const check of checks) {
     if (!check.passed) return check;
   }
+  
   return pass();
 }

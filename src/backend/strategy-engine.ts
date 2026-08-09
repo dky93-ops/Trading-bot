@@ -28,6 +28,14 @@ type LocalSessionState = StrategySessionState & {
 };
 
 export class StrategyEngine {
+  private getCompletedCandleKey(candle: Candle): string {
+    return new Date(candle.timestamp).toISOString();
+  }
+
+  private getCompletedCandleIndexByTimestamp(candles: Candle[], timestamp: string): number {
+    return candles.findIndex(c => new Date(c.timestamp).toISOString() === timestamp);
+  }
+
   private settings: AppSettings;
   private state: AppState;
   public activeSignals: Map<string, InternalSignal> = new Map();
@@ -337,7 +345,11 @@ export class StrategyEngine {
     }
 
     // Find valid OI Walls (1.5x rule & test count reaction)
-    const snapshotKey = candles1m.length > 0 ? new Date(candles1m[candles1m.length - 1].timestamp).toISOString() : '';
+    
+    const history = this.getOptionChainHistory ? this.getOptionChainHistory() : [];
+    const latestSnapshot = history.length > 0 ? history[history.length - 1] : null;
+    const snapshotKey = latestSnapshot && latestSnapshot.timeISO ? latestSnapshot.timeISO : (candles1m.length > 0 ? new Date(candles1m[candles1m.length - 1].timestamp).toISOString() : '');
+
     const candidates = this.findCandidateOIWalls(chainRows, spotPrice, sessState, snapshotKey);
     this.recordWallReactions(candidates, todayCandles, step, sessState);
     const { wallsAbove, wallsBelow } = this.getValidatedOIWalls(candidates, sessState);
@@ -695,9 +707,12 @@ export class StrategyEngine {
           }
         }
         if (callRetestIdx !== -1) {
-          const barsSinceBreak = callRetestIdx - callBreakIdx;
-          const barsSinceRetest = c0Index - callRetestIdx;
-          if (barsSinceBreak >= 1 && barsSinceBreak <= 4 && barsSinceRetest >= 1 && barsSinceRetest <= 4) {
+          const confirmationCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(c0));
+          const breakCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(candles[callBreakIdx]));
+          const retestCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(candles[callRetestIdx]));
+          const barsSinceBreakout = retestCandleIndex - breakCandleIndex;
+          const barsSinceRetest = confirmationCandleIndex - retestCandleIndex;
+          if (barsSinceBreakout >= 1 && barsSinceBreakout <= 4 && barsSinceRetest >= 1 && barsSinceRetest <= 4) {
             // Check no reclaim
             let reclaimed = false;
             for (let k = callBreakIdx + 1; k < c0Index; k++) {
@@ -716,7 +731,7 @@ export class StrategyEngine {
                  // We will skip the hard premium check in validateSetup by supplying same price if not available, OR we must use the series.
                  // We'll extract series.
                  const series = this.extractSeries(atmStrike);
-                 if (this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, candles[callRetestIdx], candles[callBreakIdx], wallAbove, 0, candles[callRetestIdx].low, ceOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - lvl, callBreakIdx, callRetestIdx, c0Index, series)) {
+                 if (this.validateSetup(valCtx, 'FAILED_RETEST', 'CALL', lvl, c0, candles[callRetestIdx], candles[callBreakIdx], wallAbove, 0, candles[callRetestIdx].low, ceOpt, passed, failed, 0, structureId, barsSinceBreakout, barsSinceRetest, undefined, spot - lvl, breakCandleIndex, retestCandleIndex, confirmationCandleIndex, series)) {
                     // Populate missing premium fields directly to pass rule13
                     // We must simulate them carefully, but prompt says "do not invent".
                     // Wait, validation-rules will fail if premiumAtConfirmation is not set correctly.
@@ -749,9 +764,12 @@ export class StrategyEngine {
           }
         }
         if (putRetestIdx !== -1) {
-          const barsSinceBreak = putRetestIdx - putBreakIdx;
-          const barsSinceRetest = c0Index - putRetestIdx;
-          if (barsSinceBreak >= 1 && barsSinceBreak <= 4 && barsSinceRetest >= 1 && barsSinceRetest <= 4) {
+          const confirmationCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(c0));
+          const breakCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(candles[putBreakIdx]));
+          const retestCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(candles[putRetestIdx]));
+          const barsSinceBreakout = retestCandleIndex - breakCandleIndex;
+          const barsSinceRetest = confirmationCandleIndex - retestCandleIndex;
+          if (barsSinceBreakout >= 1 && barsSinceBreakout <= 4 && barsSinceRetest >= 1 && barsSinceRetest <= 4) {
             let reclaimed = false;
             for (let k = putBreakIdx + 1; k < c0Index; k++) {
               if (candles[k].close > lvl) reclaimed = true;
@@ -762,7 +780,7 @@ export class StrategyEngine {
                if (peOpt && peOpt.price > 0) {
                  const structureId = `FAILED_RETEST_${lvl}_PUT_${new Date(candles[putBreakIdx].timestamp).getTime()}`;
                  const series = this.extractSeries(atmStrike);
-                 if (this.validateSetup(valCtx, 'FAILED_RETEST', 'PUT', lvl, c0, candles[putRetestIdx], candles[putBreakIdx], wallBelow, 0, candles[putRetestIdx].high, peOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - lvl, putBreakIdx, putRetestIdx, c0Index, series)) {
+                 if (this.validateSetup(valCtx, 'FAILED_RETEST', 'PUT', lvl, c0, candles[putRetestIdx], candles[putBreakIdx], wallBelow, 0, candles[putRetestIdx].high, peOpt, passed, failed, 0, structureId, barsSinceBreakout, barsSinceRetest, undefined, spot - lvl, breakCandleIndex, retestCandleIndex, confirmationCandleIndex, series)) {
                     return this.createSignal(index, 'FAILED_RETEST', 'BUY_PUT', 'PE', spot, lvl, wallAbove, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey || '', 75, ['Retest sequence validated'], passed, failed, undefined, candles[putRetestIdx].high, structureId);
                  }
                }
@@ -893,9 +911,12 @@ export class StrategyEngine {
           }
         }
         if (callRetestIdx !== -1) {
-          const barsSinceBreak = callRetestIdx - callBreakIdx;
-          const barsSinceRetest = c0Index - callRetestIdx;
-          if (barsSinceBreak >= 1 && barsSinceBreak <= 3 && barsSinceRetest >= 1 && barsSinceRetest <= 3) {
+          const confirmationCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(c0));
+          const breakCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(candles[callBreakIdx]));
+          const retestCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(candles[callRetestIdx]));
+          const barsSinceBreakout = retestCandleIndex - breakCandleIndex;
+          const barsSinceRetest = confirmationCandleIndex - retestCandleIndex;
+          if (barsSinceBreakout >= 1 && barsSinceBreakout <= 3 && barsSinceRetest >= 1 && barsSinceRetest <= 3) {
             let reclaimed = false;
             for (let k = callBreakIdx + 1; k < c0Index; k++) {
               if (candles[k].close < sess.openingRangeHigh) reclaimed = true;
@@ -906,7 +927,7 @@ export class StrategyEngine {
                if (ceOpt && ceOpt.price > 0) {
                  const structureId = `OPENING_TRAP_${sess.openingRangeHigh}_CALL_${new Date(candles[callBreakIdx].timestamp).getTime()}`;
                  const series = this.extractSeries(atmStrike);
-                 if (this.validateSetup(valCtx, 'OPENING_TRAP', 'CALL', sess.openingRangeHigh, c0, candles[callRetestIdx], candles[callBreakIdx], wallAbove, 0, candles[callRetestIdx].low, ceOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - sess.openingRangeHigh, callBreakIdx, callRetestIdx, c0Index, series)) {
+                 if (this.validateSetup(valCtx, 'OPENING_TRAP', 'CALL', sess.openingRangeHigh, c0, candles[callRetestIdx], candles[callBreakIdx], wallAbove, 0, candles[callRetestIdx].low, ceOpt, passed, failed, 0, structureId, barsSinceBreakout, barsSinceRetest, undefined, spot - sess.openingRangeHigh, breakCandleIndex, retestCandleIndex, confirmationCandleIndex, series)) {
                     return this.createSignal(index, 'OPENING_TRAP', 'BUY_CALL', 'CE', spot, sess.openingRangeHigh, wallAbove, wallBelow, atmStrike, ceOpt.price, ceOpt.instrumentKey || '', 80, ['Opening Trap CALL validated'], passed, failed, candles[callRetestIdx].low, undefined, structureId);
                  }
                }
@@ -934,9 +955,12 @@ export class StrategyEngine {
           }
         }
         if (putRetestIdx !== -1) {
-          const barsSinceBreak = putRetestIdx - putBreakIdx;
-          const barsSinceRetest = c0Index - putRetestIdx;
-          if (barsSinceBreak >= 1 && barsSinceBreak <= 3 && barsSinceRetest >= 1 && barsSinceRetest <= 3) {
+          const confirmationCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(c0));
+          const breakCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(candles[putBreakIdx]));
+          const retestCandleIndex = this.getCompletedCandleIndexByTimestamp(candles, this.getCompletedCandleKey(candles[putRetestIdx]));
+          const barsSinceBreakout = retestCandleIndex - breakCandleIndex;
+          const barsSinceRetest = confirmationCandleIndex - retestCandleIndex;
+          if (barsSinceBreakout >= 1 && barsSinceBreakout <= 3 && barsSinceRetest >= 1 && barsSinceRetest <= 3) {
             let reclaimed = false;
             for (let k = putBreakIdx + 1; k < c0Index; k++) {
               if (candles[k].close > sess.openingRangeLow) reclaimed = true;
@@ -947,7 +971,7 @@ export class StrategyEngine {
                if (peOpt && peOpt.price > 0) {
                  const structureId = `OPENING_TRAP_${sess.openingRangeLow}_PUT_${new Date(candles[putBreakIdx].timestamp).getTime()}`;
                  const series = this.extractSeries(atmStrike);
-                 if (this.validateSetup(valCtx, 'OPENING_TRAP', 'PUT', sess.openingRangeLow, c0, candles[putRetestIdx], candles[putBreakIdx], wallBelow, 0, candles[putRetestIdx].high, peOpt, passed, failed, 0, structureId, barsSinceBreak, barsSinceRetest, undefined, spot - sess.openingRangeLow, putBreakIdx, putRetestIdx, c0Index, series)) {
+                 if (this.validateSetup(valCtx, 'OPENING_TRAP', 'PUT', sess.openingRangeLow, c0, candles[putRetestIdx], candles[putBreakIdx], wallBelow, 0, candles[putRetestIdx].high, peOpt, passed, failed, 0, structureId, barsSinceBreakout, barsSinceRetest, undefined, spot - sess.openingRangeLow, breakCandleIndex, retestCandleIndex, confirmationCandleIndex, series)) {
                     return this.createSignal(index, 'OPENING_TRAP', 'BUY_PUT', 'PE', spot, sess.openingRangeLow, wallAbove, wallBelow, atmStrike, peOpt.price, peOpt.instrumentKey || '', 80, ['Opening Trap PUT validated'], passed, failed, undefined, candles[putRetestIdx].high, structureId);
                  }
                }
@@ -1157,31 +1181,39 @@ private createSignal(
     step: number,
     sess: LocalSessionState
   ) {
-    if (!candles || candles.length === 0) return;
+    if (!candles || candles.length < 2) return;
 
-    const c0 = candles[candles.length - 1];
-    const candleKey = new Date(c0.timestamp).toISOString();
-    const tolerance = step * 0.25;
+    // Use completed candles only (all except the last one which is forming)
+    const completedCandles = candles.slice(0, candles.length - 1);
 
     const recordWallEvent = (wall: OIWall, isAbove: boolean) => {
       const strike = wall.strike;
 
-      if (!sess.wallTestCandleKeys[strike]) sess.wallTestCandleKeys[strike] = [];
       if (!sess.wallReactionCandleKeys[strike]) sess.wallReactionCandleKeys[strike] = [];
 
-      const touchedWall = isAbove
-        ? c0.high >= strike - tolerance && c0.close < strike
-        : c0.low <= strike + tolerance && c0.close > strike;
+      for (const candle of completedCandles) {
+        const candleKey = this.getCompletedCandleKey(candle);
 
-      if (!touchedWall) return;
+        // CE resistance reaction: candle high reaches/touches the wall, candle close remains below the wall
+        // PE support reaction: candle low reaches/touches the wall, candle close remains above the wall
+        const touchedWall = isAbove
+          ? candle.high >= strike && candle.close < strike
+          : candle.low <= strike && candle.close > strike;
 
-      if (!sess.wallTestCandleKeys[strike].includes(candleKey)) {
-        sess.wallTestCandleKeys[strike].push(candleKey);
-        sess.wallTestCounts[strike] = sess.wallTestCandleKeys[strike].length;
-      }
+        if (touchedWall) {
+          if (!sess.wallTestCandleKeys[strike]) {
+            sess.wallTestCandleKeys[strike] = [];
+          }
 
-      if (!sess.wallReactionCandleKeys[strike].includes(candleKey)) {
-        sess.wallReactionCandleKeys[strike].push(candleKey);
+          if (!sess.wallTestCandleKeys[strike].includes(candleKey)) {
+            sess.wallTestCandleKeys[strike].push(candleKey);
+            sess.wallTestCounts[strike] = sess.wallTestCandleKeys[strike].length;
+          }
+
+          if (!sess.wallReactionCandleKeys[strike].includes(candleKey)) {
+            sess.wallReactionCandleKeys[strike].push(candleKey);
+          }
+        }
       }
     };
 
