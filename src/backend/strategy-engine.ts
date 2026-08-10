@@ -1,12 +1,16 @@
-import { AppSettings, AppState, Candle, OptionChainSnapshot, StrategySessionState, EngineDecision, TradingSymbol, InternalSignal } from './types.js';
-import { getCandles } from '../db/market.js';
-import { runGlobalPreChecks, runSetupValidation, ValidationContext, ProposedSetup } from './validation-rules.js';
+import {
+  AppSettings,
+  AppState,
+  EngineDecision,
+  InternalSignal,
+  StrategySessionState,
+  Candle
+} from './types';
+import { runGlobalPreChecks, runSetupValidation, ValidationContext, ProposedSetup } from './validation-rules';
 
-export type FetchOptionDataFn = (index: string, type: 'CE' | 'PE', spotPrice: number, strikeOffset?: number) => Promise<{ price: number, instrumentKey: string, strike: number } | null>;
-export type GetOptionChainFn = (instrumentKey: string, expiryDate: string) => Promise<any>;
-export type GetNearestExpiryFn = (instrumentKey: string) => Promise<string>;
+export type LocalSessionState = StrategySessionState;
 
-interface OIWall {
+export interface OIWall {
   strike: number;
   totalOI: number;
   avgSurroundingOI: number;
@@ -15,17 +19,11 @@ interface OIWall {
   oiChange?: number;
 }
 
-type LocalSessionState = StrategySessionState & {
-  sessionHigh: number;
-  sessionLow: number;
-  previousDayHigh: number;
-  previousDayLow: number;
-  openingRangeHigh: number;
-  openingRangeLow: number;
-  nearestCeWallAbove: number;
-  nearestPeWallBelow: number;
-  lastTradeCandleTime: string | null;
-};
+export type FetchOptionDataFn = (index: string, type: 'CE'|'PE', spotPrice: number, strikeOffset?: number) => Promise<any>;
+export type GetOptionChainFn = (instrumentKey: string, expiry: string) => Promise<any>;
+export type GetNearestExpiryFn = (instrumentKey: string) => Promise<string>;
+
+import { getCandles } from '../db/market';
 
 export class StrategyEngine {
   private getCompletedCandleKey(candle: Candle): string {
@@ -366,7 +364,7 @@ export class StrategyEngine {
     const latestSnapshot = history.length > 0 ? history[history.length - 1] : null;
     const snapshotKey = latestSnapshot && latestSnapshot.timeISO ? latestSnapshot.timeISO : (candles1m.length > 0 ? new Date(candles1m[candles1m.length - 1].timestamp).toISOString() : '');
 
-    const candidates = this.findCandidateOIWalls(chainRows, spotPrice, sessState, snapshotKey);
+    const candidates = this.findCandidateOIWalls(chainRows, spotPrice, step, sessState);
       this.updateWallOIWeakening(candidates, snapshotKey, sessState);
       this.recordWallReactions(candidates, todayCandles, step, sessState);
     const { wallsAbove, wallsBelow } = this.getValidatedOIWalls(candidates, sessState);
@@ -682,7 +680,7 @@ export class StrategyEngine {
       }
       
       if (result.reason && result.reason.includes('FAILED_FINAL_SAFETY_CHECK')) {
-        throw new Error(`FINAL_SAFETY_FAILED: ${result.reason}`);
+        // Do not throw to prevent stopping later valid families
       }
       return false;
     }
@@ -1124,162 +1122,166 @@ private createSignal(
 
   // 1.5x Dominant OI Wall Detection Helper
 
-  private updateWallOIWeakening(
-    candidates: { candidateCEWallsList: OIWall[]; candidatePEWallsList: OIWall[] },
-    snapshotKey: string,
+  private findCandidateOIWalls(
+    chainRows: any[],
+    spot: number,
+    step: number,
     sess: LocalSessionState
-  ) {
-    if (!sess.wallLastSeenOI) sess.wallLastSeenOI = {};
-    if (!sess.wallLastProcessedSnapshotKey) sess.wallLastProcessedSnapshotKey = {};
-    if (!sess.wallOIWeakeningConfirmed) sess.wallOIWeakeningConfirmed = {};
-    if (!sess.wallNegativeOICounts) sess.wallNegativeOICounts = {};
-
-    const processWeakening = (strike: number, currentOI: number, oiChange: number) => {
-      if (sess.wallLastProcessedSnapshotKey[strike] === snapshotKey) return;
-      sess.wallLastProcessedSnapshotKey[strike] = snapshotKey;
-
-      if (sess.wallLastSeenOI[strike] === undefined) {
-        sess.wallLastSeenOI[strike] = currentOI;
-      }
-
-      const refOI = sess.wallLastSeenOI[strike];
-
-      if (currentOI <= refOI * 0.95) {
-        sess.wallOIWeakeningConfirmed[strike] = true;
-      }
-
-      if (oiChange < 0) {
-        sess.wallNegativeOICounts[strike] = (sess.wallNegativeOICounts[strike] || 0) + 1;
-        if (sess.wallNegativeOICounts[strike] >= 2) {
-          sess.wallOIWeakeningConfirmed[strike] = true;
-        }
-      } else {
-        sess.wallNegativeOICounts[strike] = 0;
-      }
-    };
-
-    candidates.candidateCEWallsList.forEach(w => processWeakening(w.strike, w.totalOI, w.oiChange || 0));
-    candidates.candidatePEWallsList.forEach(w => processWeakening(w.strike, w.totalOI, w.oiChange || 0));
-  }
-
-  private findCandidateOIWalls(chainRows: any[], spot: number, sess: LocalSessionState, snapshotKey: string) {
+  ): { candidateCEWallsList: OIWall[]; candidatePEWallsList: OIWall[] } {
     const candidateCEWallsList: OIWall[] = [];
     const candidatePEWallsList: OIWall[] = [];
-
-    if (!chainRows || chainRows.length < 5) return { candidateCEWallsList, candidatePEWallsList };
-
-    const sortedRows = [...chainRows].sort((a, b) => a.strike_price - b.strike_price);
-
-    for (let i = 2; i < sortedRows.length - 2; i++) {
-      const row = sortedRows[i];
-      const strike = row.strike_price;
-      const surr = [sortedRows[i - 2], sortedRows[i - 1], sortedRows[i + 1], sortedRows[i + 2]];
-
-      const callOI = row.call_options?.market_data?.oi || 0;
-      const callOIChange = row.call_options?.market_data?.oi_change || 0;
-      const surrCallOI = surr.reduce((sum, r) => sum + (r.call_options?.market_data?.oi || 0), 0) / 4;
-      if (surrCallOI > 0 && callOI >= 1.5 * surrCallOI && callOIChange >= -0.05 * callOI) {
-        if (strike > spot) {
-          candidateCEWallsList.push({ strike, totalOI: callOI, avgSurroundingOI: surrCallOI, oiRatio: callOI / surrCallOI, type: 'CE', oiChange: callOIChange });
+    if (!chainRows || chainRows.length < 5) {
+      return { candidateCEWallsList, candidatePEWallsList };
+    }
+    const rows = [...chainRows]
+      .filter(r => Number.isFinite(Number(r.strike_price)))
+      .sort((a, b) => Number(a.strike_price) - Number(b.strike_price));
+    const getOI = (row: any, side: 'CE' | 'PE'): number => {
+      const md = side === 'CE' ? row.call_options?.market_data : row.put_options?.market_data;
+      return Number(md?.oi ?? md?.total_oi ?? md?.totalOi ?? 0);
+    };
+    const getOIChange = (row: any, side: 'CE' | 'PE'): number => {
+      const md = side === 'CE' ? row.call_options?.market_data : row.put_options?.market_data;
+      return Number(md?.oi_change ?? md?.oiChange ?? 0);
+    };
+    for (let i = 2; i <= rows.length - 3; i++) {
+      const row = rows[i];
+      const strike = Number(row.strike_price);
+      const surrounding = [rows[i - 2], rows[i - 1], rows[i + 1], rows[i + 2]];
+      const checkSide = (side: 'CE' | 'PE') => {
+        const totalOI = getOI(row, side);
+        const oiChange = getOIChange(row, side);
+        const surroundingOI = surrounding.map(r => getOI(r, side));
+        if (surroundingOI.some(v => !Number.isFinite(v))) return;
+        const averageOI = surroundingOI.reduce((a, b) => a + b, 0) / surroundingOI.length;
+        if (averageOI <= 0 || totalOI <= 0) return;
+        const ratio = totalOI / averageOI;
+        if (ratio < 1.5) return;
+        const wall: OIWall = {
+          strike,
+          totalOI,
+          avgSurroundingOI: averageOI,
+          oiRatio: ratio,
+          type: side,
+          oiChange
+        };
+        if (side === 'CE' && strike > spot) {
+          candidateCEWallsList.push(wall);
           sess.candidateCEWalls[strike] = true;
         }
-      }
-
-      const putOI = row.put_options?.market_data?.oi || 0;
-      const putOIChange = row.put_options?.market_data?.oi_change || 0;
-      const surrPutOI = surr.reduce((sum, r) => sum + (r.put_options?.market_data?.oi || 0), 0) / 4;
-      if (surrPutOI > 0 && putOI >= 1.5 * surrPutOI && putOIChange >= -0.05 * putOI) {
-        if (strike < spot) {
-          candidatePEWallsList.push({ strike, totalOI: putOI, avgSurroundingOI: surrPutOI, oiRatio: putOI / surrPutOI, type: 'PE', oiChange: putOIChange });
+        if (side === 'PE' && strike < spot) {
+          candidatePEWallsList.push(wall);
           sess.candidatePEWalls[strike] = true;
         }
-      }
+      };
+      checkSide('CE');
+      checkSide('PE');
     }
-
-    if (!sess.wallLastSeenOI) sess.wallLastSeenOI = {};
-    if (!sess.wallLastProcessedSnapshotKey) sess.wallLastProcessedSnapshotKey = {};
-    if (!sess.wallOIWeakeningConfirmed) sess.wallOIWeakeningConfirmed = {};
-    if (!sess.wallNegativeOICounts) sess.wallNegativeOICounts = {};
-
     return { candidateCEWallsList, candidatePEWallsList };
   }
 
   private recordWallReactions(
-    candidates: { candidateCEWallsList: OIWall[], candidatePEWallsList: OIWall[] },
+    candidates: { candidateCEWallsList: OIWall[]; candidatePEWallsList: OIWall[] },
     candles: Candle[],
     step: number,
     sess: LocalSessionState
-  ) {
-    if (!candles || candles.length < 2) return;
+  ): void {
+    if (!candles || candles.length === 0) return;
+    const candle = candles[candles.length - 1];
+    const candleKey = new Date(candle.timestamp).toISOString();
+    const tolerance = step * 0.25;
 
-    // Use completed candles only (all except the last one which is forming)
-    const completedCandles = candles.slice(0, candles.length - 1);
+    if (!sess.wallReactionCandleKeys) sess.wallReactionCandleKeys = {};
+    if (!sess.wallTestCandleKeys) sess.wallTestCandleKeys = {};
+    if (!sess.wallTestCounts) sess.wallTestCounts = {};
 
-    const recordWallEvent = (wall: OIWall, isAbove: boolean) => {
-      const strike = wall.strike;
-
-      if (!sess.wallReactionCandleKeys[strike]) sess.wallReactionCandleKeys[strike] = [];
-
-      for (const candle of completedCandles) {
-        const candleKey = this.getCompletedCandleKey(candle);
-
-        // CE resistance reaction: candle high reaches/touches the wall, candle close remains below the wall
-        // PE support reaction: candle low reaches/touches the wall, candle close remains above the wall
-        const tol = this.settings.WALL_TOLERANCE_POINTS || 5;
-        let touchedWall = false;
-        
-        // A wall rejection requires: spot touches or enters the tolerance zone; spot moves away from the wall; the completed candle does not accept beyond the wall
-        if (isAbove) {
-          // CE wall above spot (resistance)
-          const reachedTolerance = candle.high >= (strike - tol);
-          const closedBelow = candle.close < strike;
-          touchedWall = reachedTolerance && closedBelow;
-        } else {
-          // PE wall below spot (support)
-          const reachedTolerance = candle.low <= (strike + tol);
-          const closedAbove = candle.close > strike;
-          touchedWall = reachedTolerance && closedAbove;
-        }
-
-        if (touchedWall) {
-          if (!sess.wallTestCandleKeys[strike]) {
-            sess.wallTestCandleKeys[strike] = [];
-          }
-
-          if (!sess.wallTestCandleKeys[strike].includes(candleKey)) {
-            sess.wallTestCandleKeys[strike].push(candleKey);
-            sess.wallTestCounts[strike] = sess.wallTestCandleKeys[strike].length;
-          }
-
-          if (!sess.wallReactionCandleKeys[strike].includes(candleKey)) {
-            sess.wallReactionCandleKeys[strike].push(candleKey);
-          }
-        }
+    const record = (strike: number, isReaction: boolean) => {
+      if (!isReaction) return;
+      if (!sess.wallReactionCandleKeys[strike]) {
+        sess.wallReactionCandleKeys[strike] = [];
+      }
+      if (!sess.wallReactionCandleKeys[strike].includes(candleKey)) {
+        sess.wallReactionCandleKeys[strike].push(candleKey);
+      }
+      if (!sess.wallTestCandleKeys[strike]) {
+        sess.wallTestCandleKeys[strike] = [];
+      }
+      if (!sess.wallTestCandleKeys[strike].includes(candleKey)) {
+        sess.wallTestCandleKeys[strike].push(candleKey);
+        sess.wallTestCounts[strike] = sess.wallTestCandleKeys[strike].length;
       }
     };
 
-    for (const wall of candidates.candidateCEWallsList) recordWallEvent(wall, true);
-    for (const wall of candidates.candidatePEWallsList) recordWallEvent(wall, false);
+    for (const wall of candidates.candidateCEWallsList) {
+      const isReaction =
+        candle.high >= wall.strike - tolerance &&
+        candle.close < wall.strike;
+      record(wall.strike, isReaction);
+    }
+
+    for (const wall of candidates.candidatePEWallsList) {
+      const isReaction =
+        candle.low <= wall.strike + tolerance &&
+        candle.close > wall.strike;
+      record(wall.strike, isReaction);
+    }
   }
 
   private getValidatedOIWalls(
-    candidates: { candidateCEWallsList: OIWall[], candidatePEWallsList: OIWall[] },
+    candidates: { candidateCEWallsList: OIWall[]; candidatePEWallsList: OIWall[] },
     sess: LocalSessionState
-  ) {
+  ): { wallsAbove: OIWall[]; wallsBelow: OIWall[] } {
     const wallsAbove = candidates.candidateCEWallsList.filter(w => {
-      const reactionCount = sess.wallReactionCandleKeys?.[w.strike]?.length || 0;
-      return reactionCount >= 1;
+      const reactions = sess.wallReactionCandleKeys?.[w.strike]?.length || 0;
+      return reactions >= 1;
     });
-
     const wallsBelow = candidates.candidatePEWallsList.filter(w => {
-      const reactionCount = sess.wallReactionCandleKeys?.[w.strike]?.length || 0;
-      return reactionCount >= 1;
+      const reactions = sess.wallReactionCandleKeys?.[w.strike]?.length || 0;
+      return reactions >= 1;
     });
-
+    
     wallsAbove.sort((a, b) => a.strike - b.strike);
     wallsBelow.sort((a, b) => b.strike - a.strike);
-
+    
     return { wallsAbove, wallsBelow };
+  }
+
+  private updateWallOIWeakening(
+    candidates: { candidateCEWallsList: OIWall[]; candidatePEWallsList: OIWall[] },
+    snapshotKey: string,
+    sess: LocalSessionState
+  ): void {
+    if (!sess.wallLastSeenOI) sess.wallLastSeenOI = {};
+    if (!sess.wallLastProcessedSnapshotKey) sess.wallLastProcessedSnapshotKey = {};
+    if (!sess.wallOIWeakeningConfirmed) sess.wallOIWeakeningConfirmed = {};
+    if (!sess.wallNegativeOICounts) sess.wallNegativeOICounts = {};
+
+    const process = (wall: OIWall) => {
+      if (sess.wallLastProcessedSnapshotKey[wall.strike] === snapshotKey) return;
+      sess.wallLastProcessedSnapshotKey[wall.strike] = snapshotKey;
+
+      if (sess.wallLastSeenOI[wall.strike] === undefined) {
+        sess.wallLastSeenOI[wall.strike] = wall.totalOI;
+      }
+
+      const refOI = sess.wallLastSeenOI[wall.strike];
+
+      if (wall.totalOI <= refOI * 0.95) {
+        sess.wallOIWeakeningConfirmed[wall.strike] = true;
+      }
+
+      if ((wall.oiChange || 0) < 0) {
+        sess.wallNegativeOICounts[wall.strike] = (sess.wallNegativeOICounts[wall.strike] || 0) + 1;
+        if (sess.wallNegativeOICounts[wall.strike] >= 2) {
+          sess.wallOIWeakeningConfirmed[wall.strike] = true;
+        }
+      } else {
+        sess.wallNegativeOICounts[wall.strike] = 0;
+      }
+    };
+
+    candidates.candidateCEWallsList.forEach(process);
+    candidates.candidatePEWallsList.forEach(process);
   }
 
   private manageActiveTrades(newSignals: InternalSignal[]) {

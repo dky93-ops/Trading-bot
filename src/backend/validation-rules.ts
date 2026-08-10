@@ -178,7 +178,6 @@ export function rule9WallTestedTwice(setup: ProposedSetup): RuleResult {
       return fail('FAILED_WALL_TEST_COUNT: Wall was not tested at least 2 distinct times');
     }
   }
-  
   return pass();
 }
 
@@ -186,7 +185,6 @@ export function rule10BreakoutConfirmation(setup: ProposedSetup): RuleResult {
   if (setup.setupType === 'CONTINUATION_BREAKOUT' || setup.setupType === 'CONTINUATION_BREAKDOWN' || setup.setupType === 'FAILED_RETEST' || setup.setupType === 'OPENING_TRAP') {
     if (setup.breakCandleIndex === undefined) return fail('FAILED_BREAKOUT_CONF: Missing breakout history');
   }
-  
   return pass();
 }
 
@@ -210,36 +208,26 @@ export function rule11RetestQuality(setup: ProposedSetup): RuleResult {
       }
     }
   }
-  
-  if (['CONTINUATION_BREAKOUT', 'CONTINUATION_BREAKDOWN'].includes(setup.setupType)) {
-     if (!setup.continuationPauseValid) {
-       return fail('FAILED_RETEST_SEQUENCE: No valid 1-4 candle pause found');
-     }
-  }
-  
   return pass();
 }
 
 export function rule12ConfirmationCandle(setup: ProposedSetup, index: string): RuleResult {
   const isCall = setup.direction === 'CALL';
   const c0 = setup.c0;
-  const minBody = index === 'NIFTY' ? 0.1 : 0.2;
-  
-  if (isCall) {
-    if (c0.close <= c0.open + minBody) return fail('FAILED_CONFIRMATION_CANDLE: Confirmation candle must be bullish');
-  } else {
-    if (c0.close >= c0.open - minBody) return fail('FAILED_CONFIRMATION_CANDLE: Confirmation candle must be bearish');
-  }
+  if (!c0) return fail('FAILED_CONF_CANDLE: Missing confirmation candle');
+
+  if (isCall && c0.close <= c0.open) return fail('FAILED_CONF_CANDLE: CALL setup requires green confirmation candle');
+  if (!isCall && c0.close >= c0.open) return fail('FAILED_CONF_CANDLE: PUT setup requires red confirmation candle');
   
   return pass();
 }
 
 export function rule13PremiumConfirmation(setup: ProposedSetup): RuleResult {
   if (setup.setupType === 'FAILED_RETEST') {
-     if (setup.premiumAtConfirmation === undefined || setup.premiumAtRetestLow === undefined) {
-       return fail('FAILED_PREMIUM_CONFIRMATION: Missing premium history');
-     }
-     if (setup.premiumAtConfirmation < setup.premiumAtRetestLow * 1.01) {
+    if (setup.premiumAtConfirmation === undefined || setup.premiumAtRetestLow === undefined || setup.premiumAtBreak === undefined) {
+      return fail('FAILED_PREMIUM_CONFIRMATION: Missing premium history');
+    }
+    if (setup.premiumAtConfirmation < setup.premiumAtRetestLow * 1.01) {
        return fail('FAILED_PREMIUM_CONFIRMATION: Premium did not expand 1% from retest low');
      }
   } else if (setup.setupType === 'OPENING_TRAP') {
