@@ -1,7 +1,12 @@
 const fs = require('fs');
-let types = fs.readFileSync('src/backend/types.ts', 'utf8');
+let code = fs.readFileSync('src/backend/types.ts', 'utf8');
 
-if (!types.includes('candidateCEWalls')) {
-  types = types.replace(/wallTestCounts: Record<number, number>;/, "candidateCEWalls: Record<number, boolean>;\n  candidatePEWalls: Record<number, boolean>;\n  wallTestCounts: Record<number, number>;");
+if (!code.includes('WALL_TOLERANCE_POINTS')) {
+  code = code.replace(/expiryDate: string;/, "expiryDate: string;\n  WALL_TOLERANCE_POINTS?: number;\n  OPENING_RANGE_MINUTES?: number;");
 }
-fs.writeFileSync('src/backend/types.ts', types);
+
+if (!code.includes('openingRangeComplete')) {
+  code = code.replace(/openingRangeLow: number;/, "openingRangeLow: number;\n  openingRangeComplete: boolean;");
+}
+
+fs.writeFileSync('src/backend/types.ts', code);

@@ -78,6 +78,7 @@ export class StrategyEngine {
       previousDayLow: 0,
       openingRangeHigh: 0,
       openingRangeLow: 0,
+      openingRangeComplete: false,
       nearestCeWallAbove: 0,
       nearestPeWallBelow: 0,
       brokenLevelUnderWatch: null,
@@ -87,7 +88,13 @@ export class StrategyEngine {
       firstTargetHitFlag: false,
       trailingStopActiveFlag: false,
       lastSignalDirection: 'NONE' as const,
-      lastFailedSetupLevel: null,
+      last_failed_setup_level: null,
+      last_failed_setup_direction: null,
+      last_failed_setup_timestamp: null,
+      completedTradesCount: 0,
+      realizedDailyPnL: 0,
+      consecutiveLosingTrades: 0,
+      noNewTradeFlag: false,
       failedLevelsToday: [],
       tradedStructures: [],
       failedStructuresToday: [],
@@ -237,6 +244,11 @@ export class StrategyEngine {
 
     const sessState = this.sessionStates[index];
     
+    // 0. Active trade gate (Rule 28)
+    if (sessState.tradeTakenFlag || sessState.noNewTradeFlag) {
+      return this.createNoTrade(index, spotPrice, 'Active trade gate: trade already taken');
+    }
+    
     if (sessState.sessionDateIST !== currentDateIST) {
       sessState.sessionDateIST = currentDateIST;
       sessState.failedLevelsToday = [];
@@ -252,7 +264,7 @@ export class StrategyEngine {
       sessState.firstTargetHitFlag = false;
       sessState.trailingStopActiveFlag = false;
       sessState.lastSignalDirection = 'NONE';
-      sessState.lastFailedSetupLevel = null;
+      sessState.last_failed_setup_level = null;
       sessState.lastTradeCandleTime = null;
       sessState.activeStructureId = null;
       sessState.lastFailedStructureId = null;
@@ -313,18 +325,22 @@ export class StrategyEngine {
       sessState.sessionHigh = Math.max(...todayCandles.map(c => c.high));
       sessState.sessionLow = Math.min(...todayCandles.map(c => c.low));
 
-      // Opening range = first 15 minutes (first 15 1-minute completed updates)
-      const orbCandles = todayCandles.slice(0, 15);
-      sessState.openingRangeHigh = Math.max(...orbCandles.map(c => c.high));
-      sessState.openingRangeLow = Math.min(...orbCandles.map(c => c.low));
-    } else if (todayCandles.length > 0) {
-      sessState.sessionHigh = Math.max(...todayCandles.map(c => c.high));
-      sessState.sessionLow = Math.min(...todayCandles.map(c => c.low));
-      sessState.openingRangeHigh = 0;
-      sessState.openingRangeLow = 0;
+      const openingRangeMinutes = this.settings.OPENING_RANGE_MINUTES || 15;
+      const openingRangeComplete = todayCandles.length >= openingRangeMinutes;
+      sessState.openingRangeComplete = openingRangeComplete;
+
+      if (openingRangeComplete) {
+        const orbCandles = todayCandles.slice(0, openingRangeMinutes);
+        sessState.openingRangeHigh = Math.max(...orbCandles.map(c => c.high));
+        sessState.openingRangeLow = Math.min(...orbCandles.map(c => c.low));
+      } else {
+        sessState.openingRangeHigh = 0;
+        sessState.openingRangeLow = 0;
+      }
     } else {
       sessState.sessionHigh = spotPrice;
       sessState.sessionLow = spotPrice;
+      sessState.openingRangeComplete = false;
       sessState.openingRangeHigh = 0;
       sessState.openingRangeLow = 0;
     }
@@ -351,7 +367,8 @@ export class StrategyEngine {
     const snapshotKey = latestSnapshot && latestSnapshot.timeISO ? latestSnapshot.timeISO : (candles1m.length > 0 ? new Date(candles1m[candles1m.length - 1].timestamp).toISOString() : '');
 
     const candidates = this.findCandidateOIWalls(chainRows, spotPrice, sessState, snapshotKey);
-    this.recordWallReactions(candidates, todayCandles, step, sessState);
+      this.updateWallOIWeakening(candidates, snapshotKey, sessState);
+      this.recordWallReactions(candidates, todayCandles, step, sessState);
     const { wallsAbove, wallsBelow } = this.getValidatedOIWalls(candidates, sessState);
     const nearestCeWallAbove = wallsAbove.length > 0 ? wallsAbove[0].strike : 0;
     const nearestPeWallBelow = wallsBelow.length > 0 ? wallsBelow[0].strike : 0;
@@ -894,7 +911,7 @@ export class StrategyEngine {
     const c0Index = candles.length - 1;
 
     // CALL
-    if (sess.openingRangeHigh > 0) {
+    if (sess.openingRangeComplete && sess.openingRangeHigh > 0) {
       let callBreakIdx = -1;
       let callRetestIdx = -1;
       for (let i = c0Index - 1; i >= Math.max(1, c0Index - 10); i--) {
@@ -938,7 +955,7 @@ export class StrategyEngine {
     }
 
     // PUT
-    if (sess.openingRangeLow > 0) {
+    if (sess.openingRangeComplete && sess.openingRangeLow > 0) {
       let putBreakIdx = -1;
       let putRetestIdx = -1;
       for (let i = c0Index - 1; i >= Math.max(1, c0Index - 10); i--) {
@@ -1106,6 +1123,45 @@ private createSignal(
   }
 
   // 1.5x Dominant OI Wall Detection Helper
+
+  private updateWallOIWeakening(
+    candidates: { candidateCEWallsList: OIWall[]; candidatePEWallsList: OIWall[] },
+    snapshotKey: string,
+    sess: LocalSessionState
+  ) {
+    if (!sess.wallLastSeenOI) sess.wallLastSeenOI = {};
+    if (!sess.wallLastProcessedSnapshotKey) sess.wallLastProcessedSnapshotKey = {};
+    if (!sess.wallOIWeakeningConfirmed) sess.wallOIWeakeningConfirmed = {};
+    if (!sess.wallNegativeOICounts) sess.wallNegativeOICounts = {};
+
+    const processWeakening = (strike: number, currentOI: number, oiChange: number) => {
+      if (sess.wallLastProcessedSnapshotKey[strike] === snapshotKey) return;
+      sess.wallLastProcessedSnapshotKey[strike] = snapshotKey;
+
+      if (sess.wallLastSeenOI[strike] === undefined) {
+        sess.wallLastSeenOI[strike] = currentOI;
+      }
+
+      const refOI = sess.wallLastSeenOI[strike];
+
+      if (currentOI <= refOI * 0.95) {
+        sess.wallOIWeakeningConfirmed[strike] = true;
+      }
+
+      if (oiChange < 0) {
+        sess.wallNegativeOICounts[strike] = (sess.wallNegativeOICounts[strike] || 0) + 1;
+        if (sess.wallNegativeOICounts[strike] >= 2) {
+          sess.wallOIWeakeningConfirmed[strike] = true;
+        }
+      } else {
+        sess.wallNegativeOICounts[strike] = 0;
+      }
+    };
+
+    candidates.candidateCEWallsList.forEach(w => processWeakening(w.strike, w.totalOI, w.oiChange || 0));
+    candidates.candidatePEWallsList.forEach(w => processWeakening(w.strike, w.totalOI, w.oiChange || 0));
+  }
+
   private findCandidateOIWalls(chainRows: any[], spot: number, sess: LocalSessionState, snapshotKey: string) {
     const candidateCEWallsList: OIWall[] = [];
     const candidatePEWallsList: OIWall[] = [];
@@ -1145,33 +1201,6 @@ private createSignal(
     if (!sess.wallOIWeakeningConfirmed) sess.wallOIWeakeningConfirmed = {};
     if (!sess.wallNegativeOICounts) sess.wallNegativeOICounts = {};
 
-    const processWeakening = (strike: number, currentOI: number, oiChange: number) => {
-      if (sess.wallLastProcessedSnapshotKey[strike] === snapshotKey) return;
-      sess.wallLastProcessedSnapshotKey[strike] = snapshotKey;
-
-      if (!sess.wallLastSeenOI[strike]) {
-        sess.wallLastSeenOI[strike] = currentOI;
-      }
-
-      const refOI = sess.wallLastSeenOI[strike];
-      
-      if (currentOI <= refOI * 0.95) {
-        sess.wallOIWeakeningConfirmed[strike] = true;
-      }
-
-      if (oiChange < 0) {
-        sess.wallNegativeOICounts[strike] = (sess.wallNegativeOICounts[strike] || 0) + 1;
-        if (sess.wallNegativeOICounts[strike] >= 2) {
-          sess.wallOIWeakeningConfirmed[strike] = true;
-        }
-      } else {
-        sess.wallNegativeOICounts[strike] = 0;
-      }
-    };
-
-    candidateCEWallsList.forEach(w => processWeakening(w.strike, w.totalOI, w.oiChange || 0));
-    candidatePEWallsList.forEach(w => processWeakening(w.strike, w.totalOI, w.oiChange || 0));
-
     return { candidateCEWallsList, candidatePEWallsList };
   }
 
@@ -1196,9 +1225,21 @@ private createSignal(
 
         // CE resistance reaction: candle high reaches/touches the wall, candle close remains below the wall
         // PE support reaction: candle low reaches/touches the wall, candle close remains above the wall
-        const touchedWall = isAbove
-          ? candle.high >= strike && candle.close < strike
-          : candle.low <= strike && candle.close > strike;
+        const tol = this.settings.WALL_TOLERANCE_POINTS || 5;
+        let touchedWall = false;
+        
+        // A wall rejection requires: spot touches or enters the tolerance zone; spot moves away from the wall; the completed candle does not accept beyond the wall
+        if (isAbove) {
+          // CE wall above spot (resistance)
+          const reachedTolerance = candle.high >= (strike - tol);
+          const closedBelow = candle.close < strike;
+          touchedWall = reachedTolerance && closedBelow;
+        } else {
+          // PE wall below spot (support)
+          const reachedTolerance = candle.low <= (strike + tol);
+          const closedAbove = candle.close > strike;
+          touchedWall = reachedTolerance && closedAbove;
+        }
 
         if (touchedWall) {
           if (!sess.wallTestCandleKeys[strike]) {
@@ -1348,6 +1389,24 @@ private createSignal(
   }
 
   private closeSignal(signal: InternalSignal, exitPrice: number, reason: string) {
+    const sess = this.sessionStates[signal.index || 'NIFTY'];
+    if (sess) {
+      sess.tradeTakenFlag = false;
+      if (reason.includes("SL TRIGGERED") || reason.includes("INVALIDATION") || reason.includes("EMERGENCY")) {
+        sess.last_failed_setup_level = signal.broken_level;
+        sess.last_failed_setup_direction = signal.direction;
+        sess.last_failed_setup_timestamp = new Date().toISOString();
+        sess.consecutiveLosingTrades = (sess.consecutiveLosingTrades || 0) + 1;
+        if (sess.consecutiveLosingTrades >= 2) sess.noNewTradeFlag = true;
+      } else {
+        sess.consecutiveLosingTrades = 0;
+      }
+      sess.completedTradesCount = (sess.completedTradesCount || 0) + 1;
+      if (sess.completedTradesCount >= 3) sess.noNewTradeFlag = true;
+      
+      const pnl = exitPrice - signal.entryPrice;
+      sess.realizedDailyPnL = (sess.realizedDailyPnL || 0) + pnl;
+    }
     signal.status = 'CLOSED';
     signal.exitPrice = exitPrice;
     signal.exitTime = Date.now();
@@ -1364,14 +1423,14 @@ private createSignal(
     if (signal.realizedPnL > 0) this.winningTrades += 1;
     this.winRate = this.totalTrades > 0 ? (this.winningTrades / this.totalTrades) * 100 : 0;
 
-    const sess = this.sessionStates[signal.index];
-    if (sess) {
-      sess.lastTradeExitTime = Date.now();
+    const sessState2 = this.sessionStates[signal.index];
+    if (sessState2) {
+      sessState2.lastTradeExitTime = Date.now();
       if (signal.realizedPnL < 0 || reason.includes('SL') || reason.includes('INVALIDATION')) {
         if (signal.broken_level > 0) {
-          sess.lastFailedSetupLevel = signal.broken_level;
-          if (!sess.failedLevelsToday.includes(signal.broken_level)) {
-            sess.failedLevelsToday.push(signal.broken_level);
+          sessState2.last_failed_setup_level = signal.broken_level;
+          if (!sessState2.failedLevelsToday.includes(signal.broken_level)) {
+            sessState2.failedLevelsToday.push(signal.broken_level);
           }
         }
         if (signal.structureId) {

@@ -7,6 +7,8 @@ export interface AppSettings {
   isTradingEnabled: boolean;
   nifty50Enabled: boolean;
   expiryDate: string;
+  WALL_TOLERANCE_POINTS?: number;
+  OPENING_RANGE_MINUTES?: number;
   defaultLotsPerTrade?: number;
   maxActiveTrades?: number;
   strategies: {
@@ -75,7 +77,18 @@ export interface StrategySessionState {
   firstTargetHitFlag: boolean;
   trailingStopActiveFlag: boolean;
   lastSignalDirection: 'CALL' | 'PUT' | 'NONE';
-  lastFailedSetupLevel: number | null;
+  
+  // Failed setup tracking
+  last_failed_setup_level: number | null;
+  last_failed_setup_direction: 'CALL' | 'PUT' | 'NONE' | null;
+  last_failed_setup_timestamp: string | null;
+  
+  // Trades tracking
+  completedTradesCount: number;
+  realizedDailyPnL: number;
+  consecutiveLosingTrades: number;
+  noNewTradeFlag: boolean;
+
   lastTradeCandleTime: string | null;
   
   sessionHigh: number;
@@ -84,6 +97,7 @@ export interface StrategySessionState {
   previousDayLow: number;
   openingRangeHigh: number;
   openingRangeLow: number;
+  openingRangeComplete: boolean;
   nearestCeWallAbove: number;
   nearestPeWallBelow: number;
 
