@@ -348,11 +348,16 @@ export class UpstoxService {
 
       const m = optObj.market_data || {};
       const price = Number(m.ltp ?? m.last_price ?? 0);
-
       return {
         price,
         instrumentKey: optObj.instrument_key,
-        strike: targetStrike
+        strike: targetStrike,
+        bidPrice: Number(m.bid_price ?? 0),
+        askPrice: Number(m.ask_price ?? 0),
+        bidQty: Number(m.bid_qty ?? 0),
+        askQty: Number(m.ask_qty ?? 0),
+        volume: Number(m.volume ?? 0),
+        iv: Number(optObj.option_greeks?.iv ?? 0)
       };
     } catch (error) {
       console.error("Error fetching option data for signal", error);

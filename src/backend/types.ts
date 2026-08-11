@@ -49,6 +49,9 @@ export interface AppState {
 }
 
 export interface StrategySessionState {
+  wallPeakOI?: Record<number, number>;
+  wallNegativeOIAlignedKeys?: Record<number, string[]>;
+  wallInvalidForRejection?: Record<number, boolean>;
   lastTradeExitTime: number;
   failedLevelsToday: number[];
   tradedStructures: string[];
@@ -136,6 +139,11 @@ export interface EngineDecision {
 }
 
 export interface InternalSignal extends EngineDecision {
+  structuralStopSpot?: number;
+  target1Spot?: number;
+  target2Spot?: number;
+  entrySpot?: number;
+  initialRiskSpot?: number;
   id: string;
   index: string;
   contract: string;
@@ -180,6 +188,10 @@ export interface Candle {
 }
 
 export interface OptionData {
+  bidPrice?: number;
+  askPrice?: number;
+  bidQty?: number;
+  askQty?: number;
   ltp: number;
   totalOi: number;
   oiChange: number;
