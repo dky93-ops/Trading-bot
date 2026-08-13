@@ -1,23 +1,14 @@
 const fs = require('fs');
 let code = fs.readFileSync('src/backend/types.ts', 'utf8');
 
-// Add config fields to AppSettings
-code = code.replace(/expiryDate: string;/, "expiryDate: string;\n  WALL_TOLERANCE_POINTS?: number;\n  OPENING_RANGE_MINUTES?: number;");
+// Add MAX_OPTION_LOSS_PERCENT
+if (!code.includes('MAX_OPTION_LOSS_PERCENT?: number;')) {
+    code = code.replace(/MAX_OPTION_SPREAD_PERCENT\?: number;/, 'MAX_OPTION_SPREAD_PERCENT?: number;\n  MAX_OPTION_LOSS_PERCENT?: number;');
+}
 
-// Update StrategySessionState with tracking variables
-const stateAdditions = `
-  // Failed setup tracking
-  last_failed_setup_level: number | null;
-  last_failed_setup_direction: 'CALL' | 'PUT' | null;
-  last_failed_setup_timestamp: string | null;
-  
-  // Trades tracking
-  completedTradesCount: number;
-  realizedDailyPnL: number;
-  consecutiveLosingTrades: number;
-  noNewTradeFlag: boolean;
-`;
-
-code = code.replace(/lastFailedSetupLevel: number \| null;/, stateAdditions);
+// Add wallOiHistory and wallStableByKey to StrategySessionState
+if (!code.includes('wallOiHistory?: Record<string, number[]>;')) {
+    code = code.replace(/export interface StrategySessionState \{/, 'export interface StrategySessionState {\n  wallOiHistory?: Record<string, number[]>;\n  wallStableByKey?: Record<string, boolean>;');
+}
 
 fs.writeFileSync('src/backend/types.ts', code);

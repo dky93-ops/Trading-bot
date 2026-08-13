@@ -13,6 +13,7 @@ export interface AppSettings {
   maxActiveTrades?: number;
   DECISION_TIMEFRAME_MINUTES?: number;
   MAX_OPTION_SPREAD_PERCENT?: number;
+  MAX_OPTION_LOSS_PERCENT?: number;
   PREMIUM_CONFIRMATION_PERCENT?: number;
   OPENING_PREMIUM_CONFIRMATION_PERCENT?: number;
   WALL_OI_RATIO?: number;
@@ -59,6 +60,8 @@ export interface AppState {
 }
 
 export interface StrategySessionState {
+  wallOiHistory?: Record<string, number[]>;
+  wallStableByKey?: Record<string, boolean>;
   totalTradesToday: number;
   consecutiveLosses: number;
   feedSyncPenalty?: number;
@@ -146,20 +149,20 @@ export interface EngineDecision {
   signal: 'BUY_CALL' | 'BUY_PUT' | 'NO_TRADE';
   strategy_family: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION' | 'NONE';
   direction: 'CALL' | 'PUT' | 'NONE';
-  spot: number;
-  broken_level: number;
-  wall_above: number;
-  wall_below: number;
-  option_type: 'CE' | 'PE' | 'NONE';
-  strike: number;
+  spot?: number;
+  broken_level?: number;
+  wall_above?: number;
+  wall_below?: number;
+  option_type?: 'CE' | 'PE' | 'NONE';
+  strike?: number;
   entry: number;
   stoploss: number;
   target1: number;
   target2: number;
   confidence: number;
   reason: string[];
-  fake_signal_filters_passed: string[];
-  fake_signal_filters_failed: string[];
+  fake_signal_filters_passed?: string[];
+  fake_signal_filters_failed?: string[];
   spot_entry?: number;
   spot_invalidation?: number;
   spot_target1?: number;
@@ -168,6 +171,7 @@ export interface EngineDecision {
   option_stoploss?: number;
   option_target1?: number;
   option_target2?: number;
+  instrumentKey?: string;
 }
 
 export interface InternalSignal extends EngineDecision {
@@ -200,6 +204,7 @@ export interface InternalSignal extends EngineDecision {
   exitTime?: number;
   realizedPnL?: number;
   status: 'ACTIVE' | 'CLOSED';
+  exitReason?: string;
   highestPrice?: number;
   partialExit?: boolean;
   leg?: 'MAIN' | 'HEDGE';
@@ -261,8 +266,8 @@ export interface OptionChainSnapshot {
   maxPutOIStrike: number;
   strikeCount: number;
   rows: Array<{
-    strike: number;
-    spot: number;
+    strike?: number;
+    spot?: number;
     ce: OptionData;
     pe: OptionData;
   }>;

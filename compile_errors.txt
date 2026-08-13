@@ -1,0 +1,186 @@
+src/backend/strategy-engine.ts(387,4): error TS1068: Unexpected token. A constructor, method, accessor, or property was expected.
+src/backend/strategy-engine.ts(388,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(498,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(500,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(500,41): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(500,47): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(500,54): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(500,68): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(500,89): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(558,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(558,11): error TS1434: Unexpected keyword or identifier.
+src/backend/strategy-engine.ts(559,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(560,10): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(561,9): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(562,12): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(562,21): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(563,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(563,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(564,9): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(565,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(566,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(567,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(567,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(568,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(568,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(569,4): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(570,11): error TS1005: ':' expected.
+src/backend/strategy-engine.ts(573,6): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(574,16): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(574,47): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(574,56): error TS1005: ':' expected.
+src/backend/strategy-engine.ts(574,60): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(575,11): error TS1005: ':' expected.
+src/backend/strategy-engine.ts(575,55): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(576,11): error TS1005: ':' expected.
+src/backend/strategy-engine.ts(576,59): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(577,11): error TS1005: ':' expected.
+src/backend/strategy-engine.ts(577,57): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(578,9): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(578,35): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(579,9): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(579,33): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(580,9): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(580,37): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(582,11): error TS1005: ':' expected.
+src/backend/strategy-engine.ts(582,81): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(584,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(584,43): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(584,56): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(584,65): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(584,76): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(584,88): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(584,90): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(665,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(667,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(667,11): error TS1434: Unexpected keyword or identifier.
+src/backend/strategy-engine.ts(668,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(669,10): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(670,9): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(671,12): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(671,21): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(672,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(672,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(673,9): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(674,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(675,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(676,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(676,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(677,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(677,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(678,4): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(679,16): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(679,27): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(679,36): error TS1005: ':' expected.
+src/backend/strategy-engine.ts(679,40): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(680,11): error TS1005: ':' expected.
+src/backend/strategy-engine.ts(680,53): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(682,10): error TS1359: Identifier expected. 'const' is a reserved word that cannot be used here.
+src/backend/strategy-engine.ts(682,16): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(682,21): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(682,24): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(756,5): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(756,12): error TS1005: ':' expected.
+src/backend/strategy-engine.ts(756,16): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(759,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(759,11): error TS1434: Unexpected keyword or identifier.
+src/backend/strategy-engine.ts(760,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(761,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(762,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(763,10): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(764,9): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(765,12): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(765,21): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(766,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(766,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(767,9): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(768,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(769,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(770,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(770,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(771,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(771,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(772,4): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(773,16): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(773,27): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(773,36): error TS1005: ':' expected.
+src/backend/strategy-engine.ts(773,40): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(774,11): error TS1005: ':' expected.
+src/backend/strategy-engine.ts(774,51): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(776,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(776,58): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(776,71): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(776,80): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(776,91): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(776,103): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(776,105): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(855,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(857,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(858,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(859,10): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(860,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(860,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(861,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(861,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(862,4): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(862,6): error TS1434: Unexpected keyword or identifier.
+src/backend/strategy-engine.ts(898,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(898,33): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(898,55): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(898,74): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(898,80): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(898,83): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(921,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(921,38): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(921,52): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(921,76): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(921,85): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(921,106): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(943,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(943,39): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(943,61): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(943,76): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(943,95): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(943,101): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(943,108): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(943,129): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(954,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(955,10): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(956,9): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(957,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(958,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(959,16): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(960,14): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(960,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(961,9): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(962,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(962,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(963,11): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(963,20): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(964,4): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(964,28): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(1036,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(1036,40): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(1036,57): error TS1011: An element access expression should take an argument.
+src/backend/strategy-engine.ts(1036,60): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(1096,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(1096,29): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(1096,56): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(1096,72): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(1096,82): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(1116,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(1116,34): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(1116,57): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(1116,59): error TS1434: Unexpected keyword or identifier.
+src/backend/strategy-engine.ts(1140,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(1140,30): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(1140,44): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(1140,64): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(1140,73): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(1140,75): error TS1434: Unexpected keyword or identifier.
+src/backend/strategy-engine.ts(1174,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(1174,36): error TS1005: ',' expected.
+src/backend/strategy-engine.ts(1174,46): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(1183,3): error TS1128: Declaration or statement expected.
+src/backend/strategy-engine.ts(1183,18): error TS1005: ';' expected.
+src/backend/strategy-engine.ts(1188,1): error TS1128: Declaration or statement expected.

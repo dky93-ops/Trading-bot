@@ -27,6 +27,7 @@ export class UpstoxService {
     DECISION_TIMEFRAME_MINUTES: 5,
     OPENING_RANGE_MINUTES: 15,
     MAX_OPTION_SPREAD_PERCENT: 1.5,
+    MAX_OPTION_LOSS_PERCENT: 35,
     PREMIUM_CONFIRMATION_PERCENT: 1,
     OPENING_PREMIUM_CONFIRMATION_PERCENT: 1.5,
     WALL_OI_RATIO: 1.5,
@@ -177,6 +178,7 @@ export class UpstoxService {
   }
 
   private async recordOneMinOptionChain() {
+    if (!this.isPaperTradingOnly() || !this.hasBrokerCredentials()) return;
     if (!this.settings.accessToken) return;
 
     // Only record during market hours
@@ -219,7 +221,9 @@ export class UpstoxService {
     }
 
     // Always run the 1-minute Option Chain recording loop during server runtime
-    this.startOneMinOptionChainRecorder();
+    if (this.isPaperTradingOnly() && this.hasBrokerCredentials()) {
+      this.startOneMinOptionChainRecorder();
+    }
 
     this.wss.on('connection', (ws) => {
       this.clients.add(ws);

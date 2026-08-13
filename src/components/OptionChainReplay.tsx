@@ -255,9 +255,9 @@ export const OptionChainReplay: React.FC = () => {
                         return (
                           <tr key={idx} className={isAtm ? 'bg-yellow-400/10 font-bold' : 'hover:bg-[#1F2937]/30'}>
                             <td className="py-1.5 text-red-400">₹{r.ce.price}</td>
-                            <td className="py-1.5 text-gray-300">{formatUnits(r.ce.oi)}</td>
+                            <td className="py-1.5 text-gray-300">{formatUnits(r.ce.totalOi)}</td>
                             <td className={`py-1.5 font-bold ${isAtm ? 'text-yellow-400 underline' : 'text-white'}`}>{r.strike}</td>
-                            <td className="py-1.5 text-gray-300">{formatUnits(r.pe.oi)}</td>
+                            <td className="py-1.5 text-gray-300">{formatUnits(r.pe.totalOi)}</td>
                             <td className="py-1.5 text-brand-green">₹{r.pe.price}</td>
                           </tr>
                         );

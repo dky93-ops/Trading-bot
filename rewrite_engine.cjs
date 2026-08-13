@@ -1,462 +1,16 @@
-import {
-  AppSettings,
-  AppState,
-  EngineDecision,
-  InternalSignal,
-  StrategySessionState,
-  Candle,
-  OptionChainSnapshot
-} from './types';
-import { runGlobalPreChecks, runSetupValidation, ValidationContext, ProposedSetup } from './validation-rules';
+const fs = require('fs');
 
-export type LocalSessionState = StrategySessionState;
+const original = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
 
-export interface OIWall {
-  strike: number;
-  totalOI: number;
-  avgSurroundingOI: number;
-  oiRatio: number;
-  type: 'CE' | 'PE';
-  oiChange?: number;
+const splitIndex = original.indexOf('private async checkOpeningTrap(');
+if (splitIndex === -1) {
+    console.error("Could not find checkOpeningTrap");
+    process.exit(1);
 }
 
-export type FetchOptionDataFn = (index: string, type: 'CE'|'PE', spotPrice: number, strikeOffset?: number) => Promise<any>;
-export type GetOptionChainFn = (instrumentKey: string, expiry: string) => Promise<any>;
-export type GetNearestExpiryFn = (instrumentKey: string) => Promise<string>;
+const header = original.substring(0, splitIndex);
 
-import { getCandles } from '../db/market';
-
-export class StrategyEngine {
-  private recordWallTests(
-    walls: { candidateCEWallsList: any[]; candidatePEWallsList: any[] },
-    candles: Candle[],
-    sess: LocalSessionState,
-    tolerance: number,
-  ): void {
-    const candle = candles[candles.length - 1];
-    if (!candle) return;
-    const candleKey = new Date(candle.timestamp).toISOString();
-
-    const record = (wall: any, rejected: boolean) => {
-      if (!rejected) return;
-      const strike = Number(wall.strike);
-      const keys = sess.wallTestCandleKeys[strike] || [];
-      if (!keys.includes(candleKey)) {
-        keys.push(candleKey);
-        sess.wallTestCandleKeys[strike] = keys;
-        sess.wallTestCounts[strike] = keys.length;
-      }
-      const reactions = sess.wallReactionCandleKeys[strike] || [];
-      if (!reactions.includes(candleKey)) {
-        reactions.push(candleKey);
-        sess.wallReactionCandleKeys[strike] = reactions;
-      }
-    };
-
-    for (const wall of walls.candidateCEWallsList) {
-      record(
-        wall,
-        candle.high >= wall.strike - tolerance && candle.close < wall.strike,
-      );
-    }
-    for (const wall of walls.candidatePEWallsList) {
-      record(
-        wall,
-        candle.low <= wall.strike + tolerance && candle.close > wall.strike,
-      );
-    }
-  }
-
-  private validStructureLevels(sess: LocalSessionState): number[] {
-    return [
-      sess.previousDayHigh,
-      sess.previousDayLow,
-      sess.openingRangeHigh,
-      sess.openingRangeLow,
-      sess.nearestCeWallAbove,
-      sess.nearestPeWallBelow,
-    ].filter((value) => Number.isFinite(value) && value > 0);
-  }
-
-  private wallHistoryKey(side: 'CE' | 'PE', strike: number): string {
-    const expiry = this.settings.expiryDate || 'CURRENT';
-    return `${expiry}|${side}|${strike}`;
-  }
-
-  private readRequiredOi(row: any, side: 'CE' | 'PE'): number | undefined {
-    const md = side === 'CE'
-      ? row?.call_options?.market_data
-      : row?.put_options?.market_data;
-    const value = Number(md?.oi ?? md?.total_oi ?? md?.totalOi);
-    return Number.isFinite(value) && value >= 0 ? value : undefined;
-  }
-
-  private recordWallOi(side: 'CE' | 'PE', strike: number, currentOi: number, snapshotTimestamp: number, sess: LocalSessionState): void {
-    if (!Number.isFinite(currentOi) || currentOi < 0) return;
-    const key = this.wallHistoryKey(side, strike);
-    if (!sess.wallOiHistory) sess.wallOiHistory = {};
-    if (!sess.wallStableByKey) sess.wallStableByKey = {};
-    const values = sess.wallOiHistory[key] || [];
-    const last = values[values.length - 1];
-
-    if (last !== undefined && last === currentOi) return;
-    values.push(currentOi);
-    sess.wallOiHistory[key] = values.slice(-20);
-
-    const peak = Math.max(...sess.wallOiHistory[key]);
-    sess.wallStableByKey[key] = currentOi >= peak * 0.95;
-  }
-
-  private getCompletedCandleKey(candle: Candle): string {
-    return new Date(candle.timestamp).toISOString();
-  }
-
-  private getCompletedCandleIndexByTimestamp(candles: Candle[], timestamp: string): number {
-    return candles.findIndex(c => new Date(c.timestamp).toISOString() === timestamp);
-  }
-
-  private settings: AppSettings;
-  private state: AppState;
-  public activeSignals: Map<string, InternalSignal> = new Map();
-  public overallPnL: number = 0;
-  public realizedPnL: number = 0;
-  public unrealizedPnL: number = 0;
-  public winRate: number = 0;
-  public totalTrades: number = 0;
-  public winningTrades: number = 0;
-  private fetchOptionData: FetchOptionDataFn;
-  private getOptionChain?: GetOptionChainFn;
-  private getNearestExpiry?: GetNearestExpiryFn;
-  private getOptionChainHistory?: () => any[];
-
-  private history: Map<string, InternalSignal> = new Map();
-  private sessionStates: Record<string, LocalSessionState> = {
-    'NIFTY': this.createInitialSessionState(),
-  };
-
-  constructor(
-    settings: AppSettings, 
-    state: AppState, 
-    fetchOptionData: FetchOptionDataFn,
-    getOptionChain?: GetOptionChainFn,
-    getNearestExpiry?: GetNearestExpiryFn,
-    getOptionChainHistory?: () => any[]
-  ) {
-    this.settings = settings;
-    this.state = state;
-    this.fetchOptionData = fetchOptionData;
-    this.getOptionChain = getOptionChain;
-    this.getNearestExpiry = getNearestExpiry;
-    this.getOptionChainHistory = getOptionChainHistory;
-  }
-
-  
-  private requireWallTolerance(): number {
-    const tolerance = Number(this.settings.WALL_TOLERANCE_POINTS);
-    if (!Number.isFinite(tolerance) || tolerance <= 0) {
-      throw new Error('CONFIG_ERROR: WALL_TOLERANCE_POINTS must be a positive number');
-    }
-    return tolerance;
-  }
-
-  private createInitialSessionState() {
-    return {
-      sessionHigh: 0,
-      sessionLow: Infinity,
-      previousDayHigh: 0,
-      previousDayLow: 0,
-      openingRangeHigh: 0,
-      openingRangeLow: 0,
-      openingRangeComplete: false,
-      nearestCeWallAbove: 0,
-      nearestPeWallBelow: 0,
-      brokenLevelUnderWatch: null,
-      retestPendingFlag: false,
-      continuationPendingFlag: false,
-      tradeTakenFlag: false,
-      firstTargetHitFlag: false,
-      trailingStopActiveFlag: false,
-      lastSignalDirection: 'NONE' as const,
-      last_failed_setup_level: null,
-      last_failed_setup_direction: null,
-      last_failed_setup_timestamp: null,
-      completedTradesCount: 0,
-      realizedDailyPnL: 0,
-      consecutiveLosingTrades: 0,
-      noNewTradeFlag: false,
-      failedLevelsToday: [],
-      tradedStructures: [],
-      failedStructuresToday: [],
-      activeStructureId: null,
-      lastFailedStructureId: null,
-      sessionDateIST: new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }),
-      candidateCEWalls: {},
-      candidatePEWalls: {},
-      wallTestCounts: {},
-      prevWallTotalOI: {},
-      wallNegativeOICounts: {},
-      lastTradeExitTime: 0,
-      lastTradeCandleTime: null,
-      wallTestCandleKeys: {},
-    wallReactionCandleKeys: {},
-    wallOiHistory: {},
-    wallStableByKey: {},
-      wallLastSeenOI: {},
-      wallLastProcessedSnapshotKey: {},
-      wallOIWeakeningConfirmed: {},
-      wallPeakOI: {},
-      wallNegativeOIAlignedKeys: {},
-      wallInvalidForRejection: {},
-      totalTradesToday: 0,
-      consecutiveLosses: 0,
-      confirmedBreakoutTimestamp: null,
-      confirmedBreakoutLevel: null,
-      confirmedBreakoutDirection: null,
-      retestTimestamp: null,
-      retestLevel: null,
-      retestDirection: null,
-      lastProcessedCandleTimestamp: null,
-      currentStrategyFamily: null,
-      lastConfirmedReclaimLevel: null
-    };
-  }
-
-  public updateSettings(settings: AppSettings) {
-    this.settings = settings;
-  }
-
-  public isMarketOpen(): boolean {
-    try {
-      const istString = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
-      const istDate = new Date(istString);
-      const day = istDate.getDay(); // 0 = Sunday, 6 = Saturday
-      if (day === 0 || day === 6) return false;
-
-      const mins = istDate.getHours() * 60 + istDate.getMinutes();
-      // NSE Trading Hours: 09:15 AM (555 mins) to 03:30 PM (930 mins) IST
-      return mins >= 555 && mins <= 930;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  public async onTick(newState: AppState): Promise<EngineDecision[]> {
-    this.state = newState;
-    const newSignals: InternalSignal[] = [];
-    const decisions: EngineDecision[] = [];
-
-    // If global trading toggle is disabled or market is closed, exit active trades and return
-    if (!this.settings.isTradingEnabled || !this.isMarketOpen()) {
-      if (this.activeSignals.size > 0) {
-        this.exitAllActiveTrades(
-          !this.settings.isTradingEnabled 
-            ? "Trading Paused" 
-            : "Market Closed (Outside NSE Trading Hours 09:15 - 15:30 IST)"
-        );
-      }
-      return decisions;
-    }
-
-    // Manage active trades first
-    this.manageActiveTrades(newSignals);
-
-    // Evaluate NIFTY ONLY
-    if (this.state.nifty50.lastPrice > 0) {
-      const sig = await this.evaluateIndex('NIFTY', this.state.nifty50.lastPrice);
-      if (sig) {
-        if (sig.signal !== 'NO_TRADE') {
-          newSignals.push(sig);
-        }
-        decisions.push(this.mapToPublicDecision(sig));
-      }
-    }
-
-    newSignals.forEach(s => this.activeSignals.set(s.id, s));
-    
-    // Calculate unrealized PnL
-    this.unrealizedPnL = 0;
-    for (const sig of this.activeSignals.values()) {
-      const curPrice = sig.latestPrice || sig.entryPrice;
-      const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
-      const lotConfig = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
-      const qty = 75 * lotConfig;
-      this.unrealizedPnL += (curPrice - sig.entryPrice) * qty;
-    }
-    this.overallPnL = this.realizedPnL + this.unrealizedPnL;
-    return decisions;
-  }
-
-  private async evaluateIndex(index: string, spotPrice: number): Promise<any> {
-    const timeObj = new Date();
-    const timeStr = timeObj.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
-    const timestampISO = timeObj.toISOString();
-    const getISTDateKey = (d: Date | string | number) => {
-      const dt = new Date(d);
-      return dt.toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
-    };
-    const currentDateIST = getISTDateKey(timeObj);
-
-    const sessState = this.sessionStates[index];
-    
-    // Evaluate feed sync
-    const decisionTimeframe = this.settings.DECISION_TIMEFRAME_MINUTES || 5;
-    let decisionCandles = await getCandles(index, decisionTimeframe, 200);
-    decisionCandles = decisionCandles
-      .slice()
-      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-    const nowMs = timeObj.getTime();
-    const currentBucketStart =
-      Math.floor(nowMs / (decisionTimeframe * 60_000)) *
-      decisionTimeframe *
-      60_000;
-
-    const candles = decisionCandles.filter((c) => {
-      const startMs = new Date(c.timestamp).getTime();
-      return Number.isFinite(startMs) && startMs < currentBucketStart;
-    });
-
-    const latest = candles[candles.length - 1];
-    if (!latest) {
-      return this.createNoTrade(index, spotPrice, 'NO_TRADE: no completed decision candle');
-    }
-
-    const latestStartMs = new Date(latest.timestamp).getTime();
-    const ageMs = currentBucketStart - latestStartMs;
-    if (ageMs > decisionTimeframe * 60_000 * 2) {
-      return this.createNoTrade(index, spotPrice, 'NO_TRADE: decision candle is stale or an interval is missing');
-    }
-    const lastCompletedCandle = candles[candles.length - 1];
-    const completedCandleCloseTimestamp = new Date(lastCompletedCandle.timestamp).getTime() + (decisionTimeframe * 60_000);
-    const optionChainTimestamp = Number(this.state.optionChainTimestamp || 0);
-    if (!Number.isFinite(optionChainTimestamp) || optionChainTimestamp <= 0) {
-      return this.createNoTrade(index, spotPrice, 'FAILED_FEED_SYNC: Missing option-chain snapshot timestamp');
-    }
-    const feedDeltaMs = Math.abs(optionChainTimestamp - completedCandleCloseTimestamp);
-    if (feedDeltaMs > 15_000) {
-      return this.createNoTrade(index, spotPrice, `FAILED_FEED_SYNC: Spot/option-chain delta ${feedDeltaMs}ms > 15000ms`);
-    }
-    const feedSyncConfidencePenalty = feedDeltaMs > 5_000 ? 5 : 0;
-    sessState.feedSyncPenalty = feedSyncConfidencePenalty;
-    
-    // 0. Active trade gate (Rule 28)
-    if (sessState.tradeTakenFlag || sessState.noNewTradeFlag) {
-      return this.createNoTrade(index, spotPrice, 'Active trade gate: trade already taken');
-    }
-    
-    if ((sessState.completedTradesCount || 0) >= 3) {
-      return this.createNoTrade(index, spotPrice, 'Execution Limit: Daily trade limit (3) reached');
-    }
-    
-    if ((sessState.consecutiveLosingTrades || 0) >= 2) {
-      return this.createNoTrade(index, spotPrice, 'Execution Limit: Consecutive loss limit (2) reached');
-    }
-    
-    let chainRows: any[] = [];
-    if (this.getOptionChain) {
-      try {
-         let expiry = '';
-         if (this.getNearestExpiry) expiry = await this.getNearestExpiry(index);
-         const chain = await this.getOptionChain(index, expiry);
-         if (chain && chain.length > 0) chainRows = chain;
-      } catch(e) {}
-    }
-    const rows = [...chainRows]
-      .filter((r: any) => Number.isFinite(Number(r.strike_price)))
-      .sort((a: any, b: any) => Number(a.strike_price) - Number(b.strike_price));
-      
-    // find candidates
-    const candidates = this.findCandidateOIWalls(chainRows, spotPrice, sessState);
-    const nearestCeWallAbove = candidates.candidateCEWallsList.find(w => w.strike > spotPrice)?.strike || 0;
-    const nearestPeWallBelow = candidates.candidatePEWallsList.find(w => w.strike < spotPrice)?.strike || 0;
-
-    const valCtx: any = {
-      activeSignals: this.activeSignals,
-      index, spotPrice, timeObj, timeStr,
-      candles1m: candles, sessState, settings: this.settings,
-      chainRows: rows, nearestCeWallAbove, nearestPeWallBelow
-    };
-
-    let selectedSignal: InternalSignal | null = null;
-    const passedFilters: string[] = [];
-    const failedFilters: string[] = [];
-
-    if (!selectedSignal && this.settings.strategies?.openingTrap?.enabled) {
-      selectedSignal = await this.checkOpeningTrap(valCtx, index, spotPrice, candles, rows, sessState, nearestCeWallAbove, nearestPeWallBelow, passedFilters, failedFilters);
-    }
-    
-    if (!selectedSignal && this.settings.strategies?.oiWallRejection?.enabled) {
-      selectedSignal = await this.checkOIWallRejection(valCtx, index, spotPrice, candles, rows, sessState, nearestCeWallAbove, nearestPeWallBelow, passedFilters, failedFilters);
-    }
-
-    if (selectedSignal) {
-      sessState.tradeTakenFlag = true;
-      sessState.completedTradesCount = (sessState.completedTradesCount || 0) + 1;
-      return selectedSignal;
-    }
-    
-    return this.createNoTrade(index, spotPrice, failedFilters.join(', '));
-  }
-
-  private findCandidateOIWalls(chainRows: any[], spot: number, sess: LocalSessionState) {
-    const candidateCEWallsList: any[] = [];
-    const candidatePEWallsList: any[] = [];
-    const getOI = (row: any, side: 'CE' | 'PE'): number | undefined => this.readRequiredOi(row, side);
-    const getOIChange = (row: any, side: 'CE' | 'PE'): number => {
-      const md = side === 'CE' ? row.call_options?.market_data : row.put_options?.market_data;
-      return Number(md?.oi_change ?? md?.oiChange ?? 0);
-    };
-
-    if (!sess.wallPeakOI) sess.wallPeakOI = {};
-    if (!sess.wallNegativeOIAlignedKeys) sess.wallNegativeOIAlignedKeys = {};
-    if (!sess.wallInvalidForRejection) sess.wallInvalidForRejection = {};
-    if (!sess.wallOIWeakeningConfirmed) sess.wallOIWeakeningConfirmed = {};
-
-    for (let i = 2; i <= chainRows.length - 3; i++) {
-      const row = chainRows[i];
-      const strike = Number(row.strike_price);
-      const ceOI = getOI(row, 'CE');
-      const peOI = getOI(row, 'PE');
-      const ceOIC = getOIChange(row, 'CE');
-      const peOIC = getOIChange(row, 'PE');
-
-      if (ceOI > 0) {
-        if (sess.wallPeakOI[strike] === undefined) sess.wallPeakOI[strike] = ceOI;
-        sess.wallPeakOI[strike] = Math.max(sess.wallPeakOI[strike], ceOI);
-        if (ceOI < sess.wallPeakOI[strike] * 0.95) sess.wallOIWeakeningConfirmed[strike] = true;
-        if (ceOIC < 0) {
-           const timeKey = chainRows ? new Date().toISOString() : "snapshot";
-           if (!sess.wallNegativeOIAlignedKeys[strike]) sess.wallNegativeOIAlignedKeys[strike] = [];
-           const keys = sess.wallNegativeOIAlignedKeys[strike];
-           if (keys.length === 0 || new Date().getTime() - new Date(keys[keys.length-1]).getTime() >= 180000) {
-             keys.push(timeKey);
-           }
-        }
-        if (ceOI > (sess.wallPeakOI[strike] * 1.10) && sess.wallOIWeakeningConfirmed[strike]) {
-           sess.wallInvalidForRejection[strike] = true;
-        }
-      }
-      
-      const prev2 = chainRows[i - 2];
-      const prev1 = chainRows[i - 1];
-      const next1 = chainRows[i + 1];
-      const next2 = chainRows[i + 2];
-
-      const ceOIAvgAdj = (getOI(prev2, 'CE') + getOI(prev1, 'CE') + getOI(next1, 'CE') + getOI(next2, 'CE')) / 4;
-      if (ceOI > ceOIAvgAdj * 1.5) {
-        candidateCEWallsList.push({ strike, type: 'CE', totalOI: ceOI, oiChange: ceOIC });
-      }
-
-      const peOIAvgAdj = (getOI(prev2, 'PE') + getOI(prev1, 'PE') + getOI(next1, 'PE') + getOI(next2, 'PE')) / 4;
-      if (peOI > peOIAvgAdj * 1.5) {
-        candidatePEWallsList.push({ strike, type: 'PE', totalOI: peOI, oiChange: peOIC });
-      }
-    }
-
-    return { candidateCEWallsList, candidatePEWallsList };
-  }
-
-  private async checkOpeningTrap(
+const remainder = `private async checkOpeningTrap(
     valCtx: ValidationContext,
     index: string,
     spot: number,
@@ -772,7 +326,7 @@ export class StrategyEngine {
     if (bid > 0 && ask >= bid) {
       const spreadPercent = ((ask - bid) / price) * 100;
       if (spreadPercent > (this.settings.MAX_OPTION_SPREAD_PERCENT || 1.5)) {
-        failed.push(`FAILED_LIQUIDITY: spread ${spreadPercent.toFixed(2)}% too large`);
+        failed.push(\`FAILED_LIQUIDITY: spread \${spreadPercent.toFixed(2)}% too large\`);
         return false;
       }
       setup.spreadPercent = spreadPercent;
@@ -792,7 +346,7 @@ export class StrategyEngine {
       failed.push(result.reason || 'FAILED_SETUP_VALIDATION');
       return false;
     }
-    passed.push(`Validated ${setup.setupType} with real premium/OI history`);
+    passed.push(\`Validated \${setup.setupType} with real premium/OI history\`);
     return true;
   }
   
@@ -1044,14 +598,24 @@ export class StrategyEngine {
       signal: 'NO_TRADE',
       strategy_family: 'NONE' as any,
       direction: 'NONE' as any,
-      spot_entry: spot,
-      spot_invalidation: 0,
-      spot_target1: 0,
-      spot_target2: 0,
-      option_entry: 0,
-      option_stoploss: 0,
-      option_target1: 0,
-      option_target2: 0,
+      prices: {
+        spotEntry: spot,
+        spotInvalidation: 0,
+        spotTarget1: 0,
+        spotTarget2: 0,
+        optionEntry: 0,
+        optionStoploss: 0,
+        optionTarget1: 0,
+        optionTarget2: 0,
+      },
+      spotEntry: spot,
+      spotInvalidation: 0,
+      spotTarget1: 0,
+      spotTarget2: 0,
+      optionEntry: 0,
+      optionStoploss: 0,
+      optionTarget1: 0,
+      optionTarget2: 0,
       entry: 0,
       stoploss: 0,
       target1: 0,
@@ -1077,3 +641,6 @@ export class StrategyEngine {
     this.history.clear();
   }
 }
+`;
+
+fs.writeFileSync('src/backend/strategy-engine.ts', header + remainder);
