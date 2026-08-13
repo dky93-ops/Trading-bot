@@ -11,6 +11,15 @@ export interface AppSettings {
   OPENING_RANGE_MINUTES?: number;
   defaultLotsPerTrade?: number;
   maxActiveTrades?: number;
+  DECISION_TIMEFRAME_MINUTES?: number;
+  MAX_OPTION_SPREAD_PERCENT?: number;
+  PREMIUM_CONFIRMATION_PERCENT?: number;
+  OPENING_PREMIUM_CONFIRMATION_PERCENT?: number;
+  WALL_OI_RATIO?: number;
+  WALL_WEAKENING_PERCENT?: number;
+  MAX_WALL_DISTANCE_ATR?: number;
+  MIN_ENTRY_TIME_IST?: string;
+  LAST_ENTRY_TIME_IST?: string;
   strategies: {
     openingTrap: StrategyConfig;
     failedRetest: StrategyConfig;
@@ -35,6 +44,7 @@ export interface InstrumentData {
 }
 
 export interface AppState {
+  optionChainTimestamp: number;
   nifty50: InstrumentData;
   indiaVix: InstrumentData;
   isConnected: boolean;
@@ -49,6 +59,9 @@ export interface AppState {
 }
 
 export interface StrategySessionState {
+  totalTradesToday: number;
+  consecutiveLosses: number;
+  feedSyncPenalty?: number;
   wallPeakOI?: Record<number, number>;
   wallNegativeOIAlignedKeys?: Record<number, string[]>;
   wallInvalidForRejection?: Record<number, boolean>;
@@ -117,6 +130,17 @@ export interface StrategySessionState {
   lastConfirmedReclaimLevel: number | null;
 }
 
+export interface SignalPrices {
+  spotEntry: number;
+  spotInvalidation: number;
+  spotTarget1: number;
+  spotTarget2: number;
+  optionEntry: number;
+  optionStoploss: number;
+  optionTarget1: number;
+  optionTarget2: number;
+}
+
 export interface EngineDecision {
   timestamp: string;
   signal: 'BUY_CALL' | 'BUY_PUT' | 'NO_TRADE';
@@ -136,6 +160,14 @@ export interface EngineDecision {
   reason: string[];
   fake_signal_filters_passed: string[];
   fake_signal_filters_failed: string[];
+  spot_entry?: number;
+  spot_invalidation?: number;
+  spot_target1?: number;
+  spot_target2?: number;
+  option_entry?: number;
+  option_stoploss?: number;
+  option_target1?: number;
+  option_target2?: number;
 }
 
 export interface InternalSignal extends EngineDecision {
@@ -144,6 +176,18 @@ export interface InternalSignal extends EngineDecision {
   target2Spot?: number;
   entrySpot?: number;
   initialRiskSpot?: number;
+  prices: SignalPrices;
+  spotEntry: number;
+  spotInvalidation: number;
+  spotTarget1: number;
+  spotTarget2: number;
+  optionEntry: number;
+  optionStoploss: number;
+  optionTarget1: number;
+  optionTarget2: number;
+  latestSpot?: number;
+  latestSpotTimestamp?: number;
+  latestOptionTimestamp?: number;
   id: string;
   index: string;
   contract: string;

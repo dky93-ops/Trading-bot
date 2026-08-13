@@ -1,18 +1,31 @@
 import { db } from './index.ts';
 import { ticks, candles } from './schema.ts';
-import { sql, eq, and, desc, gte } from 'drizzle-orm';
+import { sql, eq, and, desc, gte, lt } from 'drizzle-orm';
 
-export async function insertTick(instrument: string, price: number, timestamp: number) {
+export async function insertTick(
+  instrument: string,
+  price: number,
+  timestamp: number,
+): Promise<boolean> {
+  if (
+    !instrument ||
+    !Number.isFinite(price) ||
+    price <= 0 ||
+    !Number.isFinite(timestamp)
+  ) {
+    return false;
+  }
   try {
     await db.insert(ticks).values({
       instrument,
       price,
       timestamp: new Date(timestamp),
     });
-    // Build candles
     await buildCandles(instrument, timestamp);
+    return true;
   } catch (error) {
-    console.error("Failed to insert tick:", error);
+    console.error('Failed to insert tick:', error);
+    return false;
   }
 }
 
@@ -34,12 +47,17 @@ async function buildCandles(instrument: string, currentTimestamp: number) {
       ).limit(1);
 
       // Get all ticks for this candle
-      const allTicks = await db.select().from(ticks).where(
-        and(
-          eq(ticks.instrument, instrument),
-          gte(ticks.timestamp, candleStart)
+      const allTicks = await db
+        .select()
+        .from(ticks)
+        .where(
+          and(
+            eq(ticks.instrument, instrument),
+            gte(ticks.timestamp, candleStart),
+            lt(ticks.timestamp, candleEnd),
+          ),
         )
-      ).orderBy(ticks.timestamp);
+        .orderBy(ticks.timestamp);
 
       if (allTicks.length === 0) continue;
 

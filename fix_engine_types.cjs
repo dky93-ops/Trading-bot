@@ -1,8 +1,27 @@
 const fs = require('fs');
+
 let code = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
 
-code = code.replace(/lastFailedSetupLevel: null,/g, "last_failed_setup_level: null,\n      last_failed_setup_direction: null,\n      last_failed_setup_timestamp: null,\n      completedTradesCount: 0,\n      realizedDailyPnL: 0,\n      consecutiveLosingTrades: 0,\n      noNewTradeFlag: false,");
+const regex = /const currentDateIST = this\.getISTDateKey\(timeObj\);/;
+const replacement = `const getISTDateKey = (d: Date | string | number) => {
+      const dt = new Date(d);
+      return dt.toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
+    };
+    const currentDateIST = getISTDateKey(timeObj);`;
 
-code = code.replace(/sessState\.lastFailedSetupLevel = /g, "sessState.last_failed_setup_level = ");
+code = code.replace(regex, replacement);
+
+const regex2 = /const rows = \[\.\.\.chainRows\]/;
+const replacement2 = `let chainRows: any[] = [];
+    if (this.getOptionChain) {
+      try {
+         const chain = await this.getOptionChain(index);
+         if (chain && chain.length > 0) chainRows = chain;
+      } catch(e) {}
+    }
+    const rows = [...chainRows]`;
+
+code = code.replace(regex2, replacement2);
 
 fs.writeFileSync('src/backend/strategy-engine.ts', code);
+console.log('Fixed missing chainRows and getISTDateKey');

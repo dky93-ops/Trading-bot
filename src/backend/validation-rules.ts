@@ -185,8 +185,8 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
   if (!chainRows || chainRows.length < 5) return fail('FAILED_WALL_DOMINANCE: Missing chain data');
   if (!setup.level || setup.level === 0) return fail('FAILED_WALL_DOMINANCE: No valid dominant OI wall found at this level');
 
-  const sortedRows = [...chainRows].sort((a, b) => a.strike_price - b.strike_price);
-  const wallRowIndex = sortedRows.findIndex(r => r.strike_price === setup.level);
+  const sortedRows = [...chainRows].sort((a, b) => Number(a.strike_price) - Number(b.strike_price));
+  const wallRowIndex = sortedRows.findIndex(r => Number(r.strike_price) === setup.level);
   
   if (wallRowIndex < 2 || wallRowIndex > sortedRows.length - 3) {
     return fail('FAILED_WALL_DOMINANCE: Strike not found or insufficient surrounding strikes');
@@ -198,26 +198,31 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
     sortedRows[wallRowIndex + 1], sortedRows[wallRowIndex + 2]
   ];
 
-  if (setup.direction === 'PUT') {
-    // Rejected from CE Wall above, buying PUT
-    const callOI = row.call_options?.market_data?.oi || 0;
-    const surrCallOI = surr.reduce((sum, r) => sum + (r.call_options?.market_data?.oi || 0), 0) / 4;
-    
-    if (surrCallOI === 0 || callOI < 1.5 * surrCallOI) return fail('FAILED_WALL_DOMINANCE: CE OI is not 1.5x dominant');
-    
-    // Check weakening using session state
-    
-  } else {
-    // Rejected from PE Wall below, buying CALL
-    const putOI = row.put_options?.market_data?.oi || 0;
-    const surrPutOI = surr.reduce((sum, r) => sum + (r.put_options?.market_data?.oi || 0), 0) / 4;
-    
-    if (surrPutOI === 0 || putOI < 1.5 * surrPutOI) return fail('FAILED_WALL_DOMINANCE: PE OI is not 1.5x dominant');
+  const readRequiredOi = (r: any, side: 'CE' | 'PE'): number | undefined => {
+    const md = side === 'CE'
+      ? r.call_options?.market_data
+      : r.put_options?.market_data;
+    const value = Number(md?.oi ?? md?.total_oi ?? md?.totalOi);
+    return Number.isFinite(value) && value >= 0 ? value : undefined;
+  };
 
-    
+  const side = setup.direction === 'PUT' ? 'CE' : 'PE';
+  const wallOi = readRequiredOi(row, side);
+  
+  const surrOIs = surr.map(r => readRequiredOi(r, side));
+  if (wallOi === undefined || surrOIs.some(oi => oi === undefined)) {
+    return fail('FAILED_WALL_DOMINANCE: Missing required OI for wall check');
   }
-  
-  
+
+  const avgSurr = surrOIs.reduce((sum, oi) => sum + oi, 0) / 4;
+  if (avgSurr === 0 || wallOi < 1.5 * avgSurr) {
+    return fail('FAILED_WALL_DOMINANCE: Wall OI is not 1.5x dominant');
+  }
+
+  const recentPeak = Number(ctx.sessState.wallPeakOI?.[setup.level]);
+  const current = wallOi;
+  (setup as any).wallStable = Number.isFinite(recentPeak) && Number.isFinite(current) && current >= recentPeak * 0.95;
+
   return pass();
 }
 
@@ -290,16 +295,27 @@ export function rule13PremiumConfirmation(setup: ProposedSetup): RuleResult {
        return fail('FAILED_PREMIUM_CONFIRMATION: Premium did not rise again after retest');
      }
   } else if (setup.setupType === 'CONTINUATION_BREAKOUT' || setup.setupType === 'CONTINUATION_BREAKDOWN') {
-     if (setup.premiumAtConfirmation === undefined || setup.premiumAtRetestLow === undefined || setup.premiumAtBreak === undefined) {
-       return fail('FAILED_PREMIUM_CONFIRMATION: Missing premium history');
-     }
-     if (setup.premiumAtConfirmation < setup.premiumAtRetestLow) {
-       return fail('FAILED_PREMIUM_CONFIRMATION: Premium did not remain above pause low');
-     }
-     if (setup.premiumAtConfirmation < setup.premiumAtBreak && setup.premiumAtConfirmation < setup.premiumAtRetestLow * 1.01) { // roughly: higher high OR above midpoint. We use a proxy here or assume it's calculated before.
-        // The prompt says: "make higher high OR remain above breakout-candle midpoint".
-        // This will be checked in the engine, but we ensure basic rule holds here.
-     }
+    if (
+      setup.premiumConfirmationClose === undefined ||
+      setup.premiumPauseLow === undefined ||
+      setup.premiumBreakMidpoint === undefined ||
+      setup.premiumConfirmationHigh === undefined
+    ) {
+      return fail('FAILED_PREMIUM_CONFIRMATION: Missing aligned continuation premium references');
+    }
+
+    const remainsAbovePauseLow =
+      setup.premiumConfirmationClose >= setup.premiumPauseLow;
+
+    const remainsAboveBreakMidpoint =
+      setup.premiumConfirmationClose >= setup.premiumBreakMidpoint;
+
+    const makesHigherHigh =
+      setup.premiumConfirmationHigh > setup.premiumBreakHigh!;
+
+    if (!remainsAbovePauseLow || (!remainsAboveBreakMidpoint && !makesHigherHigh)) {
+      return fail('FAILED_PREMIUM_CONFIRMATION: Continuation premium did not confirm');
+    }
   } else if (setup.setupType === 'OI_WALL_REJECTION') {
      // premium must expand after rejection
      if (setup.premiumAtConfirmation === undefined || setup.premiumAtBreak === undefined) {
@@ -338,11 +354,27 @@ export function rule15Overextension(setup: ProposedSetup): RuleResult {
 }
 
 export function rule16RoomToTarget(setup: ProposedSetup): RuleResult {
-  if (!setup.target1 || setup.target1 <= 0 || !setup.stopLoss || setup.stopLoss <= 0 || !setup.level || setup.level <= 0) return fail('FAILED_ROOM_TO_TARGET: Missing target, stopLoss, or level data');
-  const risk = Math.abs(setup.level - setup.stopLoss);
-  const reward1 = Math.abs(setup.target1 - setup.level);
-  if (risk > 0 && (reward1 / risk) < 0.8) return fail('FAILED_ROOM_TO_TARGET: Target 1 is less than 0.8R');
-  
+  if (!setup.target1 || setup.target1 <= 0 || !setup.stopLoss || setup.stopLoss <= 0 || !setup.c0) return fail('FAILED_ROOM_TO_TARGET: Missing target, stopLoss, or candle data');
+  const riskSpot = Math.abs(setup.c0.close - setup.stopLoss);
+  const rewardSpot = setup.direction === 'CALL'
+    ? setup.target1 - setup.c0.close
+    : setup.c0.close - setup.target1;
+  if (!(riskSpot > 0) || rewardSpot / riskSpot < 0.8) {
+    return fail('FAILED_ROOM_TO_TARGET: Target 1 is less than 0.8R');
+  }
+  return pass();
+}
+
+
+export function rule17ChopZoneFilter(ctx: ValidationContext): RuleResult {
+  const last20 = ctx.candles1m.slice(-20);
+  if (last20.length === 20) {
+    const high20 = Math.max(...last20.map(c => c.high));
+    const low20 = Math.min(...last20.map(c => c.low));
+    if (high20 - low20 < 40) {
+      return fail('FAILED_CHOP_ZONE: 20-candle range < 40 points');
+    }
+  }
   return pass();
 }
 
@@ -395,59 +427,13 @@ export function rule18BrokenLevelReclaimedInvalidation(ctx: ValidationContext, s
 export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
   const isCall = setup.direction === 'CALL';
   
-  // Direction and spot structure agreement
   if (isCall && setup.c0.close < setup.level) return fail('FAILED_OVERALL_AGREEMENT: CALL setup requires spot above level');
   if (!isCall && setup.c0.close > setup.level) return fail('FAILED_OVERALL_AGREEMENT: PUT setup requires spot below level');
-
-  // Premium agreement
-  const opt = isCall ? setup.ceOpt : setup.peOpt;
-  if (!opt || !opt.price || opt.price <= 0) return fail('FAILED_OVERALL_AGREEMENT: Missing premium data');
-
-  // Reward/Risk
-  const entry = setup.c0.close;
-  const risk = isCall ? entry - setup.stopLoss : setup.stopLoss - entry;
-  const reward1 = isCall ? setup.target1 - entry : entry - setup.target1;
-  if (risk > 0 && reward1 / risk < 0.8) return fail('FAILED_OVERALL_AGREEMENT: Target 1 is less than 0.8R');
-
-  // Family-specific timing and sequence
-  if (['FAILED_RETEST', 'OPENING_TRAP'].includes(setup.setupType)) {
-    if (setup.breakCandleIndex === undefined || setup.retestCandleIndex === undefined || setup.confirmationCandleIndex === undefined) {
-      return fail('FAILED_OVERALL_AGREEMENT: Missing sequence indices for retest family');
-    }
-    if (setup.barsSinceBreakout === undefined || setup.barsSinceRetest === undefined) {
-      return fail('FAILED_OVERALL_AGREEMENT: Missing bar counts for retest family');
-    }
-    if (setup.setupType === 'FAILED_RETEST' && (setup.barsSinceRetest < 1 || setup.barsSinceRetest > 4)) {
-      return fail('FAILED_OVERALL_AGREEMENT: FAILED_RETEST requires 1-4 retest candles');
-    }
-    if (setup.setupType === 'OPENING_TRAP' && (setup.barsSinceRetest < 1 || setup.barsSinceRetest > 3)) {
-      return fail('FAILED_OVERALL_AGREEMENT: OPENING_TRAP requires 1-3 retest candles');
-    }
-  }
-
-  if (setup.setupType === 'CONTINUATION_BREAKOUT' || setup.setupType === 'CONTINUATION_BREAKDOWN') {
-    if (setup.setupType === 'CONTINUATION_BREAKOUT' && !isCall) return fail('FAILED_OVERALL_AGREEMENT: Breakout must be CALL');
-    if (setup.setupType === 'CONTINUATION_BREAKDOWN' && isCall) return fail('FAILED_OVERALL_AGREEMENT: Breakdown must be PUT');
-    if (setup.barsSinceBreakout === undefined || setup.barsSinceBreakout < 1) return fail('FAILED_OVERALL_AGREEMENT: Continuation requires valid pause');
-  }
-
-  if (setup.setupType === 'OI_WALL_REJECTION') {
-    const wallTests = ctx.sessState.wallTestCounts[setup.level] || 0;
-    if (wallTests < 2) return fail('FAILED_OVERALL_AGREEMENT: OI Wall Rejection requires at least 2 distinct wall tests');
-    
-    const reactionKeys = ctx.sessState.wallReactionCandleKeys[setup.level] || [];
-    if (reactionKeys.length < 1) return fail('FAILED_OVERALL_AGREEMENT: OI Wall Rejection requires at least 1 session reaction');
-    
-    if (!ctx.sessState.wallOIWeakeningConfirmed[setup.level]) return fail('FAILED_OVERALL_AGREEMENT: Wall weakening not confirmed');
-    if (!setup.premiumAtConfirmation) return fail('FAILED_OVERALL_AGREEMENT: Premium confirmation missing for Wall Rejection');
-  }
-
-  // Reclaim Invalidation logic check is done by rule18, but enforce sequence here too if needed
-  if (ctx.sessState.lastConfirmedReclaimLevel === setup.level) {
-    return fail('FAILED_OVERALL_AGREEMENT: Level was reclaimed');
-  }
-
   
+  if (setup.setupType === 'OI_WALL_REJECTION' && (setup as any).wallStable !== true) {
+    return fail('FAILED_OVERALL_AGREEMENT: Wall is not stable/dominant');
+  }
+
   return pass();
 }
 
@@ -466,6 +452,7 @@ export function runSetupValidation(ctx: ValidationContext, setup: ProposedSetup,
     rule14MixedDirection(setup),
     rule15Overextension(setup),
     rule16RoomToTarget(setup),
+    rule17ChopZoneFilter(ctx),
     rule18BrokenLevelReclaimedInvalidation(ctx, setup),
     rule19OverallAgreement(ctx, setup)
   ];

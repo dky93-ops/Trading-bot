@@ -1,50 +1,47 @@
 const fs = require('fs');
+
 let code = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
 
-const calcConf = `
-  private calculateDeterministicConfidence(setup: ProposedSetup): number {
-    let score = 50;
-    score += 20; // mandatory entry conditions passed
-    if ((setup.rewardToRiskTarget1 || 0) >= 1.0) score += 10;
-    if ((setup.rewardToRiskTarget2 || 0) >= 1.5) score += 5;
-    if ((setup.premiumExpansionPercent || 0) >= 1.5) score += 10;
-    if ((setup.oiWeakeningPercent || 0) >= 10) score += 10;
-    if (!setup.outsidePreferredWindow) score += 5;
-    if ((setup.spreadPercent || 999) <= 1.5) score += 5;
-    if (setup.ivFavorable === true) score += 5;
-    if (setup.strongMomentum === true) score += 5;
-    if (setup.gapRulePassed === true) score += 5;
+const regex = /private calculateDeterministicConfidence\([\s\S]*?\n  \}\n\n  private/m;
 
-    if (setup.outsidePreferredWindow) score -= 10;
-    if ((setup.spreadPercent || 0) > 1.5 && (setup.spreadPercent || 0) <= 3) score -= 10;
-    if (setup.ivFavorable === false) score -= 10;
-    score -= Number(setup.feedSyncPenalty || 0);
-
-    const nowHHMM = new Date().toLocaleTimeString('en-US', {
-      hour12: false,
-      hour: '2-digit',
-      minute: '2-digit',
-      timeZone: 'Asia/Kolkata'
-    });
-    if (nowHHMM >= '09:20' && nowHHMM < '10:00') score -= 5;
-    if (setup.expiryDayAfter14 === true) score -= 10;
-    
-    score = Math.max(0, Math.min(100, score));
-
-    if (setup.expiryDayAfter14 === true) {
-      if (
-        score < 70 ||
-        (setup.rewardToRiskTarget1 || 0) < 1.0 ||
-        (setup.spreadPercent || 999) > 1.5 ||
-        (setup.oiWeakeningPercent || 0) < 7.5
-      ) {
-        return 0;
-      }
-    }
-    return score;
+const replacement = `private calculateDeterministicConfidence(setup: ProposedSetup): number {
+  let score = 50; // Base score (assuming structural validation passed)
+  score += 20; // Structural entry gate passed
+  
+  if ((setup.rewardToRiskTarget1 || 0) >= 1.0) score += 10;
+  if ((setup.rewardToRiskTarget2 || 0) >= 1.5) score += 5;
+  
+  const bp = setup.premiumBreakClose ?? setup.premiumAtBreak ?? 0;
+  const cp = setup.premiumConfirmationClose ?? setup.premiumAtConfirmation ?? 0;
+  if (bp > 0 && cp > bp) {
+    const expansion = ((cp - bp) / bp) * 100;
+    if (expansion >= 1.5) score += 10;
   }
-`;
+  
+  if (setup.setupType === 'OI_WALL_REJECTION') {
+    if (setup.wallWeakeningConfirmed) score += 10;
+  }
 
-code = code.replace(/private createSignal\(/, calcConf + "\n  $&");
+  if (setup.earlyWindow && !setup.earlyStrongWindow) {
+    score -= 10;
+  }
+  
+  if ((setup.spreadPercent || 999) <= 1.5) score += 5;
+  if ((setup.spreadPercent || 0) > 1.5 && (setup.spreadPercent || 0) <= 3.0) score -= 10;
+  
+  if (setup.ivPenalty) {
+    score -= setup.ivPenalty;
+  }
+  
+  if (setup.feedSyncPenalty) {
+    score -= setup.feedSyncPenalty;
+  }
+  
+  return Math.max(0, Math.min(100, score));
+}
+
+  private`;
+
+code = code.replace(regex, replacement);
 fs.writeFileSync('src/backend/strategy-engine.ts', code);
-console.log('Added calculateDeterministicConfidence');
+console.log('PATCH 7 confidence complete');

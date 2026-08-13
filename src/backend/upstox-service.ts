@@ -16,24 +16,58 @@ export class UpstoxService {
   private historyFilePath = path.join(process.cwd(), 'data', 'option_chain_history.json');
   
   private settings: AppSettings = {
-    apiKey: process.env.UPSTOX_API_KEY || 'b054bae2-c8eb-448e-a9d4-aacd4d355003',
-    apiSecret: process.env.UPSTOX_API_SECRET || 'a1mt0adbz8',
-    accessToken: process.env.UPSTOX_ACCESS_TOKEN || 'eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJDSDQ1ODIiLCJqdGkiOiI2YTNjMGE1ZTU0ZjIyZjBkMzQzYjAwNzciLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaXNFeHRlbmRlZCI6dHJ1ZSwiaWF0IjoxNzgyMzE5NzEwLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE4MTM4NzQ0MDB9.hdLqe8bdkWS0zcc4pASjX8nJSJ_WjwbE_diOwGqHQ8Y',
-    isTradingEnabled: true, // Global switch
+    apiKey: process.env.UPSTOX_API_KEY || '',
+    apiSecret: process.env.UPSTOX_API_SECRET || '',
+    accessToken: process.env.UPSTOX_ACCESS_TOKEN || '',
+    isTradingEnabled: true,
     nifty50Enabled: true,
     expiryDate: 'CURRENT',
     defaultLotsPerTrade: 1,
-    maxActiveTrades: 1, // Rule: STRICTLY 1 open trade at a time
+    maxActiveTrades: 1,
+    DECISION_TIMEFRAME_MINUTES: 5,
+    OPENING_RANGE_MINUTES: 15,
+    MAX_OPTION_SPREAD_PERCENT: 1.5,
+    PREMIUM_CONFIRMATION_PERCENT: 1,
+    OPENING_PREMIUM_CONFIRMATION_PERCENT: 1.5,
+    WALL_OI_RATIO: 1.5,
+    WALL_WEAKENING_PERCENT: 5,
+    MAX_WALL_DISTANCE_ATR: 1.5,
+    MIN_ENTRY_TIME_IST: '09:30',
+    LAST_ENTRY_TIME_IST: '15:00',
     strategies: {
       openingTrap: { enabled: true, lotSize: 1 },
       failedRetest: { enabled: true, lotSize: 1 },
       continuationBreakdown: { enabled: true, lotSize: 1 },
       continuationBreakout: { enabled: true, lotSize: 1 },
       oiWallRejection: { enabled: true, lotSize: 1 },
-    }
+    },
   };
 
+  private isPaperTradingOnly(): boolean {
+    return String(process.env.PAPER_TRADING_ONLY || '').toLowerCase() === 'true';
+  }
+
+  private hasBrokerCredentials(): boolean {
+    return Boolean(
+      process.env.UPSTOX_API_KEY &&
+      process.env.UPSTOX_API_SECRET &&
+      process.env.UPSTOX_ACCESS_TOKEN,
+    );
+  }
+
+  public getPublicSettings() {
+    const { apiKey: _apiKey, apiSecret: _apiSecret, accessToken: _accessToken, ...safe } =
+      this.settings;
+    return {
+      ...safe,
+      hasAccessToken: Boolean(this.settings.accessToken),
+      paperTradingOnly: this.isPaperTradingOnly(),
+      liveOrdersEnabled: false,
+    };
+  }
+
   private state: AppState = {
+    optionChainTimestamp: 0, 
     nifty50: { lastPrice: 0, change: 0, timestamp: 0 },
     indiaVix: { lastPrice: 0, change: 0, timestamp: 0 },
     isConnected: false,
@@ -172,7 +206,15 @@ export class UpstoxService {
     // Load recorded 1-minute option chain history from disk
     this.loadOptionChainHistoryFromDisk();
     
-    if (this.settings.accessToken && this.settings.isTradingEnabled) {
+    if (!this.isPaperTradingOnly()) {
+      this.state.apiError =
+        'Blocked: set PAPER_TRADING_ONLY=true. Live trading is disabled.';
+    } else if (!this.hasBrokerCredentials()) {
+      this.state.apiError =
+        'Blocked: Upstox runtime credentials are missing.';
+    }
+
+    if (this.isPaperTradingOnly() && this.hasBrokerCredentials()) {
       this.startPolling();
     }
 
@@ -209,7 +251,7 @@ export class UpstoxService {
       this.state.apiError = undefined;
     }
     this.strategyEngine.updateSettings(this.settings);
-    this.broadcast({ type: 'SETTINGS_UPDATE', data: this.settings });
+    this.broadcast({ type: 'SETTINGS_UPDATE', data: this.getPublicSettings() });
     
     // Auto-restart polling if token changes and we are not polling
     if (this.settings.accessToken && !this.pollingInterval) {
@@ -277,8 +319,7 @@ export class UpstoxService {
             if (instrumentKey.includes('Nifty Bank')) {
               
             } else if (instrumentKey.includes('Nifty 50')) {
-              this.state.nifty50.lastPrice = spot;
-              this.state.nifty50.timestamp = Date.now();
+              this.state.optionChainTimestamp = Date.now();
             }
           }
 
@@ -420,17 +461,18 @@ export class UpstoxService {
           this.state.isConnected = true;
           this.errorCount = 0; // reset errors
 
-          const insertTick = (inst: string, price: number, time: number) => {
-            // Placeholder since this is abstracted away
-          };
-
           if (data['NSE_INDEX:Nifty 50']) {
             const tick = data['NSE_INDEX:Nifty 50'];
-            this.state.nifty50 = {
-              lastPrice: tick.last_price,
-              change: tick.net_change,
-              timestamp: Date.now()
-            };
+            const niftyLast = Number(tick.last_price);
+            const niftyTimestamp = Date.now();
+            if (Number.isFinite(niftyLast) && niftyLast > 0) {
+              this.state.nifty50 = {
+                lastPrice: niftyLast,
+                change: Number(tick.net_change || 0),
+                timestamp: niftyTimestamp,
+              };
+              await insertTick('NIFTY', niftyLast, niftyTimestamp);
+            }
           }
           if (data['NSE_INDEX:India VIX']) {
             const tick = data['NSE_INDEX:India VIX'];
@@ -491,16 +533,21 @@ export class UpstoxService {
     }
 
     // Run strategy engine tick ONLY on live, fresh real-time feed during market hours
-    if (this.settings.isTradingEnabled && this.state.isConnected && !this.state.apiError && this.strategyEngine.isMarketOpen()) {
-      const now = Date.now();
-      const isNiftyFresh = this.state.nifty50.timestamp > 0 && (now - this.state.nifty50.timestamp < 12000);
+    const paperOnly = this.isPaperTradingOnly();
+    const freshSpot =
+      this.state.nifty50.timestamp > 0 &&
+      Date.now() - this.state.nifty50.timestamp <= 12_000;
 
-      if (isNiftyFresh) {
-        const newSignals = await this.strategyEngine.onTick(this.state);
-        if (newSignals.length > 0) {
-          this.state.signals = newSignals.slice(0, 10); // Keep last 10 decisions in state
-        }
-      }
+    if (
+      paperOnly &&
+      this.settings.isTradingEnabled &&
+      this.state.isConnected &&
+      !this.state.apiError &&
+      this.strategyEngine.isMarketOpen() &&
+      freshSpot
+    ) {
+      const newSignals = await this.strategyEngine.onTick(this.state);
+      this.state.signals = newSignals.slice(0, 10);
     } else {
       // If market is closed or trading disabled or feed inactive, exit any active positions
       if (this.strategyEngine.activeSignals.size > 0) {
@@ -542,6 +589,28 @@ export class UpstoxService {
   }
 
   private recordOptionChainSnapshot(instrumentKey: string, expiryDate: string, rawRows: any[]) {
+    const finiteNumber = (value: unknown): number | undefined => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const makeOption = (raw: any) => {
+      const md = raw?.market_data || {};
+      const greeks = raw?.option_greeks || {};
+      return {
+        ltp: finiteNumber(md.ltp ?? md.last_price),
+        bid: finiteNumber(md.bid_price),
+        ask: finiteNumber(md.ask_price),
+        totalOi: finiteNumber(md.oi ?? md.total_oi ?? md.totalOi),
+        oiChange: finiteNumber(md.oi_change ?? md.oiChange),
+        volume: finiteNumber(md.volume),
+        iv: finiteNumber(greeks.iv),
+        delta: finiteNumber(greeks.delta),
+        theta: finiteNumber(greeks.theta),
+        gamma: finiteNumber(greeks.gamma),
+        vega: finiteNumber(greeks.vega),
+        instrumentKey: String(raw?.instrument_key || ''),
+      };
+    };
     try {
       if (!this.strategyEngine.isMarketOpen()) return;
       if (!rawRows || rawRows.length === 0) return;
@@ -593,28 +662,8 @@ export class UpstoxService {
           rows: rawRows.map((r: any) => ({
             strike: r.strike_price,
             spot: r.underlying_spot_price,
-            ce: {
-              ltp: r.call_options?.market_data?.ltp || 0,
-              totalOi: r.call_options?.market_data?.oi || 0,
-              oiChange: r.call_options?.market_data?.oi_change || 0,
-              volume: r.call_options?.market_data?.volume || 0,
-              iv: r.call_options?.option_greeks?.iv || 0,
-              delta: r.call_options?.option_greeks?.delta || 0,
-              theta: r.call_options?.option_greeks?.theta || 0,
-              gamma: r.call_options?.option_greeks?.gamma || 0,
-              vega: r.call_options?.option_greeks?.vega || 0
-            },
-            pe: {
-              ltp: r.put_options?.market_data?.ltp || 0,
-              totalOi: r.put_options?.market_data?.oi || 0,
-              oiChange: r.put_options?.market_data?.oi_change || 0,
-              volume: r.put_options?.market_data?.volume || 0,
-              iv: r.put_options?.option_greeks?.iv || 0,
-              delta: r.put_options?.option_greeks?.delta || 0,
-              theta: r.put_options?.option_greeks?.theta || 0,
-              gamma: r.put_options?.option_greeks?.gamma || 0,
-              vega: r.put_options?.option_greeks?.vega || 0
-            }
+            ce: makeOption(r.call_options),
+            pe: makeOption(r.put_options)
           }))
         };
 

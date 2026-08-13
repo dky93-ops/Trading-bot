@@ -1,58 +1,49 @@
 const fs = require('fs');
 let code = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
 
-const targetFunction = `
-  private computeSpotTargets(
+const regex = /private computeSpotTargets\([\s\S]*?\} \| undefined \{[\s\S]*?\n  \}\n/m;
+
+const replacement = `private computeSpotTargets(
     direction: 'CALL' | 'PUT',
     spot: number,
     brokenLevel: number,
     chainRows: any[],
     sess: LocalSessionState
   ): { structuralStopSpot:number; target1Spot:number; target2Spot:number } | undefined {
-    const tolerance = Number(this.settings.WALL_TOLERANCE_POINTS);
-    if (!Number.isFinite(tolerance) || tolerance <= 0) return undefined;
-    const levels: number[] = [];
-    if (direction === 'CALL') {
-      if (sess.sessionHigh > spot) levels.push(sess.sessionHigh);
-      if (sess.previousDayHigh > spot) levels.push(sess.previousDayHigh);
-      if (sess.openingRangeHigh > spot) levels.push(sess.openingRangeHigh);
-      const candidates = this.findCandidateOIWalls(chainRows, spot, 50, sess);
-      for (const w of candidates.candidateCEWallsList) {
-        if (w.strike > spot) levels.push(w.strike);
-      }
-      const sorted = [...new Set(levels)]
-        .filter(x => x > spot + tolerance)
-        .sort((a,b) => a-b);
-      if (sorted.length < 1 || brokenLevel >= spot) return undefined;
-      return {
-        structuralStopSpot: brokenLevel,
-        target1Spot: sorted[0],
-        target2Spot: sorted.find(x => x > sorted[0]) ?? 0
-      };
-    }
-    if (sess.sessionLow < spot) levels.push(sess.sessionLow);
-    if (sess.previousDayLow > 0 && sess.previousDayLow < spot) {
-      levels.push(sess.previousDayLow);
-    }
-    if (sess.openingRangeLow > 0 && sess.openingRangeLow < spot) {
-      levels.push(sess.openingRangeLow);
-    }
+    let structuralStopSpot = direction === 'CALL' ? spot - 15 : spot + 15;
+    
+    let target1Spot = direction === 'CALL' 
+      ? spot + (spot - structuralStopSpot) * 1.5 
+      : spot - (structuralStopSpot - spot) * 1.5;
+
+    let target2Base = direction === 'CALL'
+      ? spot + (spot - structuralStopSpot) * 3.0
+      : spot - (structuralStopSpot - spot) * 3.0;
+
+    let nearestOpposingWall: number | undefined;
     const candidates = this.findCandidateOIWalls(chainRows, spot, 50, sess);
-    for (const w of candidates.candidatePEWallsList) {
-      if (w.strike < spot) levels.push(w.strike);
+    
+    if (direction === 'CALL') {
+      const walls = candidates.candidateCEWallsList.filter(w => w.strike > spot).sort((a,b) => a.strike - b.strike);
+      if (walls.length > 0) nearestOpposingWall = walls[0].strike;
+    } else {
+      const walls = candidates.candidatePEWallsList.filter(w => w.strike < spot).sort((a,b) => b.strike - a.strike);
+      if (walls.length > 0) nearestOpposingWall = walls[0].strike;
     }
-    const sorted = [...new Set(levels)]
-      .filter(x => x < spot - tolerance)
-      .sort((a,b) => b-a);
-    if (sorted.length < 1 || brokenLevel <= spot) return undefined;
-    return {
-      structuralStopSpot: brokenLevel,
-      target1Spot: sorted[0],
-      target2Spot: sorted.find(x => x < sorted[0]) ?? 0
-    };
+
+    let target2Spot = target2Base;
+    if (nearestOpposingWall !== undefined) {
+      if (direction === 'CALL') {
+         if (nearestOpposingWall < target2Base) target2Spot = nearestOpposingWall - 5;
+      } else {
+         if (nearestOpposingWall > target2Base) target2Spot = nearestOpposingWall + 5;
+      }
+    }
+
+    return { structuralStopSpot, target1Spot, target2Spot };
   }
 `;
 
-code = code.replace(/private createSignal\(/, targetFunction + "\n  $&");
+code = code.replace(regex, replacement);
 fs.writeFileSync('src/backend/strategy-engine.ts', code);
-console.log('Added computeSpotTargets');
+console.log('PATCH 5 targets complete');
