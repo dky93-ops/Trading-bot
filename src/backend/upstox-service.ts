@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { StrategyEngine } from './strategy-engine.js';
 import { AppSettings, AppState, OptionChainSnapshot, TradingSymbol, InternalSignal } from './types.js';
-import { insertTick } from '../db/market.js';
+import { insertTick, seedHistoricalCandles } from '../db/market.js';
 
 export class UpstoxService {
   private wss: WebSocketServer;
@@ -43,11 +43,6 @@ export class UpstoxService {
       oiWallRejection: { enabled: true, lotSize: 1 },
     },
   };
-
-  private isPaperTradingOnly(): boolean {
-    return String(process.env.PAPER_TRADING_ONLY || '').toLowerCase() === 'true';
-  }
-
   private hasBrokerCredentials(): boolean {
     return Boolean(
       process.env.UPSTOX_API_KEY &&
@@ -62,8 +57,6 @@ export class UpstoxService {
     return {
       ...safe,
       hasAccessToken: Boolean(this.settings.accessToken),
-      paperTradingOnly: this.isPaperTradingOnly(),
-      liveOrdersEnabled: false,
     };
   }
 
@@ -96,7 +89,9 @@ export class UpstoxService {
     }
     
     try {
-      const response = await axios.get(`https://api.upstox.com/v2/option/contract?instrument_key=${encodeURIComponent(instrumentKey)}`, {
+      const response = await axios.get(`https://api.upstox.com/v2/option/contract`, {
+        params: { instrument_key: instrumentKey },
+
         headers: {
           'Accept': 'application/json',
           'Authorization': `Bearer ${this.settings.accessToken}`
@@ -178,7 +173,7 @@ export class UpstoxService {
   }
 
   private async recordOneMinOptionChain() {
-    if (!this.isPaperTradingOnly() || !this.hasBrokerCredentials()) return;
+    if (!this.hasBrokerCredentials()) return;
     if (!this.settings.accessToken) return;
 
     // Only record during market hours
@@ -208,20 +203,17 @@ export class UpstoxService {
     // Load recorded 1-minute option chain history from disk
     this.loadOptionChainHistoryFromDisk();
     
-    if (!this.isPaperTradingOnly()) {
-      this.state.apiError =
-        'Blocked: set PAPER_TRADING_ONLY=true. Live trading is disabled.';
-    } else if (!this.hasBrokerCredentials()) {
+    if (!this.hasBrokerCredentials()) {
       this.state.apiError =
         'Blocked: Upstox runtime credentials are missing.';
     }
 
-    if (this.isPaperTradingOnly() && this.hasBrokerCredentials()) {
+    if (this.hasBrokerCredentials()) {
       this.startPolling();
     }
 
     // Always run the 1-minute Option Chain recording loop during server runtime
-    if (this.isPaperTradingOnly() && this.hasBrokerCredentials()) {
+    if (this.hasBrokerCredentials()) {
       this.startOneMinOptionChainRecorder();
     }
 
@@ -269,7 +261,9 @@ export class UpstoxService {
 
   async getExpiries(instrumentKey: string): Promise<string[]> {
     try {
-      const response = await axios.get(`https://api.upstox.com/v2/option/contract?instrument_key=${encodeURIComponent(instrumentKey)}`, {
+      const response = await axios.get(`https://api.upstox.com/v2/option/contract`, {
+        params: { instrument_key: instrumentKey },
+
         headers: {
           'Accept': 'application/json',
           'Authorization': `Bearer ${this.settings.accessToken}`
@@ -410,12 +404,37 @@ export class UpstoxService {
     return null;
   }
 
-  public startPolling() {
+  
+  private async syncHistoricalCandles() {
+    if (!this.settings.accessToken) return;
+    try {
+      console.log("Syncing historical intraday candles to bootstrap engine...");
+      // Fetch 5-minute candles for the last day
+      const response = await axios.get('https://api.upstox.com/v2/historical-candle/intraday/NSE_INDEX%7CNifty%2050/1minute', {
+        headers: {
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${this.settings.accessToken}`
+        }
+      });
+      if (response.data && response.data.status === 'success' && response.data.data && response.data.data.candles) {
+        await seedHistoricalCandles('NIFTY', 5, response.data.data.candles);
+        await seedHistoricalCandles('NIFTY', 1, response.data.data.candles);
+        await seedHistoricalCandles('NIFTY', 3, response.data.data.candles);
+        console.log("Historical candles seeded successfully.");
+      }
+    } catch(e) {
+      console.error("Failed to seed historical candles:", e.message);
+    }
+  }
+
+  public async startPolling() {
+
     if (this.pollingInterval) {
       clearInterval(this.pollingInterval);
     }
     
     console.log("Starting Upstox Market Data Polling...");
+    this.syncHistoricalCandles().catch(console.error);
     // Upstox restricts heavy polling, poll every 2.5 seconds.
     this.pollingInterval = setInterval(() => this.pollData(), 2500);
   }
@@ -537,13 +556,12 @@ export class UpstoxService {
     }
 
     // Run strategy engine tick ONLY on live, fresh real-time feed during market hours
-    const paperOnly = this.isPaperTradingOnly();
-    const freshSpot =
+        const freshSpot =
       this.state.nifty50.timestamp > 0 &&
       Date.now() - this.state.nifty50.timestamp <= 12_000;
 
     if (
-      paperOnly &&
+      
       this.settings.isTradingEnabled &&
       this.state.isConnected &&
       !this.state.apiError &&
@@ -560,6 +578,10 @@ export class UpstoxService {
           : "Market Feed Inactive or Trading Disabled";
         this.strategyEngine.exitAllActiveTrades(reason);
       }
+      this.state.signals = [
+        ...Array.from(this.strategyEngine.activeSignals.values()),
+        ...Array.from(this.strategyEngine.history.values()).reverse()
+      ].slice(0, 10) as any[];
     }
 
     this.state.overallPnL = this.strategyEngine.overallPnL;

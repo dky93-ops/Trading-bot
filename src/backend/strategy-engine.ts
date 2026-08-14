@@ -129,7 +129,7 @@ export class StrategyEngine {
   private getNearestExpiry?: GetNearestExpiryFn;
   private getOptionChainHistory?: () => any[];
 
-  private history: Map<string, InternalSignal> = new Map();
+  public history: Map<string, InternalSignal> = new Map();
   private sessionStates: Record<string, LocalSessionState> = {
     'NIFTY': this.createInitialSessionState(),
   };
@@ -240,7 +240,7 @@ export class StrategyEngine {
     }
   }
 
-  public async onTick(newState: AppState): Promise<EngineDecision[]> {
+  public async onTick(newState: AppState): Promise<any[]> {
     this.state = newState;
     const newSignals: InternalSignal[] = [];
     const decisions: EngineDecision[] = [];
@@ -254,7 +254,10 @@ export class StrategyEngine {
             : "Market Closed (Outside NSE Trading Hours 09:15 - 15:30 IST)"
         );
       }
-      return decisions;
+      return [
+        ...Array.from(this.activeSignals.values()),
+        ...Array.from(this.history.values()).reverse()
+      ].slice(0, 15);
     }
 
     // Manage active trades first
@@ -283,9 +286,13 @@ export class StrategyEngine {
       this.unrealizedPnL += (curPrice - sig.entryPrice) * qty;
     }
     this.overallPnL = this.realizedPnL + this.unrealizedPnL;
-    return decisions;
+        // Instead of just new decisions, return all active and recently closed signals so the frontend can display them properly
+    const allSignals = [
+      ...Array.from(this.activeSignals.values()),
+      ...Array.from(this.history.values()).reverse()
+    ].slice(0, 15);
+    return allSignals;
   }
-
   private async evaluateIndex(index: string, spotPrice: number): Promise<any> {
     const timeObj = new Date();
     const timeStr = timeObj.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
@@ -356,8 +363,9 @@ export class StrategyEngine {
     if (this.getOptionChain) {
       try {
          let expiry = '';
-         if (this.getNearestExpiry) expiry = await this.getNearestExpiry(index);
-         const chain = await this.getOptionChain(index, expiry);
+         const upstoxInstrumentKey = index === 'NIFTY' ? 'NSE_INDEX|Nifty 50' : index;
+         if (this.getNearestExpiry) expiry = await this.getNearestExpiry(upstoxInstrumentKey);
+         const chain = await this.getOptionChain(upstoxInstrumentKey, expiry);
          if (chain && chain.length > 0) chainRows = chain;
       } catch(e) {}
     }

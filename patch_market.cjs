@@ -1,77 +1,42 @@
 const fs = require('fs');
 let code = fs.readFileSync('src/db/market.ts', 'utf8');
 
-// Update imports
-code = code.replace(
-  "import { sql, eq, and, desc, gte } from 'drizzle-orm';",
-  "import { sql, eq, and, desc, gte, lt } from 'drizzle-orm';"
-);
-
-// Update insertTick
-const oldInsertTick = `export async function insertTick(instrument: string, price: number, timestamp: number) {
+const newCode = `
+export async function seedHistoricalCandles(instrument: string, timeframe: number, candleData: Array<[string, number, number, number, number, number, number]>) {
   try {
-    await db.insert(ticks).values({
-      instrument,
-      price,
-      timestamp: new Date(timestamp),
+    const valuesToInsert = candleData.map(c => {
+      // Upstox timestamp: '2024-03-28T12:47:00+05:30'
+      const timestamp = new Date(c[0]);
+      return {
+        instrument,
+        timeframe,
+        timestamp,
+        open: c[1],
+        high: c[2],
+        low: c[3],
+        close: c[4]
+      };
     });
-    // Build candles
-    await buildCandles(instrument, timestamp);
-  } catch (error) {
-    console.error("Failed to insert tick:", error);
-  }
-}`;
 
-const newInsertTick = `export async function insertTick(
-  instrument: string,
-  price: number,
-  timestamp: number,
-): Promise<boolean> {
-  if (
-    !instrument ||
-    !Number.isFinite(price) ||
-    price <= 0 ||
-    !Number.isFinite(timestamp)
-  ) {
-    return false;
-  }
-  try {
-    await db.insert(ticks).values({
-      instrument,
-      price,
-      timestamp: new Date(timestamp),
-    });
-    await buildCandles(instrument, timestamp);
-    return true;
-  } catch (error) {
-    console.error('Failed to insert tick:', error);
-    return false;
-  }
-}`;
-
-code = code.replace(oldInsertTick, newInsertTick);
-
-// Update allTicks query
-const oldAllTicks = `const allTicks = await db.select().from(ticks).where(
+    for (const val of valuesToInsert) {
+      const existing = await db.select().from(candles).where(
         and(
-          eq(ticks.instrument, instrument),
-          gte(ticks.timestamp, candleStart)
+          eq(candles.instrument, instrument),
+          eq(candles.timeframe, timeframe),
+          eq(candles.timestamp, val.timestamp)
         )
-      ).orderBy(ticks.timestamp);`;
+      ).limit(1);
 
-const newAllTicks = `const allTicks = await db
-        .select()
-        .from(ticks)
-        .where(
-          and(
-            eq(ticks.instrument, instrument),
-            gte(ticks.timestamp, candleStart),
-            lt(ticks.timestamp, candleEnd),
-          ),
-        )
-        .orderBy(ticks.timestamp);`;
-        
-code = code.replace(oldAllTicks, newAllTicks);
+      if (existing.length === 0) {
+        await db.insert(candles).values(val);
+      }
+    }
+  } catch(e) {
+    console.error("Failed to seed historical candles:", e);
+  }
+}
+`;
 
-fs.writeFileSync('src/db/market.ts', code);
-console.log('market.ts updated');
+if(!code.includes('seedHistoricalCandles')) {
+  fs.writeFileSync('src/db/market.ts', code + newCode);
+}

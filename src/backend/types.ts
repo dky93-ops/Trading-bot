@@ -50,7 +50,7 @@ export interface AppState {
   indiaVix: InstrumentData;
   isConnected: boolean;
   apiError?: string;
-  signals: EngineDecision[];
+  signals: any[];
   overallPnL: number;
   realizedPnL?: number;
   unrealizedPnL?: number;

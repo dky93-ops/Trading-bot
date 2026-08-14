@@ -33,10 +33,7 @@ async function startServer() {
     lastPingTime = new Date().toISOString();
 
     res.json({
-      status: upstoxService.getPublicSettings().paperTradingOnly
-        ? (upstoxService.getState().isConnected ? 'healthy' : 'degraded')
-        : 'blocked',
-      paperTradingOnly: upstoxService.getPublicSettings().paperTradingOnly,
+      status: upstoxService.getState().isConnected ? 'healthy' : 'degraded',
       marketDataFresh:
         Date.now() - Number(upstoxService.getState().nifty50.timestamp || 0) < 12_000,
       databaseReady: true,
