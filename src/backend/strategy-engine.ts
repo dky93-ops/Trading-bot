@@ -25,6 +25,11 @@ export type GetOptionChainFn = (instrumentKey: string, expiry: string) => Promis
 export type GetNearestExpiryFn = (instrumentKey: string) => Promise<string>;
 
 import { getCandles } from '../db/market';
+import {
+  normalizeChainRows,
+  readHistoricalPremium,
+} from './strategy-data';
+
 
 export class StrategyEngine {
   private recordWallTests(
@@ -360,23 +365,106 @@ export class StrategyEngine {
     }
     
     let chainRows: any[] = [];
+    const passedFilters: string[] = [];
+    const failedFilters: string[] = [];
+
     if (this.getOptionChain) {
       try {
-         let expiry = '';
-         const upstoxInstrumentKey = index === 'NIFTY' ? 'NSE_INDEX|Nifty 50' : index;
-         if (this.getNearestExpiry) expiry = await this.getNearestExpiry(upstoxInstrumentKey);
-         const chain = await this.getOptionChain(upstoxInstrumentKey, expiry);
-         if (chain && chain.length > 0) chainRows = chain;
-      } catch(e) {}
+        let expiry = '';
+        const upstoxInstrumentKey =
+          index === 'NIFTY' ? 'NSE_INDEX|Nifty 50' : index;
+
+        if (this.getNearestExpiry) {
+          expiry = await this.getNearestExpiry(upstoxInstrumentKey);
+        }
+
+        const chainResponse = await this.getOptionChain(
+          upstoxInstrumentKey,
+          expiry,
+        );
+
+        chainRows = normalizeChainRows(chainResponse);
+      } catch (error) {
+        failedFilters.push(
+          `FAILED_OPTION_CHAIN: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
     }
-    const rows = [...chainRows]
-      .filter((r: any) => Number.isFinite(Number(r.strike_price)))
-      .sort((a: any, b: any) => Number(a.strike_price) - Number(b.strike_price));
+    const rows = normalizeChainRows(chainRows);
+
+    if (rows.length === 0) {
+      return this.createNoTrade(
+        index,
+        spotPrice,
+        'FAILED_OPTION_CHAIN: No usable option-chain rows',
+      );
+    }
+
+    const snapshotTimestamp =
+      Number(this.state.optionChainTimestamp) > 0
+        ? Number(this.state.optionChainTimestamp)
+        : Date.now();
+
+    for (const row of rows) {
+      const strike = Number(row.strike_price);
+
+      if (!Number.isFinite(strike)) {
+        continue;
+      }
+
+      const ceOi = this.readRequiredOi(row, 'CE');
+      const peOi = this.readRequiredOi(row, 'PE');
+
+      if (ceOi !== undefined) {
+        this.recordWallOi(
+          'CE',
+          strike,
+          ceOi,
+          snapshotTimestamp,
+          sessState,
+        );
+      }
+
+      if (peOi !== undefined) {
+        this.recordWallOi(
+          'PE',
+          strike,
+          peOi,
+          snapshotTimestamp,
+          sessState,
+        );
+      }
+    }
+
+    const candidates = this.findCandidateOIWalls(
+      rows,
+      spotPrice,
+      sessState,
+    );
+
+    const wallTolerance = Number(this.settings.WALL_TOLERANCE_POINTS || 10);
+
+    this.recordWallTests(
+      candidates,
+      candles,
+      sessState,
+      wallTolerance,
+    );
+
+    const nearestCeWallAbove =
+      candidates.candidateCEWallsList.find(
+        (wall) => wall.strike > spotPrice,
+      )?.strike || 0;
+
+    const nearestPeWallBelow =
+      candidates.candidatePEWallsList.find(
+        (wall) => wall.strike < spotPrice,
+      )?.strike || 0;
       
     // find candidates
-    const candidates = this.findCandidateOIWalls(chainRows, spotPrice, sessState);
-    const nearestCeWallAbove = candidates.candidateCEWallsList.find(w => w.strike > spotPrice)?.strike || 0;
-    const nearestPeWallBelow = candidates.candidatePEWallsList.find(w => w.strike < spotPrice)?.strike || 0;
+    
 
     const valCtx: any = {
       activeSignals: this.activeSignals,
@@ -385,21 +473,163 @@ export class StrategyEngine {
       chainRows: rows, nearestCeWallAbove, nearestPeWallBelow
     };
 
-    let selectedSignal: InternalSignal | null = null;
-    const passedFilters: string[] = [];
-    const failedFilters: string[] = [];
+    const precheck = runGlobalPreChecks({
+      activeSignals: this.activeSignals,
+      index,
+      spotPrice,
+      timeObj,
+      timeStr,
+      sessState,
+      candles1m: candles,
+      chainRows: [],
+      nearestCeWallAbove: 0,
+      nearestPeWallBelow: 0,
+    });
 
-    if (!selectedSignal && this.settings.strategies?.openingTrap?.enabled) {
-      selectedSignal = await this.checkOpeningTrap(valCtx, index, spotPrice, candles, rows, sessState, nearestCeWallAbove, nearestPeWallBelow, passedFilters, failedFilters);
+    if (!precheck.passed) {
+      return this.createNoTrade(
+        index,
+        spotPrice,
+        precheck.reason || 'FAILED_GLOBAL_PRECHECK',
+      );
     }
+
+    const minEntryTime =
+      this.settings.MIN_ENTRY_TIME_IST || '09:30';
+
+    const lastEntryTime =
+      this.settings.LAST_ENTRY_TIME_IST || '15:00';
+
+    if (timeStr < minEntryTime) {
+      return this.createNoTrade(
+        index,
+        spotPrice,
+        `FAILED_TIME_FILTER: Before minimum entry time ${minEntryTime} IST`,
+      );
+    }
+
+    if (timeStr >= lastEntryTime) {
+      return this.createNoTrade(
+        index,
+        spotPrice,
+        `FAILED_TIME_FILTER: At or after last entry time ${lastEntryTime} IST`,
+      );
+    }
+
+    let selectedSignal: InternalSignal | null = null;
     
-    if (!selectedSignal && this.settings.strategies?.oiWallRejection?.enabled) {
-      selectedSignal = await this.checkOIWallRejection(valCtx, index, spotPrice, candles, rows, sessState, nearestCeWallAbove, nearestPeWallBelow, passedFilters, failedFilters);
+    
+
+    if (
+      !selectedSignal &&
+      this.settings.strategies?.openingTrap?.enabled
+    ) {
+      selectedSignal = await this.checkOpeningTrap(
+        valCtx,
+        index,
+        spotPrice,
+        candles,
+        rows,
+        sessState,
+        nearestCeWallAbove,
+        nearestPeWallBelow,
+        passedFilters,
+        failedFilters,
+      );
+    }
+
+    if (
+      !selectedSignal &&
+      this.settings.strategies?.failedRetest?.enabled
+    ) {
+      for (const direction of ['CALL', 'PUT'] as const) {
+        selectedSignal = await this.checkFailedRetest(
+          direction,
+          valCtx,
+          index,
+          spotPrice,
+          candles,
+          rows,
+          sessState,
+          nearestCeWallAbove,
+          nearestPeWallBelow,
+          passedFilters,
+          failedFilters,
+        );
+
+        if (selectedSignal) break;
+      }
+    }
+
+    if (
+      !selectedSignal &&
+      this.settings.strategies?.continuationBreakout?.enabled
+    ) {
+      for (const direction of ['CALL', 'PUT'] as const) {
+        selectedSignal = await this.checkContinuation(
+          'CONTINUATION_BREAKOUT',
+          direction,
+          valCtx,
+          index,
+          spotPrice,
+          candles,
+          rows,
+          sessState,
+          nearestCeWallAbove,
+          nearestPeWallBelow,
+          passedFilters,
+          failedFilters,
+        );
+
+        if (selectedSignal) break;
+      }
+    }
+
+    if (
+      !selectedSignal &&
+      this.settings.strategies?.continuationBreakdown?.enabled
+    ) {
+      for (const direction of ['CALL', 'PUT'] as const) {
+        selectedSignal = await this.checkContinuation(
+          'CONTINUATION_BREAKDOWN',
+          direction,
+          valCtx,
+          index,
+          spotPrice,
+          candles,
+          rows,
+          sessState,
+          nearestCeWallAbove,
+          nearestPeWallBelow,
+          passedFilters,
+          failedFilters,
+        );
+
+        if (selectedSignal) break;
+      }
+    }
+
+    if (
+      !selectedSignal &&
+      this.settings.strategies?.oiWallRejection?.enabled
+    ) {
+      selectedSignal = await this.checkOIWallRejection(
+        valCtx,
+        index,
+        spotPrice,
+        candles,
+        rows,
+        sessState,
+        nearestCeWallAbove,
+        nearestPeWallBelow,
+        passedFilters,
+        failedFilters,
+      );
     }
 
     if (selectedSignal) {
       sessState.tradeTakenFlag = true;
-      sessState.completedTradesCount = (sessState.completedTradesCount || 0) + 1;
+      sessState.totalTradesToday = (sessState.totalTradesToday || 0) + 1;
       return selectedSignal;
     }
     
@@ -662,6 +892,165 @@ export class StrategyEngine {
         failed,
       );
     }
+    return null;
+  }
+
+  
+  private async checkFailedRetest(
+    direction: 'CALL' | 'PUT',
+    valCtx: ValidationContext,
+    index: string,
+    spot: number,
+    candles: Candle[],
+    chainRows: any[],
+    sess: LocalSessionState,
+    wallAbove: number,
+    wallBelow: number,
+    passed: string[],
+    failed: string[],
+  ): Promise<InternalSignal | null> {
+    if (candles.length < 4) return null;
+
+    const levels = this.validStructureLevels(sess);
+    const buffer = Math.max(
+      2,
+      Number(this.settings.WALL_TOLERANCE_POINTS || 5),
+    );
+
+    const firstBreakIndex = Math.max(1, candles.length - 8);
+
+    for (
+      let breakIndex = firstBreakIndex;
+      breakIndex < candles.length - 2;
+      breakIndex++
+    ) {
+      const breakCandle = candles[breakIndex];
+
+      for (const level of levels) {
+        const breakout =
+          direction === 'CALL'
+            ? breakCandle.close > level
+            : breakCandle.close < level;
+
+        if (!breakout) continue;
+
+        for (
+          let retestIndex = breakIndex + 1;
+          retestIndex < Math.min(candles.length - 1, breakIndex + 5);
+          retestIndex++
+        ) {
+          const retestCandle = candles[retestIndex];
+          const confirmationCandle = candles[retestIndex + 1];
+
+          const validRetest =
+            direction === 'CALL'
+              ? retestCandle.low <= level + buffer &&
+                retestCandle.close > level
+              : retestCandle.high >= level - buffer &&
+                retestCandle.close < level;
+
+          const confirmed =
+            direction === 'CALL'
+              ? confirmationCandle.close > confirmationCandle.open &&
+                confirmationCandle.close > retestCandle.high
+              : confirmationCandle.close < confirmationCandle.open &&
+                confirmationCandle.close < retestCandle.low;
+
+          if (!validRetest || !confirmed) continue;
+
+          const option = this.selectStrike(direction, spot, chainRows);
+          if (!option) continue;
+
+          const optionType = direction === 'CALL' ? 'CE' : 'PE';
+
+          const premiumAtBreak =
+            this.getHistoricalPremium(
+              option.strike,
+              optionType,
+              new Date(breakCandle.timestamp).toISOString(),
+            );
+
+          const premiumAtRetestLow =
+            this.getHistoricalPremium(
+              option.strike,
+              optionType,
+              new Date(retestCandle.timestamp).toISOString(),
+            );
+
+          const premiumAtConfirmation =
+            this.getHistoricalPremium(
+              option.strike,
+              optionType,
+              new Date(confirmationCandle.timestamp).toISOString(),
+            );
+
+          if (
+            premiumAtBreak === undefined ||
+            premiumAtRetestLow === undefined ||
+            premiumAtConfirmation === undefined
+          ) {
+            failed.push(
+              'FAILED_PREMIUM_ALIGNMENT: failed-retest history incomplete',
+            );
+            continue;
+          }
+
+          const targets = this.computeSpotTargets(
+            direction,
+            spot,
+            level,
+            chainRows,
+            sess,
+          );
+
+          const setup: ProposedSetup = {
+            direction,
+            level,
+            setupType: 'FAILED_RETEST',
+            c0: confirmationCandle,
+            c1: retestCandle,
+            c2: breakCandle,
+            target1: targets.target1Spot,
+            target2: targets.target2Spot,
+            stopLoss: targets.structuralStopSpot,
+            breakCandleIndex: breakIndex,
+            retestCandleIndex: retestIndex,
+            confirmationCandleIndex: retestIndex + 1,
+            barsSinceBreakout: retestIndex - breakIndex,
+            barsSinceRetest: 1,
+            premiumAtBreak,
+            premiumAtRetestLow,
+            premiumAtConfirmation,
+            ceOpt: direction === 'CALL' ? option : undefined,
+            peOpt: direction === 'PUT' ? option : undefined,
+          };
+
+          if (
+            !this.validateCandidate(
+              valCtx,
+              setup,
+              passed,
+              failed,
+            )
+          ) {
+            continue;
+          }
+
+          return this.createSignal(
+            index,
+            spot,
+            'FAILED_RETEST',
+            direction,
+            level,
+            chainRows,
+            sess,
+            passed,
+            failed,
+          );
+        }
+      }
+    }
+
     return null;
   }
 
@@ -1045,6 +1434,8 @@ export class StrategyEngine {
       instrumentKey: sig.instrumentKey || ''
     };
   }
+
+  
 
   private createNoTrade(index: string, spot: number, failReason: string): EngineDecision {
     return {

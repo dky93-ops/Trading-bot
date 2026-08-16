@@ -25,6 +25,7 @@ export class UpstoxService {
     defaultLotsPerTrade: 1,
     maxActiveTrades: 1,
     DECISION_TIMEFRAME_MINUTES: 5,
+    WALL_TOLERANCE_POINTS: 10,
     OPENING_RANGE_MINUTES: 15,
     MAX_OPTION_SPREAD_PERCENT: 1.5,
     MAX_OPTION_LOSS_PERCENT: 35,
@@ -405,6 +406,8 @@ export class UpstoxService {
   }
 
   
+  
+
   private async syncHistoricalCandles() {
     if (!this.settings.accessToken) return;
     try {
@@ -449,6 +452,7 @@ export class UpstoxService {
   }
 
   private async pollData() {
+
     if (this.isPolling) return; // Prevent concurrent/overlapping requests
     if (Date.now() < this.rateLimitBackoffUntil) return; // Wait during rate limit backoff
 

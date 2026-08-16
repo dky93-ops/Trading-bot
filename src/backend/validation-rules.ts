@@ -439,6 +439,7 @@ export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSe
 
 export function runSetupValidation(ctx: ValidationContext, setup: ProposedSetup, validLevels: number[], testCount: number = 0): RuleResult {
   const checks = [
+    rule20MarketFilters(ctx, setup),
     rule2OpeningFilter(ctx.timeStr, setup),
     rule5MarketStructure(ctx.sessState, setup),
     rule6FailedLevel(ctx.sessState, setup),

@@ -140,6 +140,7 @@ export interface SignalPrices {
   spotTarget2: number;
   optionEntry: number;
   optionStoploss: number;
+  initialOptionRisk?: number;
   optionTarget1: number;
   optionTarget2: number;
 }
