@@ -883,13 +883,17 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
     const fetchExpiries = async () => {
       try {
         const res = await fetch(`/api/expirys?instrument=${encodeURIComponent(instrument)}`);
-        const json = await res.json();
-        if (json.expirys && json.expirys.length > 0) {
-          setExpirys(json.expirys);
-          setExpiry(json.expirys[0]);
+        if (!res.ok) return;
+        const contentType = res.headers.get("content-type");
+        if (contentType && contentType.indexOf("application/json") !== -1) {
+          const json = await res.json();
+          if (json.expirys && json.expirys.length > 0) {
+            setExpirys(json.expirys);
+            setExpiry(json.expirys[0]);
+          }
         }
       } catch (e) {
-        console.error("Error fetching expiries:", e);
+        // Ignore network errors smoothly
       }
     };
     fetchExpiries();
@@ -941,20 +945,34 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
     setNewsLoading(true);
     try {
       const res = await fetch('/api/market-news');
-      const json = await res.json();
-      if (json.news) {
-        setNewsList(json.news);
+      if (!res.ok) return;
+      const contentType = res.headers.get("content-type");
+      if (contentType && contentType.indexOf("application/json") !== -1) {
+        const json = await res.json();
+        if (json.news) {
+          setNewsList(json.news);
+        }
       }
     } catch (e) {
-      console.error("News fetch error", e);
+      // Ignore network errors smoothly
+    } finally {
+      setNewsLoading(false);
     }
-    setNewsLoading(false);
   };
 
   const fetchData = async () => {
     setLoading(true);
     try {
       const res = await fetch(`/api/option-chain?instrument=${encodeURIComponent(instrument)}&expiry=${encodeURIComponent(expiry)}`);
+      if (!res.ok) {
+        setFetchError(`Server Error: ${res.status}`);
+        return;
+      }
+      const contentType = res.headers.get("content-type");
+      if (!contentType || contentType.indexOf("application/json") === -1) {
+        // Silently ignore non-JSON responses during server restart
+        return;
+      }
       const json = await res.json();
       if (json && json.status === 'success' && Array.isArray(json.data) && json.data.length > 0) {
         setData(json.data);
@@ -967,10 +985,11 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
         }
       }
     } catch (e: any) {
-      console.error("Error fetching option chain data:", e);
-      setFetchError(e.message || "Failed to reach backend option chain API");
+      // Don't crash UI, just show a temporary fetch error
+      setFetchError("Connection interrupted (server restarting or offline)");
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const toggleCol = (key: keyof typeof columns) => {

@@ -12,15 +12,19 @@ export const OptionChainReplay: React.FC = () => {
     setLoading(true);
     try {
       const res = await fetch('/api/option-chain/history');
-      const data = await res.json();
-      if (data.status === 'success' && Array.isArray(data.snapshots)) {
-        setHistory(data.snapshots);
-        if (data.snapshots.length > 0 && !selectedSnap) {
-          setSelectedSnap(data.snapshots[data.snapshots.length - 1]);
+      if (!res.ok) return;
+      const contentType = res.headers.get("content-type");
+      if (contentType && contentType.indexOf("application/json") !== -1) {
+        const data = await res.json();
+        if (data.status === 'success' && Array.isArray(data.snapshots)) {
+          setHistory(data.snapshots);
+          if (data.snapshots.length > 0 && !selectedSnap) {
+            setSelectedSnap(data.snapshots[data.snapshots.length - 1]);
+          }
         }
       }
     } catch (err: any) {
-      console.error('Failed to fetch option chain history:', err);
+      // Ignore network errors gracefully without crashing the UI
     } finally {
       setLoading(false);
     }

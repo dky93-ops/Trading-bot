@@ -46,6 +46,8 @@ export interface InstrumentData {
 
 export interface AppState {
   optionChainTimestamp: number;
+  spotFeedTimestamp: number;
+  optionChainSnapshotTimestamp: number;
   nifty50: InstrumentData;
   indiaVix: InstrumentData;
   isConnected: boolean;

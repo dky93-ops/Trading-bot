@@ -25,6 +25,8 @@ export type GetOptionChainFn = (instrumentKey: string, expiry: string) => Promis
 export type GetNearestExpiryFn = (instrumentKey: string) => Promise<string>;
 
 import { getCandles } from '../db/market';
+import { calculateConfidence } from './validation-rules';
+import { validateFeedSync } from './feed-validation';
 import {
   normalizeChainRows,
   readHistoricalPremium,
@@ -311,7 +313,8 @@ export class StrategyEngine {
     const sessState = this.sessionStates[index];
     
     // Evaluate feed sync
-    const decisionTimeframe = this.settings.DECISION_TIMEFRAME_MINUTES || 5;
+    const decisionTimeframe = this.settings.DECISION_TIMEFRAME_MINUTES;
+    if (decisionTimeframe !== 1) throw new Error("DECISION_TIMEFRAME_MINUTES must be exactly 1");
     let decisionCandles = await getCandles(index, decisionTimeframe, 200);
     decisionCandles = decisionCandles
       .slice()
@@ -340,16 +343,29 @@ export class StrategyEngine {
     }
     const lastCompletedCandle = candles[candles.length - 1];
     const completedCandleCloseTimestamp = new Date(lastCompletedCandle.timestamp).getTime() + (decisionTimeframe * 60_000);
-    const optionChainTimestamp = Number(this.state.optionChainTimestamp || 0);
-    if (!Number.isFinite(optionChainTimestamp) || optionChainTimestamp <= 0) {
-      return this.createNoTrade(index, spotPrice, 'FAILED_FEED_SYNC: Missing option-chain snapshot timestamp');
+    
+    const syncRes = validateFeedSync({
+      candleStart: new Date(lastCompletedCandle.timestamp).getTime(),
+      candleClose: completedCandleCloseTimestamp,
+      optionSnapshotTimestamp: this.state.optionChainSnapshotTimestamp || 0,
+      nowMs: nowMs,
+      maxSnapshotLagMs: 15_000
+    });
+    if (!syncRes.valid) {
+      return this.createNoTrade(index, spotPrice, syncRes.reason || 'FAILED_FEED_SYNC');
     }
-    const feedDeltaMs = Math.abs(optionChainTimestamp - completedCandleCloseTimestamp);
-    if (feedDeltaMs > 15_000) {
-      return this.createNoTrade(index, spotPrice, `FAILED_FEED_SYNC: Spot/option-chain delta ${feedDeltaMs}ms > 15000ms`);
-    }
+
+
+
+    const feedDeltaMs = Math.abs((this.state.optionChainSnapshotTimestamp || 0) - completedCandleCloseTimestamp);
     const feedSyncConfidencePenalty = feedDeltaMs > 5_000 ? 5 : 0;
     sessState.feedSyncPenalty = feedSyncConfidencePenalty;
+
+    const candleIso = new Date(lastCompletedCandle.timestamp).toISOString();
+    if (sessState.lastProcessedCandleTimestamp === candleIso) {
+        return this.createNoTrade(index, spotPrice, 'NO_TRADE: Already processed this candle');
+    }
+    sessState.lastProcessedCandleTimestamp = candleIso;
     
     // 0. Active trade gate (Rule 28)
     if (sessState.tradeTakenFlag || sessState.noNewTradeFlag) {
@@ -1294,7 +1310,21 @@ export class StrategyEngine {
       return null;
     }
 
-    const conf = 85;
+    
+    const timeWindow = this.getTimeWindow(Date.now());
+    const conf = calculateConfidence({
+      rewardRiskRatio: rewardSpot / riskSpot,
+      premiumExpansion: 1.0,
+      oiState: 1.0,
+      spreadPercent: 1.0, // TODO: Use real spread
+      ivRegime: 1.0,
+      momentum: 1.0,
+      gapState: 0,
+      timeWindow,
+      isExpiryAfter14: false, // TODO
+      feedSyncPenalty: sess.feedSyncPenalty || 0
+    });
+
 
     return {
       id: index + '_' + Date.now(),
@@ -1443,6 +1473,7 @@ export class StrategyEngine {
       signal: 'NO_TRADE',
       strategy_family: 'NONE' as any,
       direction: 'NONE' as any,
+      option_type: 'NONE' as any,
       spot_entry: spot,
       spot_invalidation: 0,
       spot_target1: 0,
@@ -1474,5 +1505,19 @@ export class StrategyEngine {
     this.sessionStates = {};
     this.activeSignals.clear();
     this.history.clear();
+  }
+
+  public getTimeWindow(nowMs: number): string {
+    const d = new Date(nowMs);
+    const h = Number(d.toLocaleString('en-US', { timeZone: 'Asia/Kolkata', hour: 'numeric', hourCycle: 'h23' }));
+    const m = Number(d.toLocaleString('en-US', { timeZone: 'Asia/Kolkata', minute: 'numeric' }));
+    const timeNum = h * 100 + m;
+
+    if (timeNum >= 915 && timeNum < 920) return '09:15-09:20';
+    if (timeNum >= 920 && timeNum < 1000) return '09:20-10:00';
+    if (timeNum >= 1000 && timeNum < 1230) return '10:00-12:30';
+    if (timeNum >= 1230 && timeNum < 1330) return '12:30-13:30';
+    if (timeNum >= 1330 && timeNum < 1500) return '13:30-15:00';
+    return 'POST-15:00';
   }
 }

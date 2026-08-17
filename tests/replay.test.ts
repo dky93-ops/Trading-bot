@@ -62,6 +62,7 @@ describe('Deterministic Replay Harness', () => {
     vi.useFakeTimers();
     settings = {
       isTradingEnabled: true,
+      DECISION_TIMEFRAME_MINUTES: 1,
       maxLossPerDay: 5000,
       maxTradesPerDay: 5,
       maxConsecutiveLosses: 2,

@@ -24,7 +24,7 @@ export class UpstoxService {
     expiryDate: 'CURRENT',
     defaultLotsPerTrade: 1,
     maxActiveTrades: 1,
-    DECISION_TIMEFRAME_MINUTES: 5,
+    DECISION_TIMEFRAME_MINUTES: 1,
     WALL_TOLERANCE_POINTS: 10,
     OPENING_RANGE_MINUTES: 15,
     MAX_OPTION_SPREAD_PERCENT: 1.5,
@@ -62,7 +62,9 @@ export class UpstoxService {
   }
 
   private state: AppState = {
-    optionChainTimestamp: 0, 
+    optionChainTimestamp: 0,
+    spotFeedTimestamp: 0,
+    optionChainSnapshotTimestamp: 0, 
     nifty50: { lastPrice: 0, change: 0, timestamp: 0 },
     indiaVix: { lastPrice: 0, change: 0, timestamp: 0 },
     isConnected: false,
@@ -243,7 +245,7 @@ export class UpstoxService {
   }
 
   updateSettings(newSettings: Partial<AppSettings>) {
-    this.settings = { ...this.settings, ...newSettings };
+    this.settings = { ...this.settings, ...newSettings, DECISION_TIMEFRAME_MINUTES: 1 };
     if (newSettings.accessToken) {
       this.state.apiError = undefined;
     }
@@ -319,6 +321,7 @@ export class UpstoxService {
               
             } else if (instrumentKey.includes('Nifty 50')) {
               this.state.optionChainTimestamp = Date.now();
+              this.state.optionChainSnapshotTimestamp = this.state.optionChainTimestamp;
             }
           }
 
@@ -493,6 +496,7 @@ export class UpstoxService {
             const niftyLast = Number(tick.last_price);
             const niftyTimestamp = Date.now();
             if (Number.isFinite(niftyLast) && niftyLast > 0) {
+              this.state.spotFeedTimestamp = niftyTimestamp;
               this.state.nifty50 = {
                 lastPrice: niftyLast,
                 change: Number(tick.net_change || 0),

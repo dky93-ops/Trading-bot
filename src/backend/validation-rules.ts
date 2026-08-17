@@ -463,3 +463,32 @@ export function runSetupValidation(ctx: ValidationContext, setup: ProposedSetup,
   
   return pass();
 }
+
+export interface ConfidenceInput {
+  rewardRiskRatio: number;
+  premiumExpansion: number;
+  oiState: number;
+  spreadPercent: number;
+  ivRegime: number;
+  momentum: number;
+  gapState: number;
+  timeWindow: string;
+  isExpiryAfter14: boolean;
+  feedSyncPenalty: number;
+}
+
+export function calculateConfidence(input: ConfidenceInput): number {
+  let score = 75; // base score
+
+  if (input.rewardRiskRatio >= 2) score += 10;
+  else if (input.rewardRiskRatio < 1) score -= 20;
+
+  if (input.spreadPercent > (input.isExpiryAfter14 ? 1.5 : 3)) score -= 20;
+  else if (input.spreadPercent < 0.5) score += 5;
+
+  if (input.timeWindow === '10:00-12:30') score += 5;
+  if (input.timeWindow === '09:15-09:20') score -= 30; // 09:15-09:20 needs explicit strong rules
+
+  score -= input.feedSyncPenalty || 0;
+  return Math.max(0, Math.min(100, score));
+}
