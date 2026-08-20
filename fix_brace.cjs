@@ -1,4 +1,7 @@
 const fs = require('fs');
-let code = fs.readFileSync('src/backend/validation-rules.ts', 'utf8');
-code = code.replace(/return pass\(\);\s*\n\/\/ SETUP VALIDATION/, 'return pass();\n}\n\n// SETUP VALIDATION');
-fs.writeFileSync('src/backend/validation-rules.ts', code);
+let code = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
+
+// I will just add an extra '}' right before private findCandidateOIWalls
+code = code.replace(/  private findCandidateOIWalls\(/, '  }\n  private findCandidateOIWalls(');
+fs.writeFileSync('src/backend/strategy-engine.ts', code);
+console.log('fixed brace');

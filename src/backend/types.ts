@@ -27,6 +27,7 @@ export interface AppSettings {
     continuationBreakdown: StrategyConfig;
     continuationBreakout: StrategyConfig;
     oiWallRejection: StrategyConfig;
+    technicalConfluence?: StrategyConfig;
   };
 }
 
@@ -150,7 +151,7 @@ export interface SignalPrices {
 export interface EngineDecision {
   timestamp: string;
   signal: 'BUY_CALL' | 'BUY_PUT' | 'NO_TRADE';
-  strategy_family: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION' | 'NONE';
+  strategy_family: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION' | 'TECHNICAL_CONFLUENCE' | 'NONE';
   direction: 'CALL' | 'PUT' | 'NONE';
   spot?: number;
   broken_level?: number;

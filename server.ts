@@ -43,6 +43,21 @@ async function startServer() {
   });
 
   // Settings API
+  
+  app.get("/api/candles", async (req, res) => {
+    try {
+      const instrument = req.query.instrument || 'NIFTY';
+      const timeframe = Number(req.query.timeframe) || 1;
+      const limit = Number(req.query.limit) || 100;
+      
+      const { getCandles } = await import("./src/db/market.ts");
+      const candles = await getCandles(instrument.toString(), timeframe, limit);
+      res.json(candles);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   app.get('/api/settings', (_req, res) => {
     res.json(upstoxService.getPublicSettings());
   });

@@ -1,2 +1,8 @@
 const fs = require('fs');
-// Let's just fix everything that tsc complains about next.
+let code = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
+
+code = code.replace(/passedFilters/g, 'passed');
+code = code.replace(/failedFilters/g, 'failed');
+
+fs.writeFileSync('src/backend/strategy-engine.ts', code);
+console.log('fixed all');

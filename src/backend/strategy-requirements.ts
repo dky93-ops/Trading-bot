@@ -3,7 +3,8 @@ export type StrategyName =
   | 'FAILED_RETEST'
   | 'CONTINUATION_BREAKDOWN'
   | 'CONTINUATION_BREAKOUT'
-  | 'OI_WALL_REJECTION';
+  | 'OI_WALL_REJECTION'
+  | 'TECHNICAL_CONFLUENCE';
 
 export type RequirementStatus =
   | 'IMPLEMENTED'
@@ -92,6 +93,14 @@ export const STRATEGY_REQUIREMENTS: StrategyRequirement[] = [
     status: 'IMPLEMENTED',
     testName: 'global feed validation',
     source: 'validation-rules.ts/runGlobalPreChecks',
+  },
+  {
+    id: 'TC-01',
+    strategy: 'TECHNICAL_CONFLUENCE',
+    description: 'Votes from RSI, MACD, EMA, BB, and SuperTrend must exceed the opposite votes.',
+    status: 'IMPLEMENTED',
+    testName: 'technical confluence voting',
+    source: 'strategy-engine.ts/checkTechnicalConfluence',
   },
 ];
 

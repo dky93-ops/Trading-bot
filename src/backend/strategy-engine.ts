@@ -1,3 +1,4 @@
+import { computeEMA, computeSMA, computeRSI, computeMACD, computeBollinger, computeATR, computeSuperTrend } from './technical-indicators';
 import {
   AppSettings,
   AppState,
@@ -381,8 +382,8 @@ export class StrategyEngine {
     }
     
     let chainRows: any[] = [];
-    const passedFilters: string[] = [];
-    const failedFilters: string[] = [];
+    const passed: string[] = [];
+    const failed: string[] = [];
 
     if (this.getOptionChain) {
       try {
@@ -401,7 +402,7 @@ export class StrategyEngine {
 
         chainRows = normalizeChainRows(chainResponse);
       } catch (error) {
-        failedFilters.push(
+        failed.push(
           `FAILED_OPTION_CHAIN: ${
             error instanceof Error ? error.message : String(error)
           }`,
@@ -540,7 +541,9 @@ export class StrategyEngine {
       !selectedSignal &&
       this.settings.strategies?.openingTrap?.enabled
     ) {
-      selectedSignal = await this.checkOpeningTrap(
+      selectedSignal = await this.checkTechnicalConfluence(valCtx, index, spotPrice, candles, rows, sessState, passed, failed);
+      if (!selectedSignal) {
+        selectedSignal = await this.checkOpeningTrap(
         valCtx,
         index,
         spotPrice,
@@ -549,8 +552,8 @@ export class StrategyEngine {
         sessState,
         nearestCeWallAbove,
         nearestPeWallBelow,
-        passedFilters,
-        failedFilters,
+        passed,
+        failed,
       );
     }
 
@@ -569,8 +572,8 @@ export class StrategyEngine {
           sessState,
           nearestCeWallAbove,
           nearestPeWallBelow,
-          passedFilters,
-          failedFilters,
+          passed,
+          failed,
         );
 
         if (selectedSignal) break;
@@ -593,8 +596,8 @@ export class StrategyEngine {
           sessState,
           nearestCeWallAbove,
           nearestPeWallBelow,
-          passedFilters,
-          failedFilters,
+          passed,
+          failed,
         );
 
         if (selectedSignal) break;
@@ -617,8 +620,8 @@ export class StrategyEngine {
           sessState,
           nearestCeWallAbove,
           nearestPeWallBelow,
-          passedFilters,
-          failedFilters,
+          passed,
+          failed,
         );
 
         if (selectedSignal) break;
@@ -638,8 +641,8 @@ export class StrategyEngine {
         sessState,
         nearestCeWallAbove,
         nearestPeWallBelow,
-        passedFilters,
-        failedFilters,
+        passed,
+        failed,
       );
     }
 
@@ -649,9 +652,10 @@ export class StrategyEngine {
       return selectedSignal;
     }
     
-    return this.createNoTrade(index, spotPrice, failedFilters.join(', '));
+    return this.createNoTrade(index, spotPrice, failed.join(', '));
   }
 
+  }
   private findCandidateOIWalls(chainRows: any[], spot: number, sess: LocalSessionState) {
     const candidateCEWallsList: any[] = [];
     const candidatePEWallsList: any[] = [];
@@ -708,6 +712,126 @@ export class StrategyEngine {
     }
 
     return { candidateCEWallsList, candidatePEWallsList };
+  }
+
+  
+  private async checkTechnicalConfluence(
+    valCtx: ValidationContext,
+    index: string,
+    spot: number,
+    candles: Candle[],
+    chainRows: any[],
+    sess: LocalSessionState,
+    passed: string[],
+    failed: string[],
+  ): Promise<InternalSignal | null> {
+    if (candles.length < 50) return null; // Need enough history for EMA50
+    
+    const closes = candles.map(c => c.close);
+    const highs = candles.map(c => c.high);
+    const lows = candles.map(c => c.low);
+    
+    const rsiArr = computeRSI(closes, 14);
+    const { macdLine, signalLine } = computeMACD(closes);
+    const ema9 = computeEMA(closes, 9);
+    const ema21 = computeEMA(closes, 21);
+    const { upper, lower } = computeBollinger(closes);
+    const { stLine, direction: stDir } = computeSuperTrend(highs, lows, closes);
+    
+    const lastIdx = closes.length - 1;
+    const rsi = rsiArr[lastIdx];
+    const macd = macdLine[lastIdx];
+    const macdSig = signalLine[lastIdx];
+    const e9 = ema9[lastIdx];
+    const e21 = ema21[lastIdx];
+    const bbUpper = upper[lastIdx];
+    const bbLower = lower[lastIdx];
+    const stDirection = stDir[lastIdx];
+    const close = closes[lastIdx];
+    
+    let buyVotes = 0;
+    let sellVotes = 0;
+    let totalVotes = 5; // RSI, MACD, EMA, BB, SuperTrend
+    
+    if (!isNaN(rsi)) {
+      if (rsi < 30) buyVotes++;
+      else if (rsi > 70) sellVotes++;
+    }
+    
+    if (!isNaN(macd) && !isNaN(macdSig)) {
+      if (macd > macdSig) buyVotes++;
+      else sellVotes++;
+    }
+    
+    if (!isNaN(e9) && !isNaN(e21)) {
+      if (e9 > e21) buyVotes++;
+      else sellVotes++;
+    }
+    
+    if (!isNaN(bbUpper) && !isNaN(bbLower)) {
+      if (close < bbLower) buyVotes++;
+      else if (close > bbUpper) sellVotes++;
+    }
+    
+    if (!isNaN(stDirection)) {
+      if (stDirection === 1) buyVotes++;
+      else sellVotes++;
+    }
+    
+    let signalDirection: 'CALL' | 'PUT' | null = null;
+    
+    if (buyVotes > sellVotes && buyVotes >= 3) {
+      signalDirection = 'CALL';
+    } else if (sellVotes > buyVotes && sellVotes >= 3) {
+      signalDirection = 'PUT';
+    }
+    
+    if (!signalDirection) return null;
+    
+    const type = signalDirection === 'CALL' ? 'CE' : 'PE';
+    const option = this.selectStrike(signalDirection, spot, chainRows);
+    if (!option) return null;
+    
+    const level = close; // Using current spot as reference level
+    
+    const targets = this.computeSpotTargets(signalDirection, spot, level, chainRows, sess);
+    if (!targets) return null;
+    
+    const setup: ProposedSetup = {
+      direction: signalDirection,
+      level,
+      setupType: 'TECHNICAL_CONFLUENCE',
+      c0: candles[lastIdx],
+      c1: candles[lastIdx - 1],
+      c2: candles[lastIdx - 2],
+      target1: targets.target1Spot,
+      target2: targets.target2Spot,
+      stopLoss: targets.structuralStopSpot,
+      breakCandleIndex: lastIdx,
+      retestCandleIndex: lastIdx,
+      confirmationCandleIndex: lastIdx,
+      premiumAtBreak: Number(option.price) || 0,
+      premiumAtRetestLow: Number(option.price) || 0,
+      premiumAtConfirmation: Number(option.price) || 0,
+      ceOpt: signalDirection === 'CALL' ? option : undefined,
+      peOpt: signalDirection === 'PUT' ? option : undefined,
+    };
+    
+    if (!this.validateCandidate(valCtx, setup, passed, failed)) return null;
+    
+    passed.push("TECHNICAL_CONFLUENCE: Buy Votes " + buyVotes + ", Sell Votes " + sellVotes);
+    
+    return this.createSignal(
+      index,
+      spot,
+      'TECHNICAL_CONFLUENCE',
+      signalDirection,
+      level,
+      chainRows,
+      sess,
+      passed,
+      failed,
+    );
   }
 
   private async checkOpeningTrap(

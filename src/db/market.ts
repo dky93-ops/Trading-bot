@@ -114,7 +114,8 @@ export async function seedHistoricalCandles(instrument: string, timeframe: numbe
         open: c[1],
         high: c[2],
         low: c[3],
-        close: c[4]
+        close: c[4],
+        volume: Number.isFinite(c[5]) ? c[5] : 0,
       };
     });
     
@@ -131,13 +132,14 @@ export async function seedHistoricalCandles(instrument: string, timeframe: numbe
          aggregated.set(bucketStartMs, {
            instrument, timeframe,
            timestamp: new Date(bucketStartMs),
-           open: c.open, high: c.high, low: c.low, close: c.close
+           open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume
          });
        } else {
          const existing = aggregated.get(bucketStartMs);
          existing.high = Math.max(existing.high, c.high);
          existing.low = Math.min(existing.low, c.low);
          existing.close = c.close;
+         existing.volume += c.volume;
        }
     }
 
@@ -154,6 +156,14 @@ export async function seedHistoricalCandles(instrument: string, timeframe: numbe
 
       if (existing.length === 0) {
         await db.insert(candles).values(val);
+      } else {
+        await db.update(candles).set({
+          open: val.open,
+          high: val.high,
+          low: val.low,
+          close: val.close,
+          volume: val.volume,
+        }).where(eq(candles.id, existing[0].id));
       }
     }
   } catch(e) {

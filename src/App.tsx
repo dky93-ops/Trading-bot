@@ -1,3 +1,4 @@
+import { LiveChart } from './components/LiveChart';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -319,8 +320,16 @@ export default function App() {
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 flex-1">
                   <StatBox title="NET REALIZED P&L" value={`+₹${Math.max(0, state.overallPnL || 0).toLocaleString()}`} sub="Across active strategies" color={state.overallPnL >= 0 ? "green" : "red"} large />
                   <StatBox title="OVERALL WIN RATE" value={`${(state.winRate || 0).toFixed(0)}%`} sub={`${state.winningTrades || 0} wins out of ${state.totalTrades || 0} trades`} color="green" large />
-                  <StatBox title="ACTIVE STRATEGIES" value={`${settings?.isTradingEnabled ? enabledStrategiesCount : 0} / 5`} sub={settings?.isTradingEnabled ? `${enabledStrategiesCount} Modules Enabled` : "Trading Paused"} color={settings?.isTradingEnabled && enabledStrategiesCount > 0 ? "blue" : "gray"} large />
+                  <StatBox title="ACTIVE STRATEGIES" value={`${settings?.isTradingEnabled ? enabledStrategiesCount : 0} / 6`} sub={settings?.isTradingEnabled ? `${enabledStrategiesCount} Modules Enabled` : "Trading Paused"} color={settings?.isTradingEnabled && enabledStrategiesCount > 0 ? "blue" : "gray"} large />
                   <StatBox title="OPEN POSITIONS" value={`${activeTradesCount}`} sub="Active Trades Running" color={activeTradesCount > 0 ? "purple" : "gray"} large />
+                </div>
+              </div>
+
+              {/* Live Candlestick Chart */}
+              <div className="bg-[#111827] rounded-lg border border-[#1F2937] overflow-hidden h-96 p-4 flex flex-col">
+                <h3 className="text-lg font-bold text-white mb-4">NIFTY 50 Live Intraday (1m)</h3>
+                <div className="flex-1 min-h-0">
+                  <LiveChart livePrice={state.nifty50?.lastPrice} instrument="NIFTY" />
                 </div>
               </div>
 
@@ -355,7 +364,8 @@ export default function App() {
                         { id: 'continuationBreakdown', familyKey: 'CONTINUATION_BREAKDOWN', name: '2. Continuation Breakdown (CONTINUATION_BREAKDOWN)', desc: 'Priority 2 | Trades bearish continuation after level breakdown and consolidation pause.', rr: '>= 0.8R to 1.5R' },
                         { id: 'continuationBreakout', familyKey: 'CONTINUATION_BREAKOUT', name: '3. Continuation Breakout (CONTINUATION_BREAKOUT)', desc: 'Priority 3 | Trades bullish continuation after level breakout and consolidation pause.', rr: '>= 0.8R to 1.5R' },
                         { id: 'openingTrap', familyKey: 'OPENING_TRAP', name: '4. Opening Breakout Trap (OPENING_TRAP)', desc: 'Priority 4 | Catches opening range fake breakouts/breakdowns upon retest confirmation.', rr: '>= 0.8R to 1.0R' },
-                        { id: 'oiWallRejection', familyKey: 'OI_WALL_REJECTION', name: '5. OI Wall Rejection (OI_WALL_REJECTION)', desc: 'Priority 5 | Rejection trades when 1.5x dominant OI walls reject price 2+ times & begin unwinding.', rr: '>= 0.8R to 1.2R' },
+                                                { id: 'oiWallRejection', familyKey: 'OI_WALL_REJECTION', name: '5. OI Wall Rejection (OI_WALL_REJECTION)', desc: 'Priority 5 | Rejection trades when 1.5x dominant OI walls reject price 2+ times & begin unwinding.', rr: '>= 0.8R to 1.2R' },
+                        { id: 'technicalConfluence', familyKey: 'TECHNICAL_CONFLUENCE', name: '6. Technical Confluence (TECHNICAL_CONFLUENCE)', desc: 'Priority 1 | Trades based on technical indicators (RSI, MACD, EMA, BB, SuperTrend) voting consensus.', rr: '>= 1.0R' },
                       ].map(strat => {
                         const isEnabled = !!settings?.strategies?.[strat.id]?.enabled;
                         const toggleStrat = () => {
@@ -677,7 +687,8 @@ export default function App() {
                   { key: 'continuationBreakdown', name: '2. Continuation Breakdown (CONTINUATION_BREAKDOWN)', desc: 'Priority 2 | Trades bearish continuation after level breakdown and 1-4 candle consolidation pause.', win: '10:00 - 12:30 & 13:30 - 15:00', rr: '>= 0.8R to 1.5R' },
                   { key: 'continuationBreakout', name: '3. Continuation Breakout (CONTINUATION_BREAKOUT)', desc: 'Priority 3 | Trades bullish continuation after level breakout and 1-4 candle consolidation pause.', win: '10:00 - 12:30 & 13:30 - 15:00', rr: '>= 0.8R to 1.5R' },
                   { key: 'openingTrap', name: '4. Opening Breakout Trap (OPENING_TRAP)', desc: 'Priority 4 | Catches early fake breaks and reversals at ORH / ORL upon retest confirmation.', win: '09:30 - 10:30 IST', rr: '>= 0.8R to 1.0R' },
-                  { key: 'oiWallRejection', name: '5. OI Wall Rejection (OI_WALL_REJECTION)', desc: 'Priority 5 | Rejection trades when 1.5x dominant OI walls reject spot price at least 2 times.', win: 'Any (Post Wall Rejection)', rr: '>= 0.8R to 1.2R' }
+                                    { key: 'oiWallRejection', name: '5. OI Wall Rejection (OI_WALL_REJECTION)', desc: 'Priority 5 | Rejection trades when 1.5x dominant OI walls reject spot price at least 2 times.', win: 'Any (Post Wall Rejection)', rr: '>= 0.8R to 1.2R' },
+                  { key: 'technicalConfluence', name: '6. Technical Confluence (TECHNICAL_CONFLUENCE)', desc: 'Priority 1 | Trading signals generated by technical indicators (RSI, MACD, EMA, Bollinger Bands, SuperTrend) voting consensus.', win: 'Any (Trend Direction)', rr: '>= 1.0R' }
                 ].map(({ key, name, desc, win, rr }) => {
                   const config = settings.strategies?.[key] || { enabled: true, lotSize: 1 };
 

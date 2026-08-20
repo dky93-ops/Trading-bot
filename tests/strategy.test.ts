@@ -29,7 +29,8 @@ describe('StrategyEngine tests', () => {
         failedRetest: { enabled: true, lotSize: 1 },
         continuationBreakout: { enabled: true, lotSize: 1 },
         continuationBreakdown: { enabled: true, lotSize: 1 },
-        oiWallRejection: { enabled: true, lotSize: 1 }
+        oiWallRejection: { enabled: true, lotSize: 1 },
+        technicalConfluence: { enabled: true, lotSize: 1 }
       }
     };
     const mockState = {
