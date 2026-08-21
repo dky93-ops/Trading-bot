@@ -269,6 +269,9 @@ export interface OptionChainSnapshot {
   maxCallOIStrike: number;
   maxPutOIStrike: number;
   strikeCount: number;
+  indexCandles?: any[];
+  ceWalls?: any[];
+  peWalls?: any[];
   rows: Array<{
     strike?: number;
     spot?: number;

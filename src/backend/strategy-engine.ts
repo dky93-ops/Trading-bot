@@ -9,6 +9,7 @@ import {
   OptionChainSnapshot
 } from './types';
 import { runGlobalPreChecks, runSetupValidation, ValidationContext, ProposedSetup } from './validation-rules';
+import { StrategySignalsGenerator } from './strategy-signals-generator.js';
 
 export type LocalSessionState = StrategySessionState;
 
@@ -892,6 +893,8 @@ export class StrategyEngine {
           sess,
           passed,
           failed,
+          setup,
+          candles
         );
       }
     }
@@ -989,6 +992,8 @@ export class StrategyEngine {
         sess,
         passed,
         failed,
+        setup,
+        candles
       );
     }
     return null;
@@ -1154,6 +1159,8 @@ export class StrategyEngine {
             sess,
             passed,
             failed,
+            setup,
+            candles
           );
         }
       }
@@ -1296,6 +1303,8 @@ export class StrategyEngine {
             sess,
             passed,
             failed,
+            setup,
+            candles
           );
         }
       }
@@ -1441,6 +1450,8 @@ export class StrategyEngine {
     sess: LocalSessionState,
     passed: string[],
     failed: string[],
+    setup: ProposedSetup,
+    candles: Candle[]
   ): InternalSignal | null {
     const targets = this.computeSpotTargets(direction, spot, brokenLevel, chainRows, sess);
     if (!targets) return null;
@@ -1476,7 +1487,6 @@ export class StrategyEngine {
       return null;
     }
 
-    
     const timeWindow = this.getTimeWindow(Date.now());
     const conf = calculateConfidence({
       rewardRiskRatio: rewardSpot / riskSpot,
@@ -1491,6 +1501,39 @@ export class StrategyEngine {
       feedSyncPenalty: sess.feedSyncPenalty || 0
     });
 
+    const optionData = {
+      price: opt.price,
+      instrumentKey: opt.instrumentKey,
+    };
+
+    let signal: InternalSignal | null = null;
+    switch (setupType) {
+      case 'OPENING_TRAP':
+        signal = StrategySignalsGenerator.generateOpeningTrapSignal(
+          index, spot, brokenLevel, direction, candles, setup, optionData, conf, passed
+        );
+        break;
+      case 'FAILED_RETEST':
+        signal = StrategySignalsGenerator.generateFailedRetestSignal(
+          index, spot, brokenLevel, direction, candles, setup, optionData, conf, passed
+        );
+        break;
+      case 'CONTINUATION_BREAKOUT':
+      case 'CONTINUATION_BREAKDOWN':
+        signal = StrategySignalsGenerator.generateContinuationSignal(
+          index, spot, brokenLevel, direction, setupType as any, candles, setup, optionData, conf, passed
+        );
+        break;
+      case 'OI_WALL_REJECTION':
+        signal = StrategySignalsGenerator.generateWallRejectionSignal(
+          index, spot, brokenLevel, direction, candles, setup, optionData, conf, passed
+        );
+        break;
+    }
+
+    if (signal) {
+      return signal;
+    }
 
     return {
       id: index + '_' + Date.now(),

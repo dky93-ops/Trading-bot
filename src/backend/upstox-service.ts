@@ -4,7 +4,10 @@ import fs from 'fs';
 import path from 'path';
 import { StrategyEngine } from './strategy-engine.js';
 import { AppSettings, AppState, OptionChainSnapshot, TradingSymbol, InternalSignal } from './types.js';
-import { insertTick, seedHistoricalCandles } from '../db/market.js';
+import { insertTick, seedHistoricalCandles, getCandles } from '../db/market.js';
+import { EnhancedDataManager } from './enhanced-data-manager.js';
+import { EnhancedOptionChainRecorder } from './enhanced-option-chain-recorder.js';
+import { UpstoxDataFetcher } from './upstox-data-fetcher.js';
 
 export class UpstoxService {
   private wss: WebSocketServer;
@@ -13,6 +16,9 @@ export class UpstoxService {
   private oneMinRecorderInterval: NodeJS.Timeout | null = null;
   private strategyEngine: StrategyEngine;
   public optionChainHistory: OptionChainSnapshot[] = [];
+  public dataManager: EnhancedDataManager = new EnhancedDataManager();
+  public enhancedRecorder: EnhancedOptionChainRecorder = new EnhancedOptionChainRecorder();
+  public dataFetcher: UpstoxDataFetcher | null = null;
   private historyFilePath = path.join(process.cwd(), 'data', 'option_chain_history.json');
   
   private settings: AppSettings = {
@@ -206,6 +212,10 @@ export class UpstoxService {
       this.getOptionChainHistory.bind(this)
     );
 
+    if (this.settings.accessToken) {
+      this.dataFetcher = new UpstoxDataFetcher(this.settings.accessToken, this.dataManager);
+    }
+
     // Load recorded 1-minute option chain history from disk
     this.loadOptionChainHistoryFromDisk();
     
@@ -337,7 +347,7 @@ export class UpstoxService {
           this.optionChainCache[cacheKey] = { timestamp: Date.now(), data: result };
 
           // Record snapshot for backtest / analysis replay
-          this.recordOptionChainSnapshot(instrumentKey, expiryDate, rawRows);
+          this.recordOptionChainSnapshot(instrumentKey, expiryDate, rawRows).catch(console.error);
 
           return result;
         }
@@ -425,6 +435,10 @@ export class UpstoxService {
       const decisionMinutes = Number(
         this.settings.DECISION_TIMEFRAME_MINUTES || 5,
       );
+
+      if (this.dataFetcher) {
+        await this.dataFetcher.fetchHistoricalCandles('NSE_INDEX|Nifty 50', [1, 3, 5, 15, 60]);
+      }
 
       const response = await axios.get(
         `https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/${decisionMinutes}`,
@@ -647,7 +661,15 @@ export class UpstoxService {
     this.broadcastState();
   }
 
-  private recordOptionChainSnapshot(instrumentKey: string, expiryDate: string, rawRows: any[]) {
+  private async recordOptionChainSnapshot(instrumentKey: string, expiryDate: string, rawRows: any[]) {
+    const nowMs = Date.now();
+    let spot = 0;
+    for (const r of rawRows) {
+      if (r.underlying_spot_price) spot = r.underlying_spot_price;
+    }
+    this.enhancedRecorder.recordSnapshot(instrumentKey, expiryDate, rawRows, spot, nowMs);
+    this.dataFetcher?.recordOptionChainData(rawRows);
+    
     const finiteNumber = (value: unknown): number | undefined => {
       const n = Number(value);
       return Number.isFinite(n) ? n : undefined;
@@ -657,8 +679,10 @@ export class UpstoxService {
       const greeks = raw?.option_greeks || {};
       return {
         ltp: finiteNumber(md.ltp ?? md.last_price),
-        bid: finiteNumber(md.bid_price),
-        ask: finiteNumber(md.ask_price),
+        bidPrice: finiteNumber(md.bid_price),
+        askPrice: finiteNumber(md.ask_price),
+        bidQty: finiteNumber(md.bid_qty),
+        askQty: finiteNumber(md.ask_qty),
         totalOi: finiteNumber(md.oi ?? md.total_oi ?? md.totalOi),
         oiChange: finiteNumber(md.oi_change ?? md.oiChange),
         volume: finiteNumber(md.volume),
@@ -718,6 +742,43 @@ export class UpstoxService {
 
       // Enforce 1-minute recording interval (>= 50 seconds apart)
       if (!lastSnap || (nowMs - lastSnap.timestamp >= 50000)) {
+        const indexCandles = await getCandles('NIFTY', 1, 100).catch(() => []);
+        
+        const ceWalls: any[] = [];
+        const peWalls: any[] = [];
+
+        const getOI = (row: any, side: 'CE' | 'PE') => {
+          const opt = side === 'CE' ? row?.call_options : row?.put_options;
+          const md = opt?.market_data;
+          return Number(md?.oi ?? md?.total_oi ?? md?.totalOi ?? 0);
+        };
+
+        for (let i = 2; i <= rawRows.length - 3; i++) {
+          const r = rawRows[i];
+          const strike = r.strike_price;
+          
+          const ceOI = getOI(r, 'CE');
+          const peOI = getOI(r, 'PE');
+
+          const ceSurrounding = [
+            getOI(rawRows[i - 2], 'CE'), getOI(rawRows[i - 1], 'CE'),
+            getOI(rawRows[i + 1], 'CE'), getOI(rawRows[i + 2], 'CE')
+          ];
+          const ceAvg = ceSurrounding.reduce((a, b) => a + b, 0) / 4;
+          if (ceAvg > 0 && ceOI > ceAvg * 1.5) {
+            ceWalls.push({ strike, oi: ceOI, avg: ceAvg, strength: ceOI / ceAvg });
+          }
+
+          const peSurrounding = [
+            getOI(rawRows[i - 2], 'PE'), getOI(rawRows[i - 1], 'PE'),
+            getOI(rawRows[i + 1], 'PE'), getOI(rawRows[i + 2], 'PE')
+          ];
+          const peAvg = peSurrounding.reduce((a, b) => a + b, 0) / 4;
+          if (peAvg > 0 && peOI > peAvg * 1.5) {
+            peWalls.push({ strike, oi: peOI, avg: peAvg, strength: peOI / peAvg });
+          }
+        }
+
         const snap: OptionChainSnapshot = {
           id: `OC_1M_${nowMs}`,
           timestamp: nowMs,
@@ -731,6 +792,9 @@ export class UpstoxService {
           maxCallOIStrike: maxCallStrike,
           maxPutOIStrike: maxPutStrike,
           strikeCount: rawRows.length,
+          indexCandles,
+          ceWalls,
+          peWalls,
           rows: rawRows.map((r: any) => ({
             strike: r.strike_price,
             spot: r.underlying_spot_price,
