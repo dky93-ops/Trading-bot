@@ -7,6 +7,7 @@
 | CONTINUATION_BREAKOUT | PASS |
 | CONTINUATION_BREAKDOWN | PASS |
 | OI_WALL_REJECTION | PASS |
+| TECHNICAL_CONFLUENCE | PASS |
 
 **Unresolved requirements:** 0
 **Unresolved assumptions:** 0

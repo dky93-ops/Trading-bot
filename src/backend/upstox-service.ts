@@ -24,7 +24,7 @@ export class UpstoxService {
     expiryDate: 'CURRENT',
     defaultLotsPerTrade: 1,
     maxActiveTrades: 1,
-    DECISION_TIMEFRAME_MINUTES: 1,
+    DECISION_TIMEFRAME_MINUTES: 5,
     WALL_TOLERANCE_POINTS: 10,
     OPENING_RANGE_MINUTES: 15,
     MAX_OPTION_SPREAD_PERCENT: 1.5,
@@ -248,7 +248,11 @@ export class UpstoxService {
   }
 
   updateSettings(newSettings: Partial<AppSettings>) {
-    this.settings = { ...this.settings, ...newSettings, DECISION_TIMEFRAME_MINUTES: 1 };
+    this.settings = {
+      ...this.settings,
+      ...newSettings,
+      DECISION_TIMEFRAME_MINUTES: 5,
+    };
     if (newSettings.accessToken) {
       this.state.apiError = undefined;
     }
@@ -418,18 +422,23 @@ export class UpstoxService {
     if (!this.settings.accessToken) return;
     if (Date.now() < this.candleSyncBackoffUntil) return;
     try {
+      const decisionMinutes = Number(
+        this.settings.DECISION_TIMEFRAME_MINUTES || 5,
+      );
+
       const response = await axios.get(
-        'https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/1',
+        `https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/${decisionMinutes}`,
         {
           headers: {
-            'Accept': 'application/json',
-            'Authorization': `Bearer ${this.settings.accessToken}`
+            Accept: 'application/json',
+            Authorization: `Bearer ${this.settings.accessToken}`,
           },
-          timeout: 5000
-        }
+          timeout: 5000,
+        },
       );
       if (response.data && response.data.status === 'success' && response.data.data && response.data.data.candles) {
         const rawCandles = response.data.data.candles;
+        await seedHistoricalCandles('NIFTY', decisionMinutes, rawCandles);
         await seedHistoricalCandles('NIFTY', 1, rawCandles);
         await seedHistoricalCandles('NIFTY', 3, rawCandles);
         await seedHistoricalCandles('NIFTY', 5, rawCandles);
@@ -673,8 +682,21 @@ export class UpstoxService {
       let maxPutStrike = 0;
 
       for (const r of rawRows) {
-        const coi = r.call_options?.market_data?.oi || 0;
-        const poi = r.put_options?.market_data?.oi || 0;
+        const coi = Number(
+          r.call_options?.market_data?.oi ??
+          r.call_options?.market_data?.total_oi ??
+          r.call_options?.market_data?.totalOi,
+        );
+        const poi = Number(
+          r.put_options?.market_data?.oi ??
+          r.put_options?.market_data?.total_oi ??
+          r.put_options?.market_data?.totalOi,
+        );
+
+        if (!Number.isFinite(coi) || !Number.isFinite(poi)) {
+          return;
+        }
+
         totalCallOI += coi;
         totalPutOI += poi;
         if (coi > maxCallOI) {

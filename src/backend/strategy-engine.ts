@@ -75,6 +75,71 @@ export class StrategyEngine {
     }
   }
 
+  private prepareSessionLevels(candles: Candle[], now: Date, sess: LocalSessionState): void {
+    const getISTDate = (d: Date | string | number) => {
+      const dt = new Date(d);
+      return dt.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    };
+
+    const currentSessionDate = getISTDate(now);
+    sess.sessionDateIST = currentSessionDate;
+
+    // Group completed candles by IST session date
+    const candlesByDate: Record<string, Candle[]> = {};
+    for (const c of candles) {
+      const d = getISTDate(c.timestamp);
+      if (!candlesByDate[d]) candlesByDate[d] = [];
+      candlesByDate[d].push(c);
+    }
+
+    const todayCandles = (candlesByDate[currentSessionDate] || []).sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+
+    if (todayCandles.length > 0) {
+      sess.sessionHigh = Math.max(...todayCandles.map((c) => c.high));
+      sess.sessionLow = Math.min(...todayCandles.map((c) => c.low));
+    } else {
+      sess.sessionHigh = 0;
+      sess.sessionLow = Infinity;
+    }
+
+    // Previous day levels from the most recent prior trading session
+    const priorDates = Object.keys(candlesByDate)
+      .filter((d) => d < currentSessionDate)
+      .sort();
+
+    if (priorDates.length > 0) {
+      const lastPriorDate = priorDates[priorDates.length - 1];
+      const priorCandles = candlesByDate[lastPriorDate];
+      if (priorCandles && priorCandles.length >= 75) {
+        sess.previousDayHigh = Math.max(...priorCandles.map((c) => c.high));
+        sess.previousDayLow = Math.min(...priorCandles.map((c) => c.low));
+      } else if (priorCandles && priorCandles.length > 0) {
+        sess.previousDayHigh = Math.max(...priorCandles.map((c) => c.high));
+        sess.previousDayLow = Math.min(...priorCandles.map((c) => c.low));
+      } else {
+        sess.previousDayHigh = 0;
+        sess.previousDayLow = 0;
+      }
+    } else {
+      sess.previousDayHigh = 0;
+      sess.previousDayLow = 0;
+    }
+
+    // Opening range from first three completed 5-minute candles of current session (09:15-09:30)
+    const openingCandles = todayCandles.slice(0, 3);
+    if (openingCandles.length === 3) {
+      sess.openingRangeComplete = true;
+      sess.openingRangeHigh = Math.max(...openingCandles.map((c) => c.high));
+      sess.openingRangeLow = Math.min(...openingCandles.map((c) => c.low));
+    } else {
+      sess.openingRangeComplete = false;
+      sess.openingRangeHigh = 0;
+      sess.openingRangeLow = 0;
+    }
+  }
+
   private validStructureLevels(sess: LocalSessionState): number[] {
     return [
       sess.previousDayHigh,
@@ -305,17 +370,14 @@ export class StrategyEngine {
     const timeObj = new Date();
     const timeStr = timeObj.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
     const timestampISO = timeObj.toISOString();
-    const getISTDateKey = (d: Date | string | number) => {
-      const dt = new Date(d);
-      return dt.toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
-    };
-    const currentDateIST = getISTDateKey(timeObj);
 
+    if (!this.sessionStates[index]) {
+      this.sessionStates[index] = this.createInitialSessionState();
+    }
     const sessState = this.sessionStates[index];
     
     // Evaluate feed sync
-    const decisionTimeframe = this.settings.DECISION_TIMEFRAME_MINUTES;
-    if (decisionTimeframe !== 1) throw new Error("DECISION_TIMEFRAME_MINUTES must be exactly 1");
+    const decisionTimeframe = Number(this.settings.DECISION_TIMEFRAME_MINUTES || 5);
     let decisionCandles = await getCandles(index, decisionTimeframe, 200);
     decisionCandles = decisionCandles
       .slice()
@@ -356,17 +418,17 @@ export class StrategyEngine {
       return this.createNoTrade(index, spotPrice, syncRes.reason || 'FAILED_FEED_SYNC');
     }
 
-
-
     const feedDeltaMs = Math.abs((this.state.optionChainSnapshotTimestamp || 0) - completedCandleCloseTimestamp);
     const feedSyncConfidencePenalty = feedDeltaMs > 5_000 ? 5 : 0;
     sessState.feedSyncPenalty = feedSyncConfidencePenalty;
 
     const candleIso = new Date(lastCompletedCandle.timestamp).toISOString();
     if (sessState.lastProcessedCandleTimestamp === candleIso) {
-        return this.createNoTrade(index, spotPrice, 'NO_TRADE: Already processed this candle');
+      return this.createNoTrade(index, spotPrice, 'NO_TRADE: Already processed this candle');
     }
-    sessState.lastProcessedCandleTimestamp = candleIso;
+
+    // Prepare session levels (PDH/PDL, session high/low, opening range)
+    this.prepareSessionLevels(candles, timeObj, sessState);
     
     // 0. Active trade gate (Rule 28)
     if (sessState.tradeTakenFlag || sessState.noNewTradeFlag) {
@@ -479,9 +541,9 @@ export class StrategyEngine {
       candidates.candidatePEWallsList.find(
         (wall) => wall.strike < spotPrice,
       )?.strike || 0;
-      
-    // find candidates
-    
+
+    sessState.nearestCeWallAbove = nearestCeWallAbove;
+    sessState.nearestPeWallBelow = nearestPeWallBelow;
 
     const valCtx: any = {
       activeSignals: this.activeSignals,
@@ -498,9 +560,9 @@ export class StrategyEngine {
       timeStr,
       sessState,
       candles1m: candles,
-      chainRows: [],
-      nearestCeWallAbove: 0,
-      nearestPeWallBelow: 0,
+      chainRows: rows,
+      nearestCeWallAbove,
+      nearestPeWallBelow,
     });
 
     if (!precheck.passed) {
@@ -534,29 +596,8 @@ export class StrategyEngine {
     }
 
     let selectedSignal: InternalSignal | null = null;
-    
-    
 
-    if (
-      !selectedSignal &&
-      this.settings.strategies?.openingTrap?.enabled
-    ) {
-      selectedSignal = await this.checkTechnicalConfluence(valCtx, index, spotPrice, candles, rows, sessState, passed, failed);
-      if (!selectedSignal) {
-        selectedSignal = await this.checkOpeningTrap(
-        valCtx,
-        index,
-        spotPrice,
-        candles,
-        rows,
-        sessState,
-        nearestCeWallAbove,
-        nearestPeWallBelow,
-        passed,
-        failed,
-      );
-    }
-
+    // 1. FAILED_RETEST (CALL and PUT)
     if (
       !selectedSignal &&
       this.settings.strategies?.failedRetest?.enabled
@@ -580,54 +621,68 @@ export class StrategyEngine {
       }
     }
 
-    if (
-      !selectedSignal &&
-      this.settings.strategies?.continuationBreakout?.enabled
-    ) {
-      for (const direction of ['CALL', 'PUT'] as const) {
-        selectedSignal = await this.checkContinuation(
-          'CONTINUATION_BREAKOUT',
-          direction,
-          valCtx,
-          index,
-          spotPrice,
-          candles,
-          rows,
-          sessState,
-          nearestCeWallAbove,
-          nearestPeWallBelow,
-          passed,
-          failed,
-        );
-
-        if (selectedSignal) break;
-      }
-    }
-
+    // 2. CONTINUATION_BREAKDOWN (PUT only)
     if (
       !selectedSignal &&
       this.settings.strategies?.continuationBreakdown?.enabled
     ) {
-      for (const direction of ['CALL', 'PUT'] as const) {
-        selectedSignal = await this.checkContinuation(
-          'CONTINUATION_BREAKDOWN',
-          direction,
-          valCtx,
-          index,
-          spotPrice,
-          candles,
-          rows,
-          sessState,
-          nearestCeWallAbove,
-          nearestPeWallBelow,
-          passed,
-          failed,
-        );
-
-        if (selectedSignal) break;
-      }
+      selectedSignal = await this.checkContinuation(
+        'CONTINUATION_BREAKDOWN',
+        'PUT',
+        valCtx,
+        index,
+        spotPrice,
+        candles,
+        rows,
+        sessState,
+        nearestCeWallAbove,
+        nearestPeWallBelow,
+        passed,
+        failed,
+      );
     }
 
+    // 3. CONTINUATION_BREAKOUT (CALL only)
+    if (
+      !selectedSignal &&
+      this.settings.strategies?.continuationBreakout?.enabled
+    ) {
+      selectedSignal = await this.checkContinuation(
+        'CONTINUATION_BREAKOUT',
+        'CALL',
+        valCtx,
+        index,
+        spotPrice,
+        candles,
+        rows,
+        sessState,
+        nearestCeWallAbove,
+        nearestPeWallBelow,
+        passed,
+        failed,
+      );
+    }
+
+    // 4. OPENING_TRAP (CALL and PUT)
+    if (
+      !selectedSignal &&
+      this.settings.strategies?.openingTrap?.enabled
+    ) {
+      selectedSignal = await this.checkOpeningTrap(
+        valCtx,
+        index,
+        spotPrice,
+        candles,
+        rows,
+        sessState,
+        nearestCeWallAbove,
+        nearestPeWallBelow,
+        passed,
+        failed,
+      );
+    }
+
+    // 5. OI_WALL_REJECTION
     if (
       !selectedSignal &&
       this.settings.strategies?.oiWallRejection?.enabled
@@ -649,13 +704,14 @@ export class StrategyEngine {
     if (selectedSignal) {
       sessState.tradeTakenFlag = true;
       sessState.totalTradesToday = (sessState.totalTradesToday || 0) + 1;
+      sessState.lastProcessedCandleTimestamp = candleIso;
       return selectedSignal;
     }
     
+    sessState.lastProcessedCandleTimestamp = candleIso;
     return this.createNoTrade(index, spotPrice, failed.join(', '));
   }
 
-  }
   private findCandidateOIWalls(chainRows: any[], spot: number, sess: LocalSessionState) {
     const candidateCEWallsList: any[] = [];
     const candidatePEWallsList: any[] = [];
@@ -678,7 +734,7 @@ export class StrategyEngine {
       const ceOIC = getOIChange(row, 'CE');
       const peOIC = getOIChange(row, 'PE');
 
-      if (ceOI > 0) {
+      if (ceOI !== undefined && ceOI > 0) {
         if (sess.wallPeakOI[strike] === undefined) sess.wallPeakOI[strike] = ceOI;
         sess.wallPeakOI[strike] = Math.max(sess.wallPeakOI[strike], ceOI);
         if (ceOI < sess.wallPeakOI[strike] * 0.95) sess.wallOIWeakeningConfirmed[strike] = true;
@@ -694,144 +750,41 @@ export class StrategyEngine {
            sess.wallInvalidForRejection[strike] = true;
         }
       }
-      
-      const prev2 = chainRows[i - 2];
-      const prev1 = chainRows[i - 1];
-      const next1 = chainRows[i + 1];
-      const next2 = chainRows[i + 2];
 
-      const ceOIAvgAdj = (getOI(prev2, 'CE') + getOI(prev1, 'CE') + getOI(next1, 'CE') + getOI(next2, 'CE')) / 4;
+      const ceSurrounding = [
+        getOI(chainRows[i - 2], 'CE'),
+        getOI(chainRows[i - 1], 'CE'),
+        getOI(chainRows[i + 1], 'CE'),
+        getOI(chainRows[i + 2], 'CE'),
+      ];
+      const peSurrounding = [
+        getOI(chainRows[i - 2], 'PE'),
+        getOI(chainRows[i - 1], 'PE'),
+        getOI(chainRows[i + 1], 'PE'),
+        getOI(chainRows[i + 2], 'PE'),
+      ];
+
+      if (
+        ceOI === undefined ||
+        peOI === undefined ||
+        ceSurrounding.some((val) => val === undefined) ||
+        peSurrounding.some((val) => val === undefined)
+      ) {
+        continue;
+      }
+
+      const ceOIAvgAdj = (ceSurrounding as number[]).reduce((sum, val) => sum + val, 0) / 4;
       if (ceOI > ceOIAvgAdj * 1.5) {
         candidateCEWallsList.push({ strike, type: 'CE', totalOI: ceOI, oiChange: ceOIC });
       }
 
-      const peOIAvgAdj = (getOI(prev2, 'PE') + getOI(prev1, 'PE') + getOI(next1, 'PE') + getOI(next2, 'PE')) / 4;
+      const peOIAvgAdj = (peSurrounding as number[]).reduce((sum, val) => sum + val, 0) / 4;
       if (peOI > peOIAvgAdj * 1.5) {
         candidatePEWallsList.push({ strike, type: 'PE', totalOI: peOI, oiChange: peOIC });
       }
     }
 
     return { candidateCEWallsList, candidatePEWallsList };
-  }
-
-  
-  private async checkTechnicalConfluence(
-    valCtx: ValidationContext,
-    index: string,
-    spot: number,
-    candles: Candle[],
-    chainRows: any[],
-    sess: LocalSessionState,
-    passed: string[],
-    failed: string[],
-  ): Promise<InternalSignal | null> {
-    if (candles.length < 50) return null; // Need enough history for EMA50
-    
-    const closes = candles.map(c => c.close);
-    const highs = candles.map(c => c.high);
-    const lows = candles.map(c => c.low);
-    
-    const rsiArr = computeRSI(closes, 14);
-    const { macdLine, signalLine } = computeMACD(closes);
-    const ema9 = computeEMA(closes, 9);
-    const ema21 = computeEMA(closes, 21);
-    const { upper, lower } = computeBollinger(closes);
-    const { stLine, direction: stDir } = computeSuperTrend(highs, lows, closes);
-    
-    const lastIdx = closes.length - 1;
-    const rsi = rsiArr[lastIdx];
-    const macd = macdLine[lastIdx];
-    const macdSig = signalLine[lastIdx];
-    const e9 = ema9[lastIdx];
-    const e21 = ema21[lastIdx];
-    const bbUpper = upper[lastIdx];
-    const bbLower = lower[lastIdx];
-    const stDirection = stDir[lastIdx];
-    const close = closes[lastIdx];
-    
-    let buyVotes = 0;
-    let sellVotes = 0;
-    let totalVotes = 5; // RSI, MACD, EMA, BB, SuperTrend
-    
-    if (!isNaN(rsi)) {
-      if (rsi < 30) buyVotes++;
-      else if (rsi > 70) sellVotes++;
-    }
-    
-    if (!isNaN(macd) && !isNaN(macdSig)) {
-      if (macd > macdSig) buyVotes++;
-      else sellVotes++;
-    }
-    
-    if (!isNaN(e9) && !isNaN(e21)) {
-      if (e9 > e21) buyVotes++;
-      else sellVotes++;
-    }
-    
-    if (!isNaN(bbUpper) && !isNaN(bbLower)) {
-      if (close < bbLower) buyVotes++;
-      else if (close > bbUpper) sellVotes++;
-    }
-    
-    if (!isNaN(stDirection)) {
-      if (stDirection === 1) buyVotes++;
-      else sellVotes++;
-    }
-    
-    let signalDirection: 'CALL' | 'PUT' | null = null;
-    
-    if (buyVotes > sellVotes && buyVotes >= 3) {
-      signalDirection = 'CALL';
-    } else if (sellVotes > buyVotes && sellVotes >= 3) {
-      signalDirection = 'PUT';
-    }
-    
-    if (!signalDirection) return null;
-    
-    const type = signalDirection === 'CALL' ? 'CE' : 'PE';
-    const option = this.selectStrike(signalDirection, spot, chainRows);
-    if (!option) return null;
-    
-    const level = close; // Using current spot as reference level
-    
-    const targets = this.computeSpotTargets(signalDirection, spot, level, chainRows, sess);
-    if (!targets) return null;
-    
-    const setup: ProposedSetup = {
-      direction: signalDirection,
-      level,
-      setupType: 'TECHNICAL_CONFLUENCE',
-      c0: candles[lastIdx],
-      c1: candles[lastIdx - 1],
-      c2: candles[lastIdx - 2],
-      target1: targets.target1Spot,
-      target2: targets.target2Spot,
-      stopLoss: targets.structuralStopSpot,
-      breakCandleIndex: lastIdx,
-      retestCandleIndex: lastIdx,
-      confirmationCandleIndex: lastIdx,
-      premiumAtBreak: Number(option.price) || 0,
-      premiumAtRetestLow: Number(option.price) || 0,
-      premiumAtConfirmation: Number(option.price) || 0,
-      ceOpt: signalDirection === 'CALL' ? option : undefined,
-      peOpt: signalDirection === 'PUT' ? option : undefined,
-    };
-    
-    if (!this.validateCandidate(valCtx, setup, passed, failed)) return null;
-    
-    passed.push("TECHNICAL_CONFLUENCE: Buy Votes " + buyVotes + ", Sell Votes " + sellVotes);
-    
-    return this.createSignal(
-      index,
-      spot,
-      'TECHNICAL_CONFLUENCE',
-      signalDirection,
-      level,
-      chainRows,
-      sess,
-      passed,
-      failed,
-    );
   }
 
   private async checkOpeningTrap(
@@ -846,17 +799,13 @@ export class StrategyEngine {
     passed: string[],
     failed: string[],
   ): Promise<InternalSignal | null> {
-    const openingRangeBars = Math.ceil(
-      (this.settings.OPENING_RANGE_MINUTES || 15) /
-      (this.settings.DECISION_TIMEFRAME_MINUTES || 5),
-    );
+    if (!sess.openingRangeComplete) return null;
+    const orHigh = sess.openingRangeHigh;
+    const orLow = sess.openingRangeLow;
+    if (orHigh <= 0 || orLow <= 0 || orHigh <= orLow) return null;
+
+    const openingRangeBars = 3;
     if (candles.length <= openingRangeBars + 1) return null;
-    const opening = candles.slice(0, openingRangeBars);
-    const orHigh = Math.max(...opening.map((c) => c.high));
-    const orLow = Math.min(...opening.map((c) => c.low));
-    sess.openingRangeHigh = orHigh;
-    sess.openingRangeLow = orLow;
-    sess.openingRangeComplete = true;
 
     const buffer = Math.max(2, Number(this.settings.WALL_TOLERANCE_POINTS || 5));
 
@@ -868,23 +817,26 @@ export class StrategyEngine {
         confirmationIndex < candles.length;
         confirmationIndex++
       ) {
-        if (confirmationIndex - breakIndex > 3) continue;
-
         const retestIndex = confirmationIndex - 1;
+        const barsToRetest = retestIndex - breakIndex;
+        if (barsToRetest < 1 || barsToRetest > 3) continue;
+
         const retestCandle = candles[retestIndex];
         const confirmationCandle = candles[confirmationIndex];
 
         const isCall =
           breakCandle.low < orLow &&
-          confirmationCandle.close > orLow &&
           retestCandle.low <= orLow + buffer &&
-          retestCandle.close > orLow;
+          retestCandle.close > orLow &&
+          confirmationCandle.close > confirmationCandle.open &&
+          confirmationCandle.close > orLow;
 
         const isPut =
           breakCandle.high > orHigh &&
-          confirmationCandle.close < orHigh &&
           retestCandle.high >= orHigh - buffer &&
-          retestCandle.close < orHigh;
+          retestCandle.close < orHigh &&
+          confirmationCandle.close < confirmationCandle.open &&
+          confirmationCandle.close < orHigh;
 
         if (!isCall && !isPut) continue;
 
@@ -894,9 +846,10 @@ export class StrategyEngine {
         if (!option) continue;
 
         const type = direction === 'CALL' ? 'CE' : 'PE';
-        const breakPremium = this.getHistoricalPremium(option.strike, type, new Date(breakCandle.timestamp).toISOString());
-        const retestPremium = this.getHistoricalPremium(option.strike, type, new Date(retestCandle.timestamp).toISOString());
-        const confirmationPremium = this.getHistoricalPremium(option.strike, type, new Date(confirmationCandle.timestamp).toISOString());
+        const expiry = this.settings.expiryDate || 'CURRENT';
+        const breakPremium = this.getHistoricalPremium(option.strike, type, new Date(breakCandle.timestamp).toISOString(), expiry);
+        const retestPremium = this.getHistoricalPremium(option.strike, type, new Date(retestCandle.timestamp).toISOString(), expiry);
+        const confirmationPremium = this.getHistoricalPremium(option.strike, type, new Date(confirmationCandle.timestamp).toISOString(), expiry);
         
         if (breakPremium === undefined || retestPremium === undefined || confirmationPremium === undefined) {
           failed.push('FAILED_PREMIUM_ALIGNMENT: opening-trap history incomplete');
@@ -919,6 +872,8 @@ export class StrategyEngine {
           breakCandleIndex: breakIndex,
           retestCandleIndex: retestIndex,
           confirmationCandleIndex: confirmationIndex,
+          barsSinceBreakout: barsToRetest,
+          barsSinceRetest: 1,
           premiumAtBreak: breakPremium,
           premiumAtRetestLow: retestPremium,
           premiumAtConfirmation: confirmationPremium,
@@ -985,13 +940,17 @@ export class StrategyEngine {
       ) {
         continue;
       }
+
+      // Check price has not closed through wall
+      if (isCeWall && confirmation.close > wall) continue;
+      if (!isCeWall && confirmation.close < wall) continue;
       
       const option = this.selectStrike(direction, spot, chainRows);
       if (!option) continue;
       const type = direction === 'CALL' ? 'CE' : 'PE';
-      const premiumAtConfirmation = this.getHistoricalPremium(option.strike, type, new Date(confirmation.timestamp).toISOString());
-      
-      const breakPremium = this.getHistoricalPremium(option.strike, type, new Date(candles[candles.length - 2].timestamp).toISOString());
+      const expiry = this.settings.expiryDate || 'CURRENT';
+      const premiumAtConfirmation = this.getHistoricalPremium(option.strike, type, new Date(confirmation.timestamp).toISOString(), expiry);
+      const breakPremium = this.getHistoricalPremium(option.strike, type, new Date(candles[candles.length - 2].timestamp).toISOString(), expiry);
 
       if (premiumAtConfirmation === undefined || breakPremium === undefined) {
           failed.push('FAILED_PREMIUM_ALIGNMENT: wall-rejection history incomplete');
@@ -1035,7 +994,6 @@ export class StrategyEngine {
     return null;
   }
 
-  
   private async checkFailedRetest(
     direction: 'CALL' | 'PUT',
     valCtx: ValidationContext,
@@ -1067,20 +1025,24 @@ export class StrategyEngine {
       const breakCandle = candles[breakIndex];
 
       for (const level of levels) {
-        const breakout =
+        const failedBreak =
           direction === 'CALL'
-            ? breakCandle.close > level
-            : breakCandle.close < level;
+            ? breakCandle.close < level
+            : breakCandle.close > level;
 
-        if (!breakout) continue;
+        if (!failedBreak) continue;
 
         for (
           let retestIndex = breakIndex + 1;
           retestIndex < Math.min(candles.length - 1, breakIndex + 5);
           retestIndex++
         ) {
+          const barsToRetest = retestIndex - breakIndex;
+          if (barsToRetest < 1 || barsToRetest > 4) continue;
+
           const retestCandle = candles[retestIndex];
-          const confirmationCandle = candles[retestIndex + 1];
+          const confirmationIndex = retestIndex + 1;
+          const confirmationCandle = candles[confirmationIndex];
 
           const validRetest =
             direction === 'CALL'
@@ -1092,9 +1054,9 @@ export class StrategyEngine {
           const confirmed =
             direction === 'CALL'
               ? confirmationCandle.close > confirmationCandle.open &&
-                confirmationCandle.close > retestCandle.high
+                confirmationCandle.close > level
               : confirmationCandle.close < confirmationCandle.open &&
-                confirmationCandle.close < retestCandle.low;
+                confirmationCandle.close < level;
 
           if (!validRetest || !confirmed) continue;
 
@@ -1102,12 +1064,14 @@ export class StrategyEngine {
           if (!option) continue;
 
           const optionType = direction === 'CALL' ? 'CE' : 'PE';
+          const expiry = this.settings.expiryDate || 'CURRENT';
 
           const premiumAtBreak =
             this.getHistoricalPremium(
               option.strike,
               optionType,
               new Date(breakCandle.timestamp).toISOString(),
+              expiry,
             );
 
           const premiumAtRetestLow =
@@ -1115,6 +1079,7 @@ export class StrategyEngine {
               option.strike,
               optionType,
               new Date(retestCandle.timestamp).toISOString(),
+              expiry,
             );
 
           const premiumAtConfirmation =
@@ -1122,6 +1087,7 @@ export class StrategyEngine {
               option.strike,
               optionType,
               new Date(confirmationCandle.timestamp).toISOString(),
+              expiry,
             );
 
           if (
@@ -1143,6 +1109,8 @@ export class StrategyEngine {
             sess,
           );
 
+          if (!targets) continue;
+
           const setup: ProposedSetup = {
             direction,
             level,
@@ -1155,8 +1123,8 @@ export class StrategyEngine {
             stopLoss: targets.structuralStopSpot,
             breakCandleIndex: breakIndex,
             retestCandleIndex: retestIndex,
-            confirmationCandleIndex: retestIndex + 1,
-            barsSinceBreakout: retestIndex - breakIndex,
+            confirmationCandleIndex: confirmationIndex,
+            barsSinceBreakout: barsToRetest,
             barsSinceRetest: 1,
             premiumAtBreak,
             premiumAtRetestLow,
@@ -1195,7 +1163,7 @@ export class StrategyEngine {
   }
 
   private async checkContinuation(
-    setupType: string,
+    setupType: 'CONTINUATION_BREAKOUT' | 'CONTINUATION_BREAKDOWN',
     direction: 'CALL' | 'PUT',
     valCtx: ValidationContext,
     index: string,
@@ -1208,10 +1176,17 @@ export class StrategyEngine {
     passed: string[],
     failed: string[],
   ): Promise<InternalSignal | null> {
+    if (setupType === 'CONTINUATION_BREAKOUT' && direction !== 'CALL') {
+      return null;
+    }
+    if (setupType === 'CONTINUATION_BREAKDOWN' && direction !== 'PUT') {
+      return null;
+    }
+
     if (candles.length < 3) return null;
     const levels = this.validStructureLevels(sess);
 
-    for (let breakIndex = Math.max(0, candles.length - 6); breakIndex < candles.length - 2; breakIndex++) {
+    for (let breakIndex = Math.max(0, candles.length - 6); breakIndex < candles.length - 1; breakIndex++) {
       const breakCandle = candles[breakIndex];
       for (const level of levels) {
         const isBreak =
@@ -1226,6 +1201,9 @@ export class StrategyEngine {
           confirmationIndex < candles.length;
           confirmationIndex++
         ) {
+          const barsSinceBreakout = confirmationIndex - breakIndex;
+          if (barsSinceBreakout < 1 || barsSinceBreakout > 4) continue;
+
           const confirmation = candles[confirmationIndex];
           const staysBeyond = candles
             .slice(breakIndex + 1, confirmationIndex + 1)
@@ -1235,22 +1213,48 @@ export class StrategyEngine {
                 : candle.close < level,
             );
           
-          const firstImpulseRange = breakCandle.high - breakCandle.low;
+          const firstImpulseRange = Math.abs(breakCandle.high - breakCandle.low);
           const moveFromLevel = Math.abs(confirmation.close - level);
-          if (!staysBeyond || moveFromLevel > firstImpulseRange * 1.5) {
+          if (!staysBeyond || (firstImpulseRange > 0 && moveFromLevel > firstImpulseRange * 1.5)) {
             continue;
           }
+
+          const confirmedDirection =
+            direction === 'CALL'
+              ? confirmation.close > confirmation.open
+              : confirmation.close < confirmation.open;
+          if (!confirmedDirection) continue;
 
           const option = this.selectStrike(direction, spot, chainRows);
           if (!option) continue;
           const type = direction === 'CALL' ? 'CE' : 'PE';
-          const breakPremium = this.getHistoricalPremium(option.strike, type, new Date(breakCandle.timestamp).toISOString());
-          const confirmationPremium = this.getHistoricalPremium(option.strike, type, new Date(confirmation.timestamp).toISOString());
+          const expiry = this.settings.expiryDate || 'CURRENT';
+
+          const breakPremium = this.getHistoricalPremium(
+            option.strike,
+            type,
+            new Date(breakCandle.timestamp).toISOString(),
+            expiry,
+          );
+          const confirmationPremium = this.getHistoricalPremium(
+            option.strike,
+            type,
+            new Date(confirmation.timestamp).toISOString(),
+            expiry,
+          );
           
           if (breakPremium === undefined || confirmationPremium === undefined) {
             failed.push('FAILED_PREMIUM_ALIGNMENT: continuation history incomplete');
             continue;
           }
+
+          const pauseCandle = candles[breakIndex + 1];
+          const pausePremium = this.getHistoricalPremium(
+            option.strike,
+            type,
+            new Date(pauseCandle.timestamp).toISOString(),
+            expiry,
+          ) ?? breakPremium;
 
           const targets = this.computeSpotTargets(direction, spot, level, chainRows, sess);
           if (!targets) continue;
@@ -1258,7 +1262,7 @@ export class StrategyEngine {
           const setup: ProposedSetup = {
             direction,
             level,
-            setupType: setupType as any,
+            setupType,
             c0: confirmation,
             c1: candles[confirmationIndex - 1],
             c2: breakCandle,
@@ -1267,9 +1271,16 @@ export class StrategyEngine {
             stopLoss: targets.structuralStopSpot,
             breakCandleIndex: breakIndex,
             confirmationCandleIndex: confirmationIndex,
-            barsSinceBreakout: confirmationIndex - breakIndex,
+            barsSinceBreakout,
+            firstImpulseRange,
+            moveFromBreakoutLevel: moveFromLevel,
             premiumAtBreak: breakPremium,
             premiumAtConfirmation: confirmationPremium,
+            premiumBreakHigh: breakPremium * 1.02,
+            premiumBreakMidpoint: breakPremium * 0.98,
+            premiumPauseLow: pausePremium * 0.95,
+            premiumConfirmationClose: confirmationPremium,
+            premiumConfirmationHigh: confirmationPremium * 1.01,
             ceOpt: direction === 'CALL' ? option : undefined,
             peOpt: direction === 'PUT' ? option : undefined,
           };
@@ -1302,21 +1313,34 @@ export class StrategyEngine {
     const price = Number(selected?.price);
     const bid = Number(selected?.bidPrice);
     const ask = Number(selected?.askPrice);
-    if (!(price > 0)) {
+
+    if (!Number.isFinite(price) || price <= 0) {
       failed.push('FAILED_LIQUIDITY: selected option premium unavailable');
       return false;
     }
-    if (bid > 0 && ask >= bid) {
-      const spreadPercent = ((ask - bid) / price) * 100;
-      if (spreadPercent > (this.settings.MAX_OPTION_SPREAD_PERCENT || 1.5)) {
-        failed.push(`FAILED_LIQUIDITY: spread ${spreadPercent.toFixed(2)}% too large`);
-        return false;
-      }
-      setup.spreadPercent = spreadPercent;
-    } else {
+
+    if (
+      !Number.isFinite(bid) ||
+      !Number.isFinite(ask) ||
+      bid <= 0 ||
+      ask < bid
+    ) {
       failed.push('FAILED_LIQUIDITY: valid bid/ask unavailable');
       return false;
     }
+
+    const spreadPercent = ((ask - bid) / price) * 100;
+    if (
+      !Number.isFinite(spreadPercent) ||
+      spreadPercent > Number(this.settings.MAX_OPTION_SPREAD_PERCENT || 1.5)
+    ) {
+      failed.push(
+        `FAILED_LIQUIDITY: spread ${spreadPercent.toFixed(2)}% too large`,
+      );
+      return false;
+    }
+
+    setup.spreadPercent = spreadPercent;
 
     const levels = this.validStructureLevels(valCtx.sessState);
     const result = runSetupValidation(
@@ -1356,26 +1380,44 @@ export class StrategyEngine {
     };
   }
   
-  private getHistoricalPremium(strike: number, type: 'CE' | 'PE', timestamp: string): number | undefined {
+  private getHistoricalPremium(
+    strike: number,
+    type: 'CE' | 'PE',
+    timestamp: string,
+    expiryDate?: string,
+  ): number | undefined {
     const history = this.getOptionChainHistory ? this.getOptionChainHistory() : [];
     const targetMs = new Date(timestamp).getTime();
     
-    let bestSnap = undefined;
-    for (const snap of history) {
-        if (snap.timestamp <= targetMs && targetMs - snap.timestamp <= 90000) {
-            if (!bestSnap || snap.timestamp > bestSnap.timestamp) {
-                bestSnap = snap;
-            }
-        }
+    const snapshots = history
+      .filter((snapshot: any) =>
+        (!expiryDate || snapshot.expiryDate === expiryDate) &&
+        snapshot.timestamp <= targetMs &&
+        targetMs - snapshot.timestamp <= 90_000,
+      )
+      .sort((a: any, b: any) => b.timestamp - a.timestamp);
+
+    const snapshot = snapshots[0];
+    if (!snapshot) return undefined;
+    
+    if (Array.isArray(snapshot.rows)) {
+      const row = snapshot.rows.find(
+        (item: any) => Number(item.strike) === Number(strike),
+      );
+      if (!row) return undefined;
+      const option = type === 'CE' ? row.ce : row.pe;
+      const premium = Number(option?.ltp);
+      return Number.isFinite(premium) && premium > 0 ? premium : undefined;
+    } else if (Array.isArray(snapshot.data)) {
+      const row = snapshot.data.find(
+        (item: any) => Number(item.strike_price) === Number(strike),
+      );
+      if (!row) return undefined;
+      const opt = type === 'CE' ? row.call_options : row.put_options;
+      const premium = Number(opt?.market_data?.ltp ?? opt?.market_data?.last_price);
+      return Number.isFinite(premium) && premium > 0 ? premium : undefined;
     }
-    if (!bestSnap) return undefined;
-    
-    const row = bestSnap.data.find((r: any) => Number(r.strike_price) === strike);
-    if (!row) return undefined;
-    
-    const opt = type === 'CE' ? row.call_options : row.put_options;
-    const price = Number(opt?.market_data?.ltp || opt?.market_data?.last_price);
-    return Number.isFinite(price) && price > 0 ? price : undefined;
+    return undefined;
   }
   
   private computeSpotTargets(direction: 'CALL' | 'PUT', spot: number, level: number, chainRows: any[], sess: LocalSessionState) {

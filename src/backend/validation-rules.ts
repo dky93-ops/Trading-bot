@@ -4,7 +4,7 @@ import { StrategySessionState, Candle, InternalSignal } from './types.js';
 export interface ProposedSetup {
   direction: 'CALL' | 'PUT';
   level: number;
-  setupType: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION' | 'TECHNICAL_CONFLUENCE';
+  setupType: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION';
   c0: Candle;
   c1: Candle;
   c2?: Candle;
