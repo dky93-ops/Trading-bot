@@ -195,8 +195,8 @@ export class EnhancedOptionChainRecorder {
     let totalPutOI = 0;
     let maxCallOI = -1;
     let maxPutOI = -1;
-    let maxCallStrike = 0;
-    let maxPutStrike = 0;
+    let maxCallOIStrike = 0;
+    let maxPutOIStrike = 0;
     let callVolumeTotal = 0;
     let putVolumeTotal = 0;
     let callIVSum = 0;
@@ -213,11 +213,11 @@ export class EnhancedOptionChainRecorder {
 
       if (coi > maxCallOI) {
         maxCallOI = coi;
-        maxCallStrike = row.strike;
+        maxCallOIStrike = row.strike;
       }
       if (poi > maxPutOI) {
         maxPutOI = poi;
-        maxPutStrike = row.strike;
+        maxPutOIStrike = row.strike;
       }
 
       if (row.ce.volume) callVolumeTotal += row.ce.volume;
@@ -299,7 +299,7 @@ export class EnhancedOptionChainRecorder {
   ): EnhancedOptionChainSnapshot[] {
     return this.history.filter(snap => {
       if (instrumentKey && snap.instrumentKey !== instrumentKey) return false;
-      if (expiryDate && snap.expiryDate !== expiryDate) return false;
+      if (expiryDate && expiryDate !== 'CURRENT' && snap.expiryDate !== expiryDate) return false;
       if (startTime && snap.timestamp < startTime) return false;
       if (endTime && snap.timestamp > endTime) return false;
       return true;

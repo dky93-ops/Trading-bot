@@ -204,3 +204,18 @@ export function computeSuperTrend(high: number[], low: number[], close: number[]
   
   return { stLine, direction };
 }
+
+export function computeVWAP(candles: {high: number, low: number, close: number, volume?: number}[]): number[] {
+  const vwap: number[] = new Array(candles.length).fill(NaN);
+  let cumVol = 0;
+  let cumVolPrice = 0;
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const typicalPrice = (c.high + c.low + c.close) / 3;
+    const vol = c.volume || 1;
+    cumVol += vol;
+    cumVolPrice += typicalPrice * vol;
+    vwap[i] = cumVolPrice / cumVol;
+  }
+  return vwap;
+}

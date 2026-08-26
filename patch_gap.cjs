@@ -1,34 +1,27 @@
 const fs = require('fs');
-let code = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
 
-const regex = /const gapPercent = \(\(sessState\.sessionHigh - sessState\.sessionLow\) \/ sessState\.sessionLow\) \* 100;/;
+// 1. types.ts
+let typesCode = fs.readFileSync('src/backend/types.ts', 'utf-8');
+typesCode = typesCode.replace(
+  "previousDayLow: number;",
+  "previousDayLow: number;\n  previousDayClose: number;\n  isGapDay: boolean;"
+);
+typesCode = typesCode.replace(
+  "firstTargetHitFlag?: boolean;",
+  "firstTargetHitFlag?: boolean;\n  secondTargetHitFlag?: boolean;\n  isParabolic?: boolean;"
+);
+fs.writeFileSync('src/backend/types.ts', typesCode);
 
-const replacement = `const prevCandles = await getCandles(index, 1, 375); // rough estimate for previous day
-    // We actually need the previous day's close. Since we don't have it directly if we are at start of day,
-    // let's assume we can get it from candles1m if it spans across days, or we use a fallback.
-    // The prompt says: "add previousDayClose to session state. Set it to the last completed candle close of the previous IST session. Set todayOpen to today's first completed candle open. Compute gap only from those values."
-    
-    // In our engine, todayCandles are available.
-    const todayOpen = todayCandles.length > 0 ? Number(todayCandles[0].open) : 0;
-    
-    // Find previous day close from candles1m
-    let previousDayClose = sessState.previousDayClose || 0;
-    if (!previousDayClose && candles1m.length > 0) {
-      const todayDateStr = new Date(todayCandles[0].timestamp).toLocaleDateString();
-      const prevDayCandles = candles1m.filter(c => new Date(c.timestamp).toLocaleDateString() !== todayDateStr);
-      if (prevDayCandles.length > 0) {
-        previousDayClose = Number(prevDayCandles[prevDayCandles.length - 1].close);
-        sessState.previousDayClose = previousDayClose;
-      }
-    }
-    
-    if (previousDayClose <= 0 || todayOpen <= 0) {
-      return this.createNoTrade(index, spotPrice, 'FAILED_GAP_FILTER: Previous-day close or today open unavailable');
-    }
-    
-    const gapPercent = ((todayOpen - previousDayClose) / previousDayClose) * 100;`;
+// 2. strategy-engine.ts (Session State)
+let engineCode = fs.readFileSync('src/backend/strategy-engine.ts', 'utf-8');
+engineCode = engineCode.replace(
+  "previousDayLow: 0,",
+  "previousDayLow: 0,\n      previousDayClose: 0,\n      isGapDay: false,"
+);
+engineCode = engineCode.replace(
+  "sess.previousDayLow = Math.min(...priorCandles.map((c) => c.low));",
+  "sess.previousDayLow = Math.min(...priorCandles.map((c) => c.low));\n        sess.previousDayClose = priorCandles[priorCandles.length - 1].close;\n        sess.isGapDay = Math.abs((todayCandles[0]?.open - sess.previousDayClose) / sess.previousDayClose * 100) > 0.4;"
+);
+fs.writeFileSync('src/backend/strategy-engine.ts', engineCode);
 
-code = code.replace(regex, replacement);
-
-fs.writeFileSync('src/backend/strategy-engine.ts', code);
-console.log('Patched gap filter');
+console.log('patched gap state');

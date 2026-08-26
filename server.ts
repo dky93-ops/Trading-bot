@@ -107,7 +107,7 @@ async function startServer() {
     try {
       const { instrument, expiry } = req.query;
       const data = await upstoxService.getOptionChain(instrument as string, expiry as string);
-      res.json(data);
+      res.json({ status: "success", data: data });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }

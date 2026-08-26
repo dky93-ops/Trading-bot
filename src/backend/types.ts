@@ -7,6 +7,7 @@ export interface AppSettings {
   isTradingEnabled: boolean;
   nifty50Enabled: boolean;
   expiryDate: string;
+  strikeOffset?: number;
   WALL_TOLERANCE_POINTS?: number;
   OPENING_RANGE_MINUTES?: number;
   defaultLotsPerTrade?: number;
@@ -69,6 +70,7 @@ export interface StrategySessionState {
   consecutiveLosses: number;
   feedSyncPenalty?: number;
   wallPeakOI?: Record<number, number>;
+  wallOIHistory?: Record<string, {time: number, oi: number}[]>;
   wallNegativeOIAlignedKeys?: Record<number, string[]>;
   wallInvalidForRejection?: Record<number, boolean>;
   lastTradeExitTime: number;
@@ -117,6 +119,8 @@ export interface StrategySessionState {
   sessionLow: number;
   previousDayHigh: number;
   previousDayLow: number;
+  previousDayClose: number;
+  isGapDay: boolean;
   openingRangeHigh: number;
   openingRangeLow: number;
   openingRangeComplete: boolean;
@@ -196,6 +200,7 @@ export interface InternalSignal extends EngineDecision {
   latestSpot?: number;
   latestSpotTimestamp?: number;
   latestOptionTimestamp?: number;
+  entryTime?: number;
   id: string;
   index: string;
   contract: string;
@@ -214,6 +219,8 @@ export interface InternalSignal extends EngineDecision {
   leg?: 'MAIN' | 'HEDGE';
   isStraddle?: boolean;
   firstTargetHitFlag?: boolean;
+  secondTargetHitFlag?: boolean;
+  isParabolic?: boolean;
   trailingStopActiveFlag?: boolean;
   breakevenShifted?: boolean;
   timeStop?: string;

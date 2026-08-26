@@ -1,27 +1,8 @@
 const fs = require('fs');
-
-let code = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
-
-const regex = /const currentDateIST = this\.getISTDateKey\(timeObj\);/;
-const replacement = `const getISTDateKey = (d: Date | string | number) => {
-      const dt = new Date(d);
-      return dt.toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata' });
-    };
-    const currentDateIST = getISTDateKey(timeObj);`;
-
-code = code.replace(regex, replacement);
-
-const regex2 = /const rows = \[\.\.\.chainRows\]/;
-const replacement2 = `let chainRows: any[] = [];
-    if (this.getOptionChain) {
-      try {
-         const chain = await this.getOptionChain(index);
-         if (chain && chain.length > 0) chainRows = chain;
-      } catch(e) {}
-    }
-    const rows = [...chainRows]`;
-
-code = code.replace(regex2, replacement2);
-
+let code = fs.readFileSync('src/backend/strategy-engine.ts', 'utf-8');
+code = code.replace(/this\.state\.nifty50\?\.lastUpdateTime/g, 'this.state.nifty50?.timestamp');
+code = code.replace(/this\.state\.nifty50\?\.candles1m/g, '(this.state.nifty50 as any)?.candles1m');
+code = code.replace(/this\.settings\.CHOP_ATR_PERIOD/g, '(this.settings as any).CHOP_ATR_PERIOD');
+code = code.replace(/this\.settings\.SL_BUFFER_ATR_MULTIPLIER/g, '(this.settings as any).SL_BUFFER_ATR_MULTIPLIER');
 fs.writeFileSync('src/backend/strategy-engine.ts', code);
-console.log('Fixed missing chainRows and getISTDateKey');
+console.log('Fixed engine types');

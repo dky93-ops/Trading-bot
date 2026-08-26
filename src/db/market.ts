@@ -22,11 +22,25 @@ export async function insertTick(
       timestamp: new Date(timestamp),
     });
     await buildCandles(instrument, timestamp);
+    
+    // Cleanup old ticks and candles occasionally (approx 1% of the time)
+    if (Math.random() < 0.01) {
+      cleanupOldData().catch(e => console.error('Background DB cleanup failed:', e));
+    }
+    
     return true;
   } catch (error) {
     console.error('Failed to insert tick:', error);
     return false;
   }
+}
+
+async function cleanupOldData() {
+  const twoDaysAgo = new Date(Date.now() - 48 * 60 * 60 * 1000);
+  await db.delete(ticks).where(lt(ticks.timestamp, twoDaysAgo));
+  
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  await db.delete(candles).where(lt(candles.timestamp, thirtyDaysAgo));
 }
 
 async function buildCandles(instrument: string, currentTimestamp: number) {

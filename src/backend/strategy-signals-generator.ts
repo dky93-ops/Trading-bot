@@ -36,8 +36,7 @@ export class StrategySignalsGenerator {
   ): InternalSignal | null {
     if (!optionData) return null;
 
-    const riskPoints = Math.abs(spot - level);
-    const rewardPoints = riskPoints * 2;
+    
 
     const optionEntry = Number(optionData.price);
     const optionStoploss = optionEntry * 0.65; // 35% max loss
@@ -57,9 +56,9 @@ export class StrategySignalsGenerator {
       action: 'BUY' as const,
       status: 'ACTIVE' as const,
       spotEntry: spot,
-      spotInvalidation: level,
-      spotTarget1: direction === 'CALL' ? spot + rewardPoints : spot - rewardPoints,
-      spotTarget2: direction === 'CALL' ? spot + rewardPoints * 2 : spot - rewardPoints * 2,
+      spotInvalidation: setup.stopLoss || level,
+      spotTarget1: setup.target1 || spot,
+      spotTarget2: setup.target2 || spot,
       entryPrice: optionEntry,
       entry: optionEntry,
       stoploss: optionStoploss,
@@ -75,9 +74,9 @@ export class StrategySignalsGenerator {
       spot,
       prices: {
         spotEntry: spot,
-        spotInvalidation: level,
-        spotTarget1: direction === 'CALL' ? spot + rewardPoints : spot - rewardPoints,
-        spotTarget2: direction === 'CALL' ? spot + rewardPoints * 2 : spot - rewardPoints * 2,
+        spotInvalidation: setup.stopLoss || level,
+        spotTarget1: setup.target1 || spot,
+        spotTarget2: setup.target2 || spot,
         optionEntry,
         optionStoploss,
         optionTarget1: optionEntry + (optionEntry - optionStoploss),
@@ -111,8 +110,7 @@ export class StrategySignalsGenerator {
   ): InternalSignal | null {
     if (!optionData) return null;
 
-    const riskPoints = Math.abs(spot - level);
-    const rewardPoints = riskPoints * 1.5;
+    
 
     const optionEntry = Number(optionData.price);
     const optionStoploss = optionEntry * 0.65;
@@ -132,9 +130,9 @@ export class StrategySignalsGenerator {
       action: 'BUY' as const,
       status: 'ACTIVE' as const,
       spotEntry: spot,
-      spotInvalidation: level,
-      spotTarget1: direction === 'CALL' ? spot + rewardPoints : spot - rewardPoints,
-      spotTarget2: direction === 'CALL' ? spot + rewardPoints * 2 : spot - rewardPoints * 2,
+      spotInvalidation: setup.stopLoss || level,
+      spotTarget1: setup.target1 || spot,
+      spotTarget2: setup.target2 || spot,
       entryPrice: optionEntry,
       entry: optionEntry,
       stoploss: optionStoploss,
@@ -150,9 +148,9 @@ export class StrategySignalsGenerator {
       spot,
       prices: {
         spotEntry: spot,
-        spotInvalidation: level,
-        spotTarget1: direction === 'CALL' ? spot + rewardPoints : spot - rewardPoints,
-        spotTarget2: direction === 'CALL' ? spot + rewardPoints * 2 : spot - rewardPoints * 2,
+        spotInvalidation: setup.stopLoss || level,
+        spotTarget1: setup.target1 || spot,
+        spotTarget2: setup.target2 || spot,
         optionEntry,
         optionStoploss,
         optionTarget1: optionEntry + (optionEntry - optionStoploss),
@@ -187,9 +185,8 @@ export class StrategySignalsGenerator {
   ): InternalSignal | null {
     if (!optionData) return null;
 
-    const impulseRange = setup.firstImpulseRange || 20;
-    const riskPoints = Math.abs(spot - level);
-    const rewardPoints = riskPoints * 2;
+    
+    
 
     const optionEntry = Number(optionData.price);
     const optionStoploss = optionEntry * 0.65;
@@ -209,9 +206,9 @@ export class StrategySignalsGenerator {
       action: 'BUY' as const,
       status: 'ACTIVE' as const,
       spotEntry: spot,
-      spotInvalidation: level,
-      spotTarget1: direction === 'CALL' ? spot + rewardPoints : spot - rewardPoints,
-      spotTarget2: direction === 'CALL' ? spot + rewardPoints * 2 : spot - rewardPoints * 2,
+      spotInvalidation: setup.stopLoss || level,
+      spotTarget1: setup.target1 || spot,
+      spotTarget2: setup.target2 || spot,
       entryPrice: optionEntry,
       entry: optionEntry,
       stoploss: optionStoploss,
@@ -227,9 +224,9 @@ export class StrategySignalsGenerator {
       spot,
       prices: {
         spotEntry: spot,
-        spotInvalidation: level,
-        spotTarget1: direction === 'CALL' ? spot + rewardPoints : spot - rewardPoints,
-        spotTarget2: direction === 'CALL' ? spot + rewardPoints * 2 : spot - rewardPoints * 2,
+        spotInvalidation: setup.stopLoss || level,
+        spotTarget1: setup.target1 || spot,
+        spotTarget2: setup.target2 || spot,
         optionEntry,
         optionStoploss,
         optionTarget1: optionEntry + (optionEntry - optionStoploss),
@@ -242,7 +239,7 @@ export class StrategySignalsGenerator {
       highestPrice: optionEntry,
       firstTargetHitFlag: false,
       trailingStopActiveFlag: false,
-      impulseRange,
+      
       barsSinceBreakout: setup.barsSinceBreakout
     } as InternalSignal;
   }
@@ -263,8 +260,7 @@ export class StrategySignalsGenerator {
   ): InternalSignal | null {
     if (!optionData) return null;
 
-    const riskPoints = Math.abs(spot - wall);
-    const rewardPoints = riskPoints * 1.5;
+    
 
     const optionEntry = Number(optionData.price);
     const optionStoploss = optionEntry * 0.65;
@@ -284,9 +280,9 @@ export class StrategySignalsGenerator {
       action: 'BUY' as const,
       status: 'ACTIVE' as const,
       spotEntry: spot,
-      spotInvalidation: wall,
-      spotTarget1: direction === 'CALL' ? spot + rewardPoints : spot - rewardPoints,
-      spotTarget2: direction === 'CALL' ? spot + rewardPoints * 2 : spot - rewardPoints * 2,
+      spotInvalidation: setup.stopLoss || wall,
+      spotTarget1: setup.target1 || spot,
+      spotTarget2: setup.target2 || spot,
       entryPrice: optionEntry,
       entry: optionEntry,
       stoploss: optionStoploss,
@@ -302,9 +298,9 @@ export class StrategySignalsGenerator {
       spot,
       prices: {
         spotEntry: spot,
-        spotInvalidation: wall,
-        spotTarget1: direction === 'CALL' ? spot + rewardPoints : spot - rewardPoints,
-        spotTarget2: direction === 'CALL' ? spot + rewardPoints * 2 : spot - rewardPoints * 2,
+        spotInvalidation: setup.stopLoss || wall,
+        spotTarget1: setup.target1 || spot,
+        spotTarget2: setup.target2 || spot,
         optionEntry,
         optionStoploss,
         optionTarget1: optionEntry + (optionEntry - optionStoploss),

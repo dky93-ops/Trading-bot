@@ -1,5 +1,6 @@
 
 import { StrategySessionState, Candle, InternalSignal } from './types.js';
+import { computeATR, computeSMA, computeEMA, computeVWAP } from './technical-indicators';
 
 export interface ProposedSetup {
   direction: 'CALL' | 'PUT';
@@ -63,6 +64,7 @@ export interface ValidationContext {
   chainRows: any[];
   nearestCeWallAbove: number;
   nearestPeWallBelow: number;
+  settings?: any;
 }
 
 export interface RuleResult {
@@ -184,19 +186,15 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
   const chainRows = ctx.chainRows;
   if (!chainRows || chainRows.length < 5) return fail('FAILED_WALL_DOMINANCE: Missing chain data');
   if (!setup.level || setup.level === 0) return fail('FAILED_WALL_DOMINANCE: No valid dominant OI wall found at this level');
-
+  
   const sortedRows = [...chainRows].sort((a, b) => Number(a.strike_price) - Number(b.strike_price));
   const wallRowIndex = sortedRows.findIndex(r => Number(r.strike_price) === setup.level);
   
-  if (wallRowIndex < 2 || wallRowIndex > sortedRows.length - 3) {
-    return fail('FAILED_WALL_DOMINANCE: Strike not found or insufficient surrounding strikes');
+  if (wallRowIndex === -1) {
+    return fail('FAILED_WALL_DOMINANCE: Strike not found');
   }
 
   const row = sortedRows[wallRowIndex];
-  const surr = [
-    sortedRows[wallRowIndex - 2], sortedRows[wallRowIndex - 1], 
-    sortedRows[wallRowIndex + 1], sortedRows[wallRowIndex + 2]
-  ];
 
   const readRequiredOi = (r: any, side: 'CE' | 'PE'): number | undefined => {
     const md = side === 'CE'
@@ -209,14 +207,49 @@ export function rule8DominantOIWall(ctx: ValidationContext, setup: ProposedSetup
   const side = setup.direction === 'PUT' ? 'CE' : 'PE';
   const wallOi = readRequiredOi(row, side);
   
-  const surrOIs = surr.map(r => readRequiredOi(r, side));
-  if (wallOi === undefined || surrOIs.some(oi => oi === undefined)) {
+  if (wallOi === undefined) {
     return fail('FAILED_WALL_DOMINANCE: Missing required OI for wall check');
   }
 
-  const avgSurr = surrOIs.reduce((sum, oi) => sum + oi, 0) / 4;
-  if (avgSurr === 0 || wallOi < 1.5 * avgSurr) {
-    return fail('FAILED_WALL_DOMINANCE: Wall OI is not 1.5x dominant');
+  const allOIs = chainRows.map(r => readRequiredOi(r, side)).filter(oi => oi !== undefined && oi > 0) as number[];
+  allOIs.sort((a, b) => a - b);
+  
+  if (allOIs.length === 0) {
+    return fail('FAILED_WALL_DOMINANCE: No valid OI in chain');
+  }
+  
+  let count = 0;
+  for (const x of allOIs) if (x <= wallOi) count++;
+  const pctRank = (count / allOIs.length) * 100;
+  
+  const percentileThreshold = Number(ctx.settings?.WALL_OI_PERCENTILE || 90);
+
+  if (pctRank < percentileThreshold) {
+    return fail(`FAILED_WALL_DOMINANCE: Wall OI percentile (${pctRank.toFixed(1)}%) is below threshold (${percentileThreshold}%)`);
+  }
+
+  // OI Velocity Check (15 min)
+  const history = ctx.sessState.wallOIHistory?.[`${setup.level}_${side}`];
+  if (history && history.length > 0) {
+    const nowStr = ctx.candles1m && ctx.candles1m.length > 0 ? ctx.candles1m[ctx.candles1m.length - 1].timestamp : Date.now();
+    const now = typeof nowStr === 'string' ? new Date(nowStr).getTime() : (typeof nowStr === 'number' ? nowStr : Date.now());
+    const min15Ago = now - 15 * 60 * 1000;
+    // Find closest to 15 mins ago
+    let oldOI = null;
+    let minDiff = Infinity;
+    for (const entry of history) {
+      const diff = Math.abs(entry.time - min15Ago);
+      if (diff < minDiff) {
+         minDiff = diff;
+         oldOI = entry.oi;
+      }
+    }
+    if (oldOI) {
+      const velocity = ((wallOi - oldOI) / oldOI) * 100;
+      if (velocity < -5) {
+        return fail('FAILED_OI_VELOCITY: Wall is actively unwinding, breakout imminent');
+      }
+    }
   }
 
   const recentPeak = Number(ctx.sessState.wallPeakOI?.[setup.level]);
@@ -235,9 +268,24 @@ export function rule9WallTestedTwice(setup: ProposedSetup): RuleResult {
   return pass();
 }
 
-export function rule10BreakoutConfirmation(setup: ProposedSetup): RuleResult {
+export function rule10BreakoutConfirmation(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
   if (setup.setupType === 'CONTINUATION_BREAKOUT' || setup.setupType === 'CONTINUATION_BREAKDOWN' || setup.setupType === 'FAILED_RETEST' || setup.setupType === 'OPENING_TRAP') {
     if (setup.breakCandleIndex === undefined) return fail('FAILED_BREAKOUT_CONF: Missing breakout history');
+    
+    // RVOL Check for Breakouts
+    if ((setup.setupType === 'CONTINUATION_BREAKOUT' || setup.setupType === 'CONTINUATION_BREAKDOWN') && setup.c2) {
+      if (ctx.candles1m && ctx.candles1m.length >= 20) {
+        const volumes = ctx.candles1m.map(c => c.volume || 0);
+        const volSMAArray = computeSMA(volumes, 20);
+        const volSMA = volSMAArray[volSMAArray.length - 1];
+        if (!isNaN(volSMA) && volSMA > 0) {
+          const c2Volume = setup.c2.volume || 0;
+          if (c2Volume < volSMA * 1.2) {
+            return fail('FAILED_RVOL: Breakout lacks institutional volume');
+          }
+        }
+      }
+    }
   }
   return pass();
 }
@@ -265,13 +313,28 @@ export function rule11RetestQuality(setup: ProposedSetup): RuleResult {
   return pass();
 }
 
-export function rule12ConfirmationCandle(setup: ProposedSetup, index: string): RuleResult {
+export function rule12ConfirmationCandle(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
   const isCall = setup.direction === 'CALL';
   const c0 = setup.c0;
   if (!c0) return fail('FAILED_CONF_CANDLE: Missing confirmation candle');
 
   if (isCall && c0.close <= c0.open) return fail('FAILED_CONF_CANDLE: CALL setup requires green confirmation candle');
   if (!isCall && c0.close >= c0.open) return fail('FAILED_CONF_CANDLE: PUT setup requires red confirmation candle');
+  
+  // RVOL Check for Traps
+  if (setup.setupType === 'OPENING_TRAP') {
+    if (ctx.candles1m && ctx.candles1m.length >= 20) {
+      const volumes = ctx.candles1m.map(c => c.volume || 0);
+      const volSMAArray = computeSMA(volumes, 20);
+      const volSMA = volSMAArray[volSMAArray.length - 1];
+      if (!isNaN(volSMA) && volSMA > 0) {
+        const c0Volume = c0.volume || 0;
+        if (c0Volume < volSMA * 1.5) {
+          return fail('FAILED_RVOL: Opening trap lacks institutional reversal volume');
+        }
+      }
+    }
+  }
   
   return pass();
 }
@@ -367,12 +430,29 @@ export function rule16RoomToTarget(setup: ProposedSetup): RuleResult {
 
 
 export function rule17ChopZoneFilter(ctx: ValidationContext): RuleResult {
-  const last20 = ctx.candles1m.slice(-20);
-  if (last20.length === 20) {
-    const high20 = Math.max(...last20.map(c => c.high));
-    const low20 = Math.min(...last20.map(c => c.low));
-    if (high20 - low20 < 40) {
-      return fail('FAILED_CHOP_ZONE: 20-candle range < 40 points');
+  const atrPeriod = ctx.settings?.CHOP_ATR_PERIOD || 14;
+  const atrMultiplier = ctx.settings?.CHOP_ATR_MULTIPLIER || 1.5;
+  const candles = ctx.candles1m;
+
+  if (candles.length >= atrPeriod) {
+    const atrArray = computeATR(
+      candles.map((c) => c.high),
+      candles.map((c) => c.low),
+      candles.map((c) => c.close),
+      atrPeriod
+    );
+    const currentAtr = atrArray[atrArray.length - 1];
+
+    if (!isNaN(currentAtr)) {
+      const minRange = currentAtr * atrMultiplier;
+      const last20 = candles.slice(-20);
+      if (last20.length === 20) {
+        const high20 = Math.max(...last20.map((c) => c.high));
+        const low20 = Math.min(...last20.map((c) => c.low));
+        if (high20 - low20 < minRange) {
+          return fail(`FAILED_CHOP_ZONE: 20-candle range < ATR-based floor (${minRange.toFixed(2)} points)`);
+        }
+      }
     }
   }
   return pass();
@@ -437,18 +517,90 @@ export function rule19OverallAgreement(ctx: ValidationContext, setup: ProposedSe
   return pass();
 }
 
+export function rule21HTFTrendAlignment(ctx: ValidationContext, setup: ProposedSetup): RuleResult {
+  if (setup.setupType === 'CONTINUATION_BREAKOUT' || setup.setupType === 'CONTINUATION_BREAKDOWN' || setup.setupType === 'FAILED_RETEST') {
+    const candles = ctx.candles1m;
+    if (!candles || candles.length < 30) return pass(); // Not enough data
+    
+    
+    const timeStr = ctx.timeStr || '';
+    const isMorning = timeStr >= '09:15' && timeStr <= '10:45';
+    
+    if (ctx.sessState.isGapDay && isMorning) {
+      // Use VWAP instead of 15m EMA
+      const todayStr = ctx.timeObj.toISOString().split('T')[0];
+      const todayCandles = candles.filter((c: any) => {
+        const ts = typeof c.timestamp === 'string' ? new Date(c.timestamp).getTime() : c.timestamp;
+        const d = new Date(ts);
+        return d.toISOString().split('T')[0] === todayStr;
+      });
+      
+      if (todayCandles.length > 0) {
+        const vwapArray = computeVWAP(todayCandles);
+        const currentVwap = vwapArray[vwapArray.length - 1];
+        const currentSpot = ctx.spotPrice;
+        
+        if (!isNaN(currentVwap)) {
+          if (setup.direction === 'CALL' && currentSpot <= currentVwap) {
+            return fail('FAILED_HTF_ALIGNMENT: Fighting the Intraday VWAP (Gap Day)');
+          }
+          if (setup.direction === 'PUT' && currentSpot >= currentVwap) {
+            return fail('FAILED_HTF_ALIGNMENT: Fighting the Intraday VWAP (Gap Day)');
+          }
+        }
+      }
+      return pass();
+    }
+
+    // Synthesize 15m closes
+    // We group by math.floor(time / (15*60*1000))
+    const closes15m = [];
+    let current15mBlock = -1;
+    let lastClose = -1;
+    for (const c of candles) {
+      const ts = typeof c.timestamp === 'string' ? new Date(c.timestamp).getTime() : c.timestamp;
+      const block = Math.floor(ts / (15 * 60 * 1000));
+      if (block !== current15mBlock) {
+        if (current15mBlock !== -1) {
+          closes15m.push(lastClose);
+        }
+        current15mBlock = block;
+      }
+      lastClose = c.close;
+    }
+    closes15m.push(lastClose); // Push the last one
+    
+    if (closes15m.length >= 20) {
+      const emaArray = computeEMA(closes15m, 20);
+      const currentEma = emaArray[emaArray.length - 1];
+      const currentSpot = ctx.spotPrice;
+      
+      if (!isNaN(currentEma)) {
+        if (setup.direction === 'CALL' && currentSpot <= currentEma) {
+          return fail('FAILED_HTF_ALIGNMENT: Fighting the 15m trend');
+        }
+        if (setup.direction === 'PUT' && currentSpot >= currentEma) {
+          return fail('FAILED_HTF_ALIGNMENT: Fighting the 15m trend');
+        }
+      }
+    }
+  }
+  return pass();
+}
+
 export function runSetupValidation(ctx: ValidationContext, setup: ProposedSetup, validLevels: number[], testCount: number = 0): RuleResult {
   const checks = [
     rule20MarketFilters(ctx, setup),
+    rule21HTFTrendAlignment(ctx, setup),
     rule2OpeningFilter(ctx.timeStr, setup),
     rule5MarketStructure(ctx.sessState, setup),
     rule6FailedLevel(ctx.sessState, setup),
     rule7ValidLevels(setup, validLevels),
     rule8DominantOIWall(ctx, setup),
     rule9WallTestedTwice(setup),
-    rule10BreakoutConfirmation(setup),
+    rule10BreakoutConfirmation(ctx, setup),
     rule11RetestQuality(setup),
-    rule12ConfirmationCandle(setup, ctx.index),
+    rule12ConfirmationCandle(ctx, setup),
     rule13PremiumConfirmation(setup),
     rule14MixedDirection(setup),
     rule15Overextension(setup),

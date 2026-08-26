@@ -94,143 +94,27 @@ export class UpstoxService {
 
   private nearestExpiryCache: Record<string, { date: string, timestamp: number }> = {};
 
-  private async getNearestExpiry(instrumentKey: string): Promise<string> {
-    const cached = this.nearestExpiryCache[instrumentKey];
-    if (cached && Date.now() - cached.timestamp < 12 * 60 * 60 * 1000) {
-      return cached.date;
-    }
-    
-    try {
-      const response = await axios.get(`https://api.upstox.com/v2/option/contract`, {
-        params: { instrument_key: instrumentKey },
-
-        headers: {
-          'Accept': 'application/json',
-          'Authorization': `Bearer ${this.settings.accessToken}`
-        }
-      });
-      
-      if (response.data && response.data.data && Array.isArray(response.data.data)) {
-         const expirys = [...new Set(response.data.data.map((c: any) => c.expiry))].sort();
-         // Use IST current date for boundary checks
-         const todayIST = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().split('T')[0];
-         const validExpirys = expirys.filter((e: any) => e >= todayIST);
-         
-         if (validExpirys.length > 0) {
-            this.nearestExpiryCache[instrumentKey] = { date: validExpirys[0] as string, timestamp: Date.now() };
-            return validExpirys[0] as string;
-         } else if (expirys.length > 0) {
-            // Fallback to latest available expiry if todayIST filter excludes past
-            const latest = expirys[expirys.length - 1] as string;
-            this.nearestExpiryCache[instrumentKey] = { date: latest, timestamp: Date.now() };
-            return latest;
-         }
-      }
-    } catch (e) {
-      console.error('Error fetching contracts for expiry:', e);
-    }
-    
-    // Fallback calculation in IST
-    const nowIST = new Date(Date.now() + 5.5 * 3600 * 1000);
-    const targetDay = instrumentKey.includes('Nifty 50') ? 4 : 3;
-    let daysToAdd = (targetDay - nowIST.getDay() + 7) % 7;
-    
-    if (daysToAdd === 0 && (nowIST.getHours() > 15 || (nowIST.getHours() === 15 && nowIST.getMinutes() >= 30))) {
-        daysToAdd = 7;
-    }
-    const expiryDate = new Date(nowIST.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
-    return expiryDate.toISOString().split('T')[0];
-  }
-
-
-  private loadOptionChainHistoryFromDisk() {
-    try {
-      if (fs.existsSync(this.historyFilePath)) {
-        const raw = fs.readFileSync(this.historyFilePath, 'utf-8');
-        const json = JSON.parse(raw);
-        if (Array.isArray(json)) {
-          this.optionChainHistory = json;
-          console.log(`Loaded ${json.length} recorded 1-min option chain snapshots from disk.`);
-        }
-      }
-    } catch (e) {
-      console.error("Failed to load option chain history from disk:", e);
-    }
-  }
-
-  private saveOptionChainHistoryToDisk() {
-    try {
-      const dir = path.dirname(this.historyFilePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      fs.writeFileSync(this.historyFilePath, JSON.stringify(this.optionChainHistory, null, 2), 'utf-8');
-    } catch (e) {
-      console.error("Failed to save option chain history to disk:", e);
-    }
-  }
-
-  private startOneMinOptionChainRecorder() {
-    if (this.oneMinRecorderInterval) {
-      clearInterval(this.oneMinRecorderInterval);
-    }
-
-    console.log("Starting 1-Minute Option Chain Recording Engine...");
-    
-    // Trigger immediately once, then schedule every 60 seconds (1 minute)
-    this.recordOneMinOptionChain();
-    this.oneMinRecorderInterval = setInterval(() => {
-      this.recordOneMinOptionChain();
-    }, 60000);
-  }
-
-  private async recordOneMinOptionChain() {
-    if (!this.hasBrokerCredentials()) return;
-    if (!this.settings.accessToken) return;
-
-    // Only record during market hours
-    if (!this.strategyEngine.isMarketOpen()) {
-      return;
-    }
-
-    try {
-      const niftyExpiry = await this.getNearestExpiry('NSE_INDEX|Nifty 50');
-      await this.getOptionChain('NSE_INDEX|Nifty 50', niftyExpiry);
-    } catch (e) {
-      console.error("Error in 1-min option chain recording tick:", e);
-    }
-  }
-
+  
+  
   constructor(wss: WebSocketServer) {
     this.wss = wss;
     this.strategyEngine = new StrategyEngine(
       this.settings, 
       this.state, 
-      this.fetchOptionData.bind(this),
-      this.getOptionChain.bind(this),
-      this.getNearestExpiry.bind(this),
-      this.getOptionChainHistory.bind(this)
+      this.fetchOptionData.bind(this)
     );
-
-    if (this.settings.accessToken) {
-      this.dataFetcher = new UpstoxDataFetcher(this.settings.accessToken, this.dataManager);
-    }
-
-    // Load recorded 1-minute option chain history from disk
-    this.loadOptionChainHistoryFromDisk();
     
-    if (!this.hasBrokerCredentials()) {
-      this.state.apiError =
-        'Blocked: Upstox runtime credentials are missing.';
+    if (fs.existsSync(this.historyFilePath)) {
+      try {
+        const data = fs.readFileSync(this.historyFilePath, 'utf8');
+        this.optionChainHistory = JSON.parse(data);
+      } catch (e) {
+        console.error("Failed to load option chain history:", e);
+      }
     }
-
+    
     if (this.hasBrokerCredentials()) {
       this.startPolling();
-    }
-
-    // Always run the 1-minute Option Chain recording loop during server runtime
-    if (this.hasBrokerCredentials()) {
-      this.startOneMinOptionChainRecorder();
     }
 
     this.wss.on('connection', (ws) => {
@@ -243,47 +127,44 @@ export class UpstoxService {
     });
   }
 
+  private saveOptionChainHistoryToDisk() {
+    try {
+      const dir = path.dirname(this.historyFilePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(this.historyFilePath, JSON.stringify(this.optionChainHistory));
+    } catch (e) {
+      console.error("Failed to save option chain history:", e);
+    }
+  }
+
+  public updateSettings(newSettings: Partial<AppSettings>) {
+    this.settings = { ...this.settings, ...newSettings };
+    if (this.settings.accessToken && !this.pollingInterval) {
+      this.startPolling();
+    }
+  }
+
+  public getState(): AppState {
+    return this.state;
+  }
+
   public resetSignals() {
     this.state.signals = [];
     this.strategyEngine.activeSignals.clear();
     this.state.overallPnL = 0;
+    this.state.realizedPnL = 0;
+    this.state.unrealizedPnL = 0;
     this.state.winRate = 0;
     this.state.totalTrades = 0;
     this.state.winningTrades = 0;
     this.broadcastState();
   }
 
-  getSettings(): AppSettings {
-    return this.settings;
-  }
-
-  updateSettings(newSettings: Partial<AppSettings>) {
-    this.settings = {
-      ...this.settings,
-      ...newSettings,
-      DECISION_TIMEFRAME_MINUTES: 5,
-    };
-    if (newSettings.accessToken) {
-      this.state.apiError = undefined;
-    }
-    this.strategyEngine.updateSettings(this.settings);
-    this.broadcast({ type: 'SETTINGS_UPDATE', data: this.getPublicSettings() });
-    
-    // Auto-restart polling if token changes and we are not polling
-    if (this.settings.accessToken && !this.pollingInterval) {
-      this.startPolling();
-    }
-  }
-
-  getState(): AppState {
-    return this.state;
-  }
-
-  async getExpiries(instrumentKey: string): Promise<string[]> {
+  
+  public async getExpiries(instrumentKey: string): Promise<string[]> {
     try {
       const response = await axios.get(`https://api.upstox.com/v2/option/contract`, {
         params: { instrument_key: instrumentKey },
-
         headers: {
           'Accept': 'application/json',
           'Authorization': `Bearer ${this.settings.accessToken}`
@@ -291,7 +172,7 @@ export class UpstoxService {
       });
       if (response.data && response.data.data && Array.isArray(response.data.data)) {
         const todayIST = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().split('T')[0];
-        const expirys = [...new Set(response.data.data.map((c: any) => c.expiry))].sort().filter((e: any) => e >= todayIST) as string[];
+        const expirys = [...new Set(response.data.data.map((c: any) => c.expiry))].sort().filter((e: any) => (e) >= todayIST) as string[];
         if (expirys.length > 0) return expirys;
       }
     } catch (e) {
@@ -301,162 +182,116 @@ export class UpstoxService {
     return [nearest];
   }
 
-  async getOptionChain(instrumentKey: string, expiryDate?: string) {
-    if (!expiryDate || expiryDate === 'CURRENT' || expiryDate === 'undefined') {
-      expiryDate = await this.getNearestExpiry(instrumentKey);
-    }
-    const cacheKey = `${instrumentKey}-${expiryDate}`;
-    const cached = this.optionChainCache[cacheKey];
-    if (cached && Date.now() - cached.timestamp < 1200) { // 1.2s cache for high frequency updates
-       return cached.data;
+  private async getNearestExpiry(instrumentKey: string): Promise<string> {
+    const cached = this.nearestExpiryCache[instrumentKey];
+    if (cached && Date.now() - cached.timestamp < 12 * 60 * 60 * 1000) {
+      return cached.date;
     }
     
-    if (this.settings.accessToken) {
-      try {
-        const response = await axios.get(`https://api.upstox.com/v2/option/chain`, {
-          params: {
-            instrument_key: instrumentKey,
-            expiry_date: expiryDate
-          },
-          headers: {
-            'Accept': 'application/json',
-            'Authorization': `Bearer ${this.settings.accessToken}`
-          },
-          timeout: 5000
-        });
-
-        if (response.data && response.data.status === 'success' && Array.isArray(response.data.data) && response.data.data.length > 0) {
-          const rawRows = response.data.data;
-
-          // Ensure strikes are strictly sorted ascending for accurate table matching
-          rawRows.sort((a: any, b: any) => Number(a.strike_price) - Number(b.strike_price));
-
-          // Sync underlying spot price into app state
-          if (rawRows.length > 0 && rawRows[0].underlying_spot_price) {
-            const spot = Number(rawRows[0].underlying_spot_price);
-            if (instrumentKey.includes('Nifty Bank')) {
-              
-            } else if (instrumentKey.includes('Nifty 50')) {
-              this.state.optionChainTimestamp = Date.now();
-              this.state.optionChainSnapshotTimestamp = this.state.optionChainTimestamp;
-            }
-          }
-
-          this.state.apiError = undefined;
-          const result = { status: "success", data: rawRows, source: "UPSTOX_REALTIME" };
-          this.optionChainCache[cacheKey] = { timestamp: Date.now(), data: result };
-
-          // Record snapshot for backtest / analysis replay
-          this.recordOptionChainSnapshot(instrumentKey, expiryDate, rawRows).catch(console.error);
-
-          return result;
-        }
-      } catch (error: any) {
-        console.error("Upstox Option Chain realtime API error:", error.response?.data || error.message);
-        const errObj = error.response?.data?.errors?.[0];
-        const code = errObj?.errorCode || errObj?.error_code;
-        const msg = errObj?.message || error.message;
-
-        let formattedMsg = msg;
-        if (code === 'UDAPI10005' || error.response?.status === 401) {
-          formattedMsg = "Upstox Access Token is invalid or expired (UDAPI10005). Please paste a new token in Settings.";
-        } else if (code === 'UDAPI100042' || error.response?.status === 429) {
-          this.rateLimitBackoffUntil = Date.now() + 6000;
-          formattedMsg = "Upstox API Rate Limit reached (UDAPI100042). Throttling requests automatically...";
-        } else if (code) {
-          formattedMsg = `Upstox API Error (${code}): ${msg}`;
-        }
-
-        this.state.apiError = formattedMsg;
-        return { 
-          status: "error", 
-          message: formattedMsg, 
-          data: [] 
-        };
+    try {
+      const expiries = await this.getExpiries(instrumentKey);
+      if (expiries && expiries.length > 0) {
+        this.nearestExpiryCache[instrumentKey] = { date: expiries[0], timestamp: Date.now() };
+        return expiries[0];
       }
+    } catch (error) {
+      console.error('Error fetching nearest expiry:', error);
     }
+    
+    return 'CURRENT';
+  }
 
-    const missingMsg = "Upstox Access Token missing or unconfigured. Paste your daily Upstox Access Token in Settings.";
-    this.state.apiError = missingMsg;
-    return { 
-      status: "error", 
-      message: missingMsg, 
-      data: [] 
+  public async getOptionChain(instrumentKey: string, expiryDate?: string) {
+    if (!this.dataFetcher) this.dataFetcher = new UpstoxDataFetcher(this.settings.accessToken, this.dataManager);
+    
+    let resolvedExpiry = expiryDate || this.settings.expiryDate;
+    if (!resolvedExpiry || resolvedExpiry === 'CURRENT') {
+      resolvedExpiry = await this.getNearestExpiry(instrumentKey);
+    }
+    
+    const rawRows = await this.dataFetcher.fetchFullOptionChain(instrumentKey, resolvedExpiry);
+    if (rawRows && rawRows.length > 0) {
+      // Background record to keep history padded
+      this.recordOptionChainSnapshot(instrumentKey, resolvedExpiry, rawRows).catch(e => {
+        console.error("Failed background snapshot record:", e.message);
+      });
+    }
+    return rawRows;
+  }
+
+  private async fetchOptionData(spot: number): Promise<OptionChainSnapshot | null> {
+    const expiry = await this.getNearestExpiry('NSE_INDEX|Nifty 50');
+    const chain = await this.getOptionChain('NSE_INDEX|Nifty 50', expiry);
+    if (!chain || chain.length === 0) return null;
+    
+    // Convert to OptionChainSnapshot
+    return {
+      id: Date.now().toString(),
+      timestamp: Date.now(),
+      timeISO: new Date().toISOString(),
+      instrumentKey: 'NSE_INDEX|Nifty 50',
+      expiryDate: expiry,
+      spotPrice: spot,
+      totalCallOI: 0,
+      totalPutOI: 0,
+      pcr: 1,
+      maxCallOIStrike: 0,
+      maxPutOIStrike: 0,
+      strikeCount: chain.length,
+      rows: chain.map((c: any) => ({
+        strike: c.strike_price,
+        ce: c.call_options ? {
+          ltp: c.call_options.market_data?.ltp,
+          totalOi: c.call_options.market_data?.oi,
+          bidPrice: c.call_options.market_data?.bid_price,
+          askPrice: c.call_options.market_data?.ask_price,
+          volume: c.call_options.market_data?.volume,
+          iv: c.call_options.option_greeks?.iv,
+          delta: c.call_options.option_greeks?.delta,
+          theta: c.call_options.option_greeks?.theta,
+          gamma: c.call_options.option_greeks?.gamma,
+          vega: c.call_options.option_greeks?.vega,
+          oiChange: 0
+        } : {} as any,
+        pe: c.put_options ? {
+          ltp: c.put_options.market_data?.ltp,
+          totalOi: c.put_options.market_data?.oi,
+          bidPrice: c.put_options.market_data?.bid_price,
+          askPrice: c.put_options.market_data?.ask_price,
+          volume: c.put_options.market_data?.volume,
+          iv: c.put_options.option_greeks?.iv,
+          delta: c.put_options.option_greeks?.delta,
+          theta: c.put_options.option_greeks?.theta,
+          gamma: c.put_options.option_greeks?.gamma,
+          vega: c.put_options.option_greeks?.vega,
+          oiChange: 0
+        } : {} as any
+      }))
     };
   }
-
-  private async fetchOptionData(index: TradingSymbol, type: 'CE' | 'PE', spotPrice: number, strikeOffset: number = 0) {
-    try {
-      const instrumentKey = 'NSE_INDEX|Nifty 50';
-      let expiry = this.settings.expiryDate;
-      if (!expiry || expiry === 'CURRENT') {
-        expiry = await this.getNearestExpiry(instrumentKey);
-      }
-      const chainResponse = await this.getOptionChain(instrumentKey, expiry);
-      if (!chainResponse || !chainResponse.data) return null;
-      
-      const chainData = chainResponse.data;
-      const strikeStep = 50;
-      const atmStrike = Math.round(spotPrice / strikeStep) * strikeStep;
-      const targetStrike = atmStrike + (strikeOffset * strikeStep);
-      
-      const optionData = chainData.find((row: any) => Number(row.strike_price) === targetStrike);
-      if (!optionData) return null;
-
-      const optObj = type === 'CE' ? optionData.call_options : optionData.put_options;
-      if (!optObj) return null;
-
-      const m = optObj.market_data || {};
-      const price = Number(m.ltp ?? m.last_price ?? 0);
-      return {
-        price,
-        instrumentKey: optObj.instrument_key,
-        strike: targetStrike,
-        bidPrice: Number(m.bid_price ?? 0),
-        askPrice: Number(m.ask_price ?? 0),
-        bidQty: Number(m.bid_qty ?? 0),
-        askQty: Number(m.ask_qty ?? 0),
-        volume: Number(m.volume ?? 0),
-        iv: Number(optObj.option_greeks?.iv ?? 0)
-      };
-    } catch (error) {
-      console.error("Error fetching option data for signal", error);
-    }
-    return null;
-  }
-
-  
-  
 
   private async syncHistoricalCandles() {
     if (!this.settings.accessToken) return;
     if (Date.now() < this.candleSyncBackoffUntil) return;
     try {
-      const decisionMinutes = Number(
-        this.settings.DECISION_TIMEFRAME_MINUTES || 5,
+      const decisionMinutes = Number(this.settings.DECISION_TIMEFRAME_MINUTES || 5);
+      
+      const response1m = await axios.get(
+        `https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/1`,
+        { headers: { Accept: 'application/json', Authorization: `Bearer ${this.settings.accessToken}` }, timeout: 5000 }
       );
-
-      if (this.dataFetcher) {
-        await this.dataFetcher.fetchHistoricalCandles('NSE_INDEX|Nifty 50', [1, 3, 5, 15, 60]);
+      if (response1m.data?.status === 'success' && response1m.data.data?.candles) {
+        await seedHistoricalCandles('NIFTY', 1, response1m.data.data.candles);
       }
-
-      const response = await axios.get(
-        `https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/${decisionMinutes}`,
-        {
-          headers: {
-            Accept: 'application/json',
-            Authorization: `Bearer ${this.settings.accessToken}`,
-          },
-          timeout: 5000,
-        },
-      );
-      if (response.data && response.data.status === 'success' && response.data.data && response.data.data.candles) {
-        const rawCandles = response.data.data.candles;
-        await seedHistoricalCandles('NIFTY', decisionMinutes, rawCandles);
-        await seedHistoricalCandles('NIFTY', 1, rawCandles);
-        await seedHistoricalCandles('NIFTY', 3, rawCandles);
-        await seedHistoricalCandles('NIFTY', 5, rawCandles);
-        await seedHistoricalCandles('NIFTY', 15, rawCandles);
+      
+      if (decisionMinutes > 1) {
+          const responseDt = await axios.get(
+            `https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/${decisionMinutes}`,
+            { headers: { Accept: 'application/json', Authorization: `Bearer ${this.settings.accessToken}` }, timeout: 5000 }
+          );
+          if (responseDt.data?.status === 'success' && responseDt.data.data?.candles) {
+            await seedHistoricalCandles('NIFTY', decisionMinutes, responseDt.data.data.candles);
+          }
       }
     } catch(e: any) {
       if (e.response?.status === 429) {
@@ -465,8 +300,7 @@ export class UpstoxService {
       console.error("Failed to sync historical candles:", e.response?.data || e.message);
     }
   }
-
-  public async startPolling() {
+public async startPolling() {
 
     if (this.pollingInterval) {
       clearInterval(this.pollingInterval);
@@ -613,6 +447,18 @@ export class UpstoxService {
       if (currentMinuteBucket !== this.lastSyncedMinuteBucket) {
         this.lastSyncedMinuteBucket = currentMinuteBucket;
         await this.syncHistoricalCandles();
+        
+        // Auto-record option chain snapshot for history/replay buffer
+        try {
+          const instrument = 'NSE_INDEX|Nifty 50';
+          const expiry = await this.getNearestExpiry(instrument);
+          const rawRows = await this.dataFetcher?.fetchFullOptionChain(instrument, expiry);
+          if (rawRows && rawRows.length > 0) {
+            await this.recordOptionChainSnapshot(instrument, expiry, rawRows);
+          }
+        } catch (e: any) {
+          console.error("Failed to auto-record option chain snapshot:", e.message);
+        }
       }
 
       const newSignals = await this.strategyEngine.onTick(this.state);
@@ -709,16 +555,16 @@ export class UpstoxService {
         const coi = Number(
           r.call_options?.market_data?.oi ??
           r.call_options?.market_data?.total_oi ??
-          r.call_options?.market_data?.totalOi,
+          r.call_options?.market_data?.totalOi ?? 0
         );
         const poi = Number(
           r.put_options?.market_data?.oi ??
           r.put_options?.market_data?.total_oi ??
-          r.put_options?.market_data?.totalOi,
+          r.put_options?.market_data?.totalOi ?? 0
         );
 
         if (!Number.isFinite(coi) || !Number.isFinite(poi)) {
-          return;
+          continue;
         }
 
         totalCallOI += coi;

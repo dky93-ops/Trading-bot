@@ -116,9 +116,15 @@ export class StrategyEngine {
       if (priorCandles && priorCandles.length >= 75) {
         sess.previousDayHigh = Math.max(...priorCandles.map((c) => c.high));
         sess.previousDayLow = Math.min(...priorCandles.map((c) => c.low));
+        sess.previousDayClose = priorCandles[priorCandles.length - 1].close;
+        if (todayCandles.length > 0) sess.isGapDay = Math.abs((todayCandles[0].open - sess.previousDayClose) / sess.previousDayClose * 100) > 0.4;
+        sess.previousDayClose = priorCandles[priorCandles.length - 1].close;
+        sess.isGapDay = Math.abs((todayCandles[0]?.open - sess.previousDayClose) / sess.previousDayClose * 100) > 0.4;
       } else if (priorCandles && priorCandles.length > 0) {
         sess.previousDayHigh = Math.max(...priorCandles.map((c) => c.high));
         sess.previousDayLow = Math.min(...priorCandles.map((c) => c.low));
+        sess.previousDayClose = priorCandles[priorCandles.length - 1].close;
+        if (todayCandles.length > 0) sess.isGapDay = Math.abs((todayCandles[0].open - sess.previousDayClose) / sess.previousDayClose * 100) > 0.4;
       } else {
         sess.previousDayHigh = 0;
         sess.previousDayLow = 0;
@@ -239,6 +245,8 @@ export class StrategyEngine {
       sessionLow: Infinity,
       previousDayHigh: 0,
       previousDayLow: 0,
+      previousDayClose: 0,
+      isGapDay: false,
       openingRangeHigh: 0,
       openingRangeLow: 0,
       openingRangeComplete: false,
@@ -375,6 +383,22 @@ export class StrategyEngine {
     if (!this.sessionStates[index]) {
       this.sessionStates[index] = this.createInitialSessionState();
     }
+    
+    // Detect day rollover and reset session arrays/stats for 24/7 continuous running
+    const currentSessionDate = timeObj.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    if (this.sessionStates[index].sessionDateIST !== currentSessionDate) {
+      console.log(`[Strategy Engine] New trading day detected for ${index}. Resetting session state.`);
+      this.sessionStates[index] = this.createInitialSessionState();
+      this.sessionStates[index].sessionDateIST = currentSessionDate;
+      
+      // Exit any stale trades left overnight (failsafe)
+      for (const [id, signal] of this.activeSignals.entries()) {
+        if (signal.index === index) {
+          this.closeSignal(signal, spotPrice, "Overnight Position Auto-Close");
+        }
+      }
+    }
+    
     const sessState = this.sessionStates[index];
     
     // Evaluate feed sync
@@ -722,7 +746,11 @@ export class StrategyEngine {
       return Number(md?.oi_change ?? md?.oiChange ?? 0);
     };
 
-    if (!sess.wallPeakOI) sess.wallPeakOI = {};
+        if (!sess.wallPeakOI) sess.wallPeakOI = {};
+    if (!sess.wallNegativeOIAlignedKeys) sess.wallNegativeOIAlignedKeys = {};
+    if (!sess.wallInvalidForRejection) sess.wallInvalidForRejection = {};
+    if (!sess.wallOIWeakeningConfirmed) sess.wallOIWeakeningConfirmed = {};
+    if (!sess.wallOIHistory) sess.wallOIHistory = {};
     if (!sess.wallNegativeOIAlignedKeys) sess.wallNegativeOIAlignedKeys = {};
     if (!sess.wallInvalidForRejection) sess.wallInvalidForRejection = {};
     if (!sess.wallOIWeakeningConfirmed) sess.wallOIWeakeningConfirmed = {};
@@ -736,6 +764,10 @@ export class StrategyEngine {
       const peOIC = getOIChange(row, 'PE');
 
       if (ceOI !== undefined && ceOI > 0) {
+        if (!sess.wallOIHistory[`${strike}_CE`]) sess.wallOIHistory[`${strike}_CE`] = [];
+        const simTime = (this.state && this.state.nifty50 && this.state.nifty50.timestamp) ? this.state.nifty50.timestamp : Date.now();
+        sess.wallOIHistory[`${strike}_CE`].push({ time: simTime, oi: ceOI });
+        
         if (sess.wallPeakOI[strike] === undefined) sess.wallPeakOI[strike] = ceOI;
         sess.wallPeakOI[strike] = Math.max(sess.wallPeakOI[strike], ceOI);
         if (ceOI < sess.wallPeakOI[strike] * 0.95) sess.wallOIWeakeningConfirmed[strike] = true;
@@ -857,7 +889,7 @@ export class StrategyEngine {
           continue;
         }
 
-        const targets = this.computeSpotTargets(direction, spot, level, chainRows, sess);
+        const targets = this.computeSpotTargets(direction, spot, level, chainRows, sess, candles);
         if (!targets) continue;
 
         const setup: ProposedSetup = {
@@ -960,7 +992,7 @@ export class StrategyEngine {
           continue;
       }
 
-      const targets = this.computeSpotTargets(direction, spot, wall, chainRows, sess);
+      const targets = this.computeSpotTargets(direction, spot, wall, chainRows, sess, candles);
       if (!targets) continue;
 
       const setup: ProposedSetup = {
@@ -1106,13 +1138,7 @@ export class StrategyEngine {
             continue;
           }
 
-          const targets = this.computeSpotTargets(
-            direction,
-            spot,
-            level,
-            chainRows,
-            sess,
-          );
+          const targets = this.computeSpotTargets(direction, spot, level, chainRows, sess, candles);
 
           if (!targets) continue;
 
@@ -1263,7 +1289,7 @@ export class StrategyEngine {
             expiry,
           ) ?? breakPremium;
 
-          const targets = this.computeSpotTargets(direction, spot, level, chainRows, sess);
+          const targets = this.computeSpotTargets(direction, spot, level, chainRows, sess, candles);
           if (!targets) continue;
 
           const setup: ProposedSetup = {
@@ -1367,26 +1393,63 @@ export class StrategyEngine {
   }
   
   private selectStrike(direction: 'CALL' | 'PUT', spot: number, chainRows: any[]) {
-    let closestRow = chainRows[0];
+    // 3. Option Strike Selection (Moneyness Bands)
+    // Find ATM
+    let atmIndex = -1;
     let minDiff = Infinity;
-    for (const row of chainRows) {
-        const diff = Math.abs(Number(row.strike_price) - spot);
+    for (let i = 0; i < chainRows.length; i++) {
+        const diff = Math.abs(Number(chainRows[i].strike_price) - spot);
         if (diff < minDiff) {
             minDiff = diff;
-            closestRow = row;
+            atmIndex = i;
         }
     }
-    if (!closestRow) return undefined;
-    const opt = direction === 'CALL' ? closestRow.call_options : closestRow.put_options;
-    if (!opt) return undefined;
     
-    return {
-        strike: Number(closestRow.strike_price),
-        price: Number(opt.market_data?.ltp || opt.market_data?.last_price || 0),
-        bidPrice: Number(opt.market_data?.bid_price || opt.market_data?.bid || 0),
-        askPrice: Number(opt.market_data?.ask_price || opt.market_data?.ask || 0),
-        instrumentKey: opt.instrument_key || ''
-    };
+    if (atmIndex === -1) return undefined;
+    
+    // Allowed strikes: ATM, and 1 ITM.
+    // For CALL, ITM is a lower strike price (usually lower index if sorted ascending).
+    // For PUT, ITM is a higher strike price (usually higher index if sorted ascending).
+    // Let's ensure chainRows is sorted just in case
+    const sorted = [...chainRows].sort((a,b) => Number(a.strike_price) - Number(b.strike_price));
+    let newAtmIndex = sorted.findIndex(r => Math.abs(Number(r.strike_price) - spot) === minDiff);
+    
+    let allowedRows = [];
+    if (newAtmIndex !== -1) {
+      allowedRows.push(sorted[newAtmIndex]); // ATM
+      if (direction === 'CALL' && newAtmIndex > 0) {
+         allowedRows.push(sorted[newAtmIndex - 1]); // 1 ITM (lower strike)
+      } else if (direction === 'PUT' && newAtmIndex < sorted.length - 1) {
+         allowedRows.push(sorted[newAtmIndex + 1]); // 1 ITM (higher strike)
+      }
+    }
+    
+    let bestOption = null;
+    let bestSpread = Infinity;
+    const maxSpread = Number(this.settings.MAX_OPTION_SPREAD_PERCENT || 1.5);
+    
+    for (const row of allowedRows) {
+      const opt = direction === 'CALL' ? row.call_options : row.put_options;
+      if (!opt) continue;
+      
+      const price = Number(opt.market_data?.ltp || opt.market_data?.last_price || 0);
+      const bidPrice = Number(opt.market_data?.bid_price || opt.market_data?.bid || 0);
+      const askPrice = Number(opt.market_data?.ask_price || opt.market_data?.ask || 0);
+      
+      if (price > 0 && bidPrice > 0 && askPrice >= bidPrice) {
+         const spread = ((askPrice - bidPrice) / price) * 100;
+         if (spread <= maxSpread && spread < bestSpread) {
+            bestSpread = spread;
+            bestOption = {
+                strike: Number(row.strike_price),
+                price, bidPrice, askPrice,
+                instrumentKey: opt.instrument_key || ''
+            };
+         }
+      }
+    }
+    
+    return bestOption || undefined;
   }
   
   private getHistoricalPremium(
@@ -1400,9 +1463,9 @@ export class StrategyEngine {
     
     const snapshots = history
       .filter((snapshot: any) =>
-        (!expiryDate || snapshot.expiryDate === expiryDate) &&
+        (!expiryDate || expiryDate === 'CURRENT' || snapshot.expiryDate === expiryDate) &&
         snapshot.timestamp <= targetMs &&
-        targetMs - snapshot.timestamp <= 90_000,
+        targetMs - snapshot.timestamp <= 180_000,
       )
       .sort((a: any, b: any) => b.timestamp - a.timestamp);
 
@@ -1429,14 +1492,36 @@ export class StrategyEngine {
     return undefined;
   }
   
-  private computeSpotTargets(direction: 'CALL' | 'PUT', spot: number, level: number, chainRows: any[], sess: LocalSessionState) {
-    const risk = this.settings.WALL_TOLERANCE_POINTS || 10;
+  private computeSpotTargets(direction: 'CALL' | 'PUT', spot: number, level: number, chainRows: any[], sess: LocalSessionState, candles: Candle[]) {
+    let buffer = this.settings.WALL_TOLERANCE_POINTS || 10;
+    
+    const atrPeriod = (this.settings as any).CHOP_ATR_PERIOD || 14;
+    const atrMultiplier = (this.settings as any).SL_BUFFER_ATR_MULTIPLIER || 0.5;
+    
+    if (candles && candles.length >= atrPeriod) {
+      const atrArray = computeATR(
+        candles.map((c) => c.high),
+        candles.map((c) => c.low),
+        candles.map((c) => c.close),
+        atrPeriod
+      );
+      const currentAtr = atrArray[atrArray.length - 1];
+      if (!isNaN(currentAtr)) {
+        buffer = currentAtr * atrMultiplier;
+      }
+    }
+    
+    const stopLossSpot = direction === 'CALL' 
+      ? Math.min(spot, level) - buffer 
+      : Math.max(spot, level) + buffer;
+      
+    const risk = Math.max(buffer, Math.abs(spot - stopLossSpot));
     const reward = risk * 2;
     
     return {
         target1Spot: direction === 'CALL' ? spot + reward : spot - reward,
         target2Spot: direction === 'CALL' ? spot + reward * 2 : spot - reward * 2,
-        structuralStopSpot: direction === 'CALL' ? Math.min(spot, level) - risk : Math.max(spot, level) + risk
+        structuralStopSpot: stopLossSpot
     };
   }
 
@@ -1453,7 +1538,7 @@ export class StrategyEngine {
     setup: ProposedSetup,
     candles: Candle[]
   ): InternalSignal | null {
-    const targets = this.computeSpotTargets(direction, spot, brokenLevel, chainRows, sess);
+    const targets = this.computeSpotTargets(direction, spot, brokenLevel, chainRows, sess, candles);
     if (!targets) return null;
 
     const opt = this.selectStrike(direction, spot, chainRows);
@@ -1488,16 +1573,53 @@ export class StrategyEngine {
     }
 
     const timeWindow = this.getTimeWindow(Date.now());
+
+    let spreadPercent = 1.0;
+    if (opt.price > 0 && opt.bidPrice > 0 && opt.askPrice >= opt.bidPrice) {
+       spreadPercent = ((opt.askPrice - opt.bidPrice) / opt.price) * 100;
+    }
+    
+    let premiumExpansion = 1.0;
+    if (setup.premiumAtBreak > 0 && setup.premiumAtConfirmation > 0) {
+       premiumExpansion = setup.premiumAtConfirmation / setup.premiumAtBreak;
+    }
+
+    let momentumScore = 1.0;
+    const closes = candles.map(c => c.close);
+    if (closes.length >= 14) {
+       const rsiArr = computeRSI(closes, 14);
+       const currentRSI = rsiArr[rsiArr.length - 1];
+       if (!isNaN(currentRSI)) {
+           // RSI > 60 is strong bullish, RSI < 40 is strong bearish
+           if (direction === 'CALL') {
+               momentumScore = currentRSI > 60 ? 1.5 : (currentRSI < 45 ? 0.5 : 1.0);
+           } else {
+               momentumScore = currentRSI < 40 ? 1.5 : (currentRSI > 55 ? 0.5 : 1.0);
+           }
+       }
+    }
+
+    let oiStateScore = 1.5; // 1.5 is neutral in confidence.ts
+    if (sess.nearestCeWallAbove && sess.nearestPeWallBelow) {
+       const ceWallOi = sess.wallOiHistory?.[`CE_${sess.nearestCeWallAbove}`]?.[0] || 0;
+       const peWallOi = sess.wallOiHistory?.[`PE_${sess.nearestPeWallBelow}`]?.[0] || 0;
+       
+       if (ceWallOi > 0 && peWallOi > 0) {
+           const ratio = direction === 'CALL' ? peWallOi / ceWallOi : ceWallOi / peWallOi;
+           oiStateScore = ratio > 1.2 ? 2.5 : (ratio < 0.8 ? 1.0 : 1.5);
+       }
+    }
+
     const conf = calculateConfidence({
       rewardRiskRatio: rewardSpot / riskSpot,
-      premiumExpansion: 1.0,
-      oiState: 1.0,
-      spreadPercent: 1.0, // TODO: Use real spread
+      premiumExpansion,
+      oiState: oiStateScore,
+      spreadPercent,
       ivRegime: 1.0,
-      momentum: 1.0,
+      momentum: momentumScore,
       gapState: 0,
       timeWindow,
-      isExpiryAfter14: false, // TODO
+      isExpiryAfter14: false,
       feedSyncPenalty: sess.feedSyncPenalty || 0
     });
 
@@ -1565,8 +1687,9 @@ export class StrategyEngine {
       status: 'ACTIVE',
       highestPrice: optionEntry,
       latestSpot: spot,
-      latestSpotTimestamp: Date.now(),
-      latestOptionTimestamp: Date.now()
+      latestSpotTimestamp: this.state.nifty50?.timestamp || Date.now(),
+      latestOptionTimestamp: this.state.nifty50?.timestamp || Date.now(),
+      entryTime: this.state.nifty50?.timestamp || Date.now()
     } as any;
   }
 
@@ -1608,24 +1731,103 @@ export class StrategyEngine {
       }
 
       if (currentOptPrice >= signal.optionTarget2) {
-        this.closeSignal(signal, currentOptPrice, 'OPTION PREMIUM TARGET 2');
-        newSignals.push(signal);
-        continue;
+        signal.isParabolic = true;
       }
 
       const optionRisk = signal.optionEntry - signal.optionStoploss;
-      if (
-        signal.firstTargetHitFlag &&
-        optionRisk > 0 &&
-        signal.highestPrice > signal.optionEntry
-      ) {
-        const candidate = Number(
-          (signal.highestPrice - optionRisk * 0.5).toFixed(2),
-        );
-        if (candidate > signal.optionStoploss) {
-          signal.optionStoploss = candidate;
-          signal.stoploss = candidate;
-        }
+      if (signal.firstTargetHitFlag && optionRisk > 0) {
+         // 5. Market Structure (Swing) Trailing Stop-Loss
+         const candles = (this.state.nifty50 as any)?.candles1m || [];
+         const entryTime = signal.entryTime || (signal.latestOptionTimestamp - 100000000); // fallback
+         if (candles.length >= 3) {
+            let atrBuffer = 5;
+            const atrPeriod = (this.settings as any).CHOP_ATR_PERIOD || 14;
+            const atrMultiplier = (this.settings as any).SL_BUFFER_ATR_MULTIPLIER || 0.5;
+            if (candles.length >= atrPeriod) {
+               const atrArray = computeATR(candles.map((c) => c.high), candles.map((c) => c.low), candles.map((c) => c.close), atrPeriod);
+               const currentAtr = atrArray[atrArray.length - 1];
+               if (!isNaN(currentAtr)) atrBuffer = currentAtr * atrMultiplier;
+            }
+
+            
+            let parabolicAtrBuffer = 10;
+            if (candles.length >= atrPeriod) {
+               const atrArray = computeATR(candles.map((c) => c.high), candles.map((c) => c.low), candles.map((c) => c.close), atrPeriod);
+               const currentAtr = atrArray[atrArray.length - 1];
+               if (!isNaN(currentAtr)) {
+                   parabolicAtrBuffer = currentAtr * 1.5; // 1.5x ATR for parabolic
+               }
+            }
+
+            if (isCall) {
+               // A. Parabolic ATR Trail
+               let parabolicStop = -Infinity;
+               if (signal.isParabolic) {
+                   const highestSpotSinceEntry = Math.max(...candles.filter((c) => {
+                       const cTs = typeof c.timestamp === 'string' ? new Date(c.timestamp).getTime() : c.timestamp;
+                       return cTs >= entryTime;
+                   }).map((c) => c.high));
+                   parabolicStop = highestSpotSinceEntry - parabolicAtrBuffer;
+               }
+
+               // B. Swing Low Trail
+               let highestSwingLow = -Infinity;
+               for (let i = 2; i < candles.length - 1; i++) {
+                  const cTime = typeof candles[i-1].timestamp === 'string' ? new Date(candles[i-1].timestamp).getTime() : candles[i-1].timestamp;
+                  if (cTime >= entryTime && candles[i-1].low < candles[i-2].low && candles[i-1].low < candles[i].low) {
+                     highestSwingLow = Math.max(highestSwingLow, candles[i-1].low);
+                  }
+               }
+               
+               let swingStop = -Infinity;
+               if (highestSwingLow !== -Infinity) {
+                  swingStop = highestSwingLow - atrBuffer;
+               }
+
+               const bestStop = Math.max(swingStop, parabolicStop, signal.spotInvalidation);
+               if (bestStop > signal.spotInvalidation) {
+                   signal.spotInvalidation = bestStop;
+               }
+            } else {
+               // A. Parabolic ATR Trail
+               let parabolicStop = Infinity;
+               if (signal.isParabolic) {
+                   const lowestSpotSinceEntry = Math.min(...candles.filter((c) => {
+                       const cTs = typeof c.timestamp === 'string' ? new Date(c.timestamp).getTime() : c.timestamp;
+                       return cTs >= entryTime;
+                   }).map((c) => c.low));
+                   parabolicStop = lowestSpotSinceEntry + parabolicAtrBuffer;
+               }
+
+               // B. Swing High Trail
+               let lowestSwingHigh = Infinity;
+               for (let i = 2; i < candles.length - 1; i++) {
+                  const cTime = typeof candles[i-1].timestamp === 'string' ? new Date(candles[i-1].timestamp).getTime() : candles[i-1].timestamp;
+                  if (cTime >= entryTime && candles[i-1].high > candles[i-2].high && candles[i-1].high > candles[i].high) {
+                     lowestSwingHigh = Math.min(lowestSwingHigh, candles[i-1].high);
+                  }
+               }
+               
+               let swingStop = Infinity;
+               if (lowestSwingHigh !== Infinity) {
+                  swingStop = lowestSwingHigh + atrBuffer;
+               }
+
+               const bestStop = Math.min(swingStop, parabolicStop, signal.spotInvalidation);
+               if (bestStop < signal.spotInvalidation) {
+                   signal.spotInvalidation = bestStop;
+               }
+            }
+         }
+         
+         // Still fallback trail the option premium to lock profits just in case gamma is wild
+         if (signal.highestPrice > signal.optionEntry) {
+            const candidate = Number((signal.highestPrice - optionRisk * 0.5).toFixed(2));
+            if (candidate > signal.optionStoploss) {
+               signal.optionStoploss = candidate;
+               signal.stoploss = candidate;
+            }
+         }
       }
     }
   }
@@ -1647,6 +1849,15 @@ export class StrategyEngine {
     this.realizedPnL += signal.realizedPnL;
     
     this.history.set(signal.id, signal);
+    
+    // Prevent memory leaks for 24/7 operation by bounding the history map
+    if (this.history.size > 500) {
+      const oldestKey = this.history.keys().next().value;
+      if (oldestKey) {
+        this.history.delete(oldestKey);
+      }
+    }
+    
     this.activeSignals.delete(signal.id);
   }
 
