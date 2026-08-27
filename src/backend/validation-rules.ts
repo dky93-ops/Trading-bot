@@ -321,6 +321,13 @@ export function rule12ConfirmationCandle(ctx: ValidationContext, setup: Proposed
   if (isCall && c0.close <= c0.open) return fail('FAILED_CONF_CANDLE: CALL setup requires green confirmation candle');
   if (!isCall && c0.close >= c0.open) return fail('FAILED_CONF_CANDLE: PUT setup requires red confirmation candle');
   
+  // Doji Loophole Fix: Ensure candle body is at least 40% of the total candle range
+  const bodySize = Math.abs(c0.close - c0.open);
+  const candleRange = c0.high - c0.low;
+  if (candleRange > 0 && bodySize < candleRange * 0.4) {
+    return fail('FAILED_CONF_CANDLE: Confirmation candle is a doji (body < 40% of range)');
+  }
+  
   // RVOL Check for Traps
   if (setup.setupType === 'OPENING_TRAP') {
     if (ctx.candles1m && ctx.candles1m.length >= 20) {

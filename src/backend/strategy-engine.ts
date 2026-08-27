@@ -548,7 +548,7 @@ export class StrategyEngine {
       sessState,
     );
 
-    const wallTolerance = Number(this.settings.WALL_TOLERANCE_POINTS || 10);
+    const wallTolerance = Number(this.settings.RETEST_TOLERANCE_POINTS || 10);
 
     this.recordWallTests(
       candidates,
@@ -840,7 +840,7 @@ export class StrategyEngine {
     const openingRangeBars = 3;
     if (candles.length <= openingRangeBars + 1) return null;
 
-    const buffer = Math.max(2, Number(this.settings.WALL_TOLERANCE_POINTS || 5));
+    const buffer = Math.max(2, Number(this.settings.RETEST_TOLERANCE_POINTS || 5));
 
     for (let breakIndex = openingRangeBars; breakIndex < candles.length - 2; breakIndex++) {
       const breakCandle = candles[breakIndex];
@@ -1049,7 +1049,7 @@ export class StrategyEngine {
     const levels = this.validStructureLevels(sess);
     const buffer = Math.max(
       2,
-      Number(this.settings.WALL_TOLERANCE_POINTS || 5),
+      Number(this.settings.RETEST_TOLERANCE_POINTS || 5),
     );
 
     const firstBreakIndex = Math.max(1, candles.length - 8);
@@ -1493,7 +1493,7 @@ export class StrategyEngine {
   }
   
   private computeSpotTargets(direction: 'CALL' | 'PUT', spot: number, level: number, chainRows: any[], sess: LocalSessionState, candles: Candle[]) {
-    let buffer = this.settings.WALL_TOLERANCE_POINTS || 10;
+    let buffer = this.settings.SL_BUFFER_POINTS || 10;
     
     const atrPeriod = (this.settings as any).CHOP_ATR_PERIOD || 14;
     const atrMultiplier = (this.settings as any).SL_BUFFER_ATR_MULTIPLIER || 0.5;
@@ -1548,11 +1548,17 @@ export class StrategyEngine {
     }
     const optionEntry = Number(opt.price);
     const lossPercent = this.settings.MAX_OPTION_LOSS_PERCENT || 35;
-    const optionStoploss = Number(
+    const catastrophicOptionStoploss = Number(
       (optionEntry * (1 - lossPercent / 100)).toFixed(2),
     );
-    const optionRisk = optionEntry - optionStoploss;
-    if (!(optionEntry > 0) || !(optionRisk > 0)) return null;
+
+    const riskSpot = Math.abs(spot - targets.structuralStopSpot);
+    let dynamicOptionRisk = riskSpot * 0.5; // Approx ATM delta mapped to option premium
+    if (!Number.isFinite(dynamicOptionRisk) || dynamicOptionRisk < 5) {
+      dynamicOptionRisk = 5;
+    }
+
+    if (!(optionEntry > 0) || !(dynamicOptionRisk > 0)) return null;
 
     const prices = {
       spotEntry: spot,
@@ -1560,12 +1566,11 @@ export class StrategyEngine {
       spotTarget1: targets.target1Spot,
       spotTarget2: targets.target2Spot,
       optionEntry,
-      optionStoploss,
-      optionTarget1: Number((optionEntry + optionRisk).toFixed(2)),
-      optionTarget2: Number((optionEntry + optionRisk * 1.5).toFixed(2)),
+      optionStoploss: catastrophicOptionStoploss,
+      optionTarget1: Number((optionEntry + dynamicOptionRisk).toFixed(2)),
+      optionTarget2: Number((optionEntry + dynamicOptionRisk * 1.5).toFixed(2)),
     };
 
-    const riskSpot = Math.abs(prices.spotEntry - prices.spotInvalidation);
     const rewardSpot = Math.abs(prices.spotTarget1 - prices.spotEntry);
     if (!(riskSpot > 0) || rewardSpot / riskSpot < 0.8) {
       failed.push('FAILED_ROOM_TO_TARGET: Target 1 is less than 0.8R');
@@ -1734,7 +1739,7 @@ export class StrategyEngine {
         signal.isParabolic = true;
       }
 
-      const optionRisk = signal.optionEntry - signal.optionStoploss;
+      const optionRisk = signal.optionTarget1 - signal.optionEntry;
       if (signal.firstTargetHitFlag && optionRisk > 0) {
          // 5. Market Structure (Swing) Trailing Stop-Loss
          const candles = (this.state.nifty50 as any)?.candles1m || [];

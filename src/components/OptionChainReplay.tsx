@@ -246,23 +246,35 @@ export const OptionChainReplay: React.FC = () => {
                   <table className="w-full text-xs font-mono text-center">
                     <thead className="bg-[#0A0F1C] text-[10px] text-gray-500 uppercase sticky top-0">
                       <tr>
-                        <th className="py-2 px-1 text-red-400">CE Premium</th>
+                        <th className="py-2 px-1 text-red-400">CE Vol</th>
+                        <th className="py-2 px-1 text-red-400">CE Delta</th>
+                        <th className="py-2 px-1 text-red-400">CE IV</th>
+                        <th className="py-2 px-1 text-red-400">CE LTP</th>
                         <th className="py-2 px-1 text-red-400">CE OI</th>
                         <th className="py-2 px-1 text-yellow-400">Strike</th>
                         <th className="py-2 px-1 text-brand-green">PE OI</th>
-                        <th className="py-2 px-1 text-brand-green">PE Premium</th>
+                        <th className="py-2 px-1 text-brand-green">PE LTP</th>
+                        <th className="py-2 px-1 text-brand-green">PE IV</th>
+                        <th className="py-2 px-1 text-brand-green">PE Delta</th>
+                        <th className="py-2 px-1 text-brand-green">PE Vol</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#1F2937]">
-                      {selectedSnap.rows.slice(0, 15).map((r, idx) => {
+                      {selectedSnap.rows.map((r, idx) => {
                         const isAtm = Math.abs(r.strike - selectedSnap.spotPrice) < 25;
                         return (
                           <tr key={idx} className={isAtm ? 'bg-yellow-400/10 font-bold' : 'hover:bg-[#1F2937]/30'}>
-                            <td className="py-1.5 text-red-400">₹{r.ce.price}</td>
+                            <td className="py-1.5 text-gray-400">{formatUnits(r.ce.volume)}</td>
+                            <td className="py-1.5 text-gray-400">{r.ce.delta ? r.ce.delta.toFixed(2) : '-'}</td>
+                            <td className="py-1.5 text-gray-400">{r.ce.iv ? r.ce.iv.toFixed(2) : '-'}</td>
+                            <td className="py-1.5 text-red-400">₹{r.ce.ltp}</td>
                             <td className="py-1.5 text-gray-300">{formatUnits(r.ce.totalOi)}</td>
                             <td className={`py-1.5 font-bold ${isAtm ? 'text-yellow-400 underline' : 'text-white'}`}>{r.strike}</td>
                             <td className="py-1.5 text-gray-300">{formatUnits(r.pe.totalOi)}</td>
-                            <td className="py-1.5 text-brand-green">₹{r.pe.price}</td>
+                            <td className="py-1.5 text-brand-green">₹{r.pe.ltp}</td>
+                            <td className="py-1.5 text-gray-400">{r.pe.iv ? r.pe.iv.toFixed(2) : '-'}</td>
+                            <td className="py-1.5 text-gray-400">{r.pe.delta ? r.pe.delta.toFixed(2) : '-'}</td>
+                            <td className="py-1.5 text-gray-400">{formatUnits(r.pe.volume)}</td>
                           </tr>
                         );
                       })}

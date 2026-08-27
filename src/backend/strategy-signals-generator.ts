@@ -39,7 +39,7 @@ export class StrategySignalsGenerator {
     
 
     const optionEntry = Number(optionData.price);
-    const optionStoploss = optionEntry * 0.65; // 35% max loss
+    const optionStoploss = (optionData as any).structuralOptionStop || (optionEntry * 0.65); // 35% max loss
 
     if (!(optionEntry > 0)) return null;
 
@@ -113,7 +113,7 @@ export class StrategySignalsGenerator {
     
 
     const optionEntry = Number(optionData.price);
-    const optionStoploss = optionEntry * 0.65;
+    const optionStoploss = (optionData as any).structuralOptionStop || (optionEntry * 0.65);
 
     if (!(optionEntry > 0)) return null;
 
@@ -189,7 +189,7 @@ export class StrategySignalsGenerator {
     
 
     const optionEntry = Number(optionData.price);
-    const optionStoploss = optionEntry * 0.65;
+    const optionStoploss = (optionData as any).structuralOptionStop || (optionEntry * 0.65);
 
     if (!(optionEntry > 0)) return null;
 
@@ -263,7 +263,7 @@ export class StrategySignalsGenerator {
     
 
     const optionEntry = Number(optionData.price);
-    const optionStoploss = optionEntry * 0.65;
+    const optionStoploss = (optionData as any).structuralOptionStop || (optionEntry * 0.65);
 
     if (!(optionEntry > 0)) return null;
 

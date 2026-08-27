@@ -1,0 +1,39 @@
+--- src/backend/upstox-service.ts
++++ src/backend/upstox-service.ts
+@@ -541,6 +541,9 @@
+       };
+     };
+     try {
++      console.log("[DEBUG] recordOptionChainSnapshot called. isMarketOpen:", this.strategyEngine.isMarketOpen());
+       if (!this.strategyEngine.isMarketOpen()) return;
+       if (!rawRows || rawRows.length === 0) return;
+       const spot = Number(rawRows[0].underlying_spot_price || 0);
+@@ -588,11 +591,15 @@
+       const matchingSnaps = this.optionChainHistory.filter(s => s.instrumentKey === instrumentKey);
+       const lastSnap = matchingSnaps[matchingSnaps.length - 1];
+ 
++      console.log("[DEBUG] lastSnap:", !!lastSnap, "time diff:", lastSnap ? nowMs - lastSnap.timestamp : 'N/A');
+       // Enforce 1-minute recording interval (>= 50 seconds apart)
+       if (!lastSnap || (nowMs - lastSnap.timestamp >= 50000)) {
++        console.log("[DEBUG] passed 1-minute interval, proceeding to record.");
+         const indexCandles = await getCandles('NIFTY', 1, 100).catch(() => []);
++        console.log("[DEBUG] getCandles returned length:", indexCandles.length);
+         
+         const ceWalls: any[] = [];
+         const peWalls: any[] = [];
+@@ -647,6 +654,7 @@
+             pe: makeOption(r.put_options)
+           }))
+         };
++        console.log("[DEBUG] pushing snapshot to optionChainHistory, length before:", this.optionChainHistory.length);
+         this.optionChainHistory.push(snap);
+         if (this.optionChainHistory.length > 5000) {
+           this.optionChainHistory.shift();
+@@ -656,6 +664,7 @@
+         this.saveOptionChainHistoryToDisk();
+       }
+     } catch (e) {
++      console.log("[DEBUG] Exception in recordOptionChainSnapshot:", e);
+       console.error("Error recording 1-min option chain snapshot:", e);
+     }
+   }

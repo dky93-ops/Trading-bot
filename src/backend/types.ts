@@ -9,6 +9,8 @@ export interface AppSettings {
   expiryDate: string;
   strikeOffset?: number;
   WALL_TOLERANCE_POINTS?: number;
+  RETEST_TOLERANCE_POINTS?: number;
+  SL_BUFFER_POINTS?: number;
   OPENING_RANGE_MINUTES?: number;
   defaultLotsPerTrade?: number;
   maxActiveTrades?: number;

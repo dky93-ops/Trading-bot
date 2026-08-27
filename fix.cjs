@@ -1,37 +1,76 @@
 const fs = require('fs');
+let content = fs.readFileSync('src/backend/upstox-service.ts', 'utf8');
 
-// 1. Fix validation-rules.ts
-let rules = fs.readFileSync('src/backend/validation-rules.ts', 'utf8');
-rules = rules.replace(/rule2MarketHours/g, 'rule2OpeningFilter');
-fs.writeFileSync('src/backend/validation-rules.ts', rules);
+// replace rows mapping
+const oldMapping = `        const snap: OptionChainSnapshot = {
+          id: \`OC_1M_\${nowMs}\`,
+          timestamp: nowMs,
+          timeISO: new Date(nowMs).toISOString(),
+          instrumentKey,
+          expiryDate: expiryDate || 'CURRENT',
+          spotPrice: spot,
+          totalCallOI,
+          totalPutOI,
+          pcr,
+          maxCallOIStrike: maxCallStrike,
+          maxPutOIStrike: maxPutStrike,
+          strikeCount: rawRows.length,
+          indexCandles,
+          ceWalls,
+          peWalls,
+          rows: rawRows.map((r: any) => ({
+            strike: r.strike_price,
+            spot: r.underlying_spot_price,
+            ce: makeOption(r.call_options),
+            pe: makeOption(r.put_options)
+          }))
+        };`;
 
-// 2. Fix strategy-engine.ts
-let engine = fs.readFileSync('src/backend/strategy-engine.ts', 'utf8');
+const newMapping = `        let atmStrike = 0;
+        let minDiff = Infinity;
+        for (const r of rawRows) {
+          const diff = Math.abs(r.strike_price - spot);
+          if (diff < minDiff) {
+            minDiff = diff;
+            atmStrike = r.strike_price;
+          }
+        }
+        const atmIndex = rawRows.findIndex((r: any) => r.strike_price === atmStrike);
+        let filteredRows = rawRows;
+        if (atmIndex !== -1) {
+          const startIndex = Math.max(0, atmIndex - 12);
+          const endIndex = Math.min(rawRows.length - 1, atmIndex + 12);
+          filteredRows = rawRows.slice(startIndex, endIndex + 1);
+        }
 
-const createNoTradeFn = `  private createNoTrade(index: string, spot: number, reason: string): EngineDecision {
-    return {
-      timestamp: new Date().toISOString(),
-      signal: 'NO_TRADE',
-      strategy_family: 'NONE',
-      direction: 'NONE',
-      spot: spot,
-      broken_level: 0,
-      wall_above: 0,
-      wall_below: 0,
-      option_type: 'NONE',
-      strike: 0,
-      entry: 0,
-      stoploss: 0,
-      target1: 0,
-      target2: 0,
-      confidence: 0,
-      reason: [reason],
-      fake_signal_filters_passed: [],
-      fake_signal_filters_failed: []
-    } as any;
-  }`;
+        const snap: OptionChainSnapshot = {
+          id: \`OC_1M_\${nowMs}\`,
+          timestamp: nowMs,
+          timeISO: new Date(nowMs).toISOString(),
+          instrumentKey,
+          expiryDate: expiryDate || 'CURRENT',
+          spotPrice: spot,
+          totalCallOI,
+          totalPutOI,
+          pcr,
+          maxCallOIStrike: maxCallStrike,
+          maxPutOIStrike: maxPutStrike,
+          strikeCount: filteredRows.length,
+          indexCandles,
+          ceWalls,
+          peWalls,
+          rows: filteredRows.map((r: any) => ({
+            strike: r.strike_price,
+            spot: r.underlying_spot_price,
+            ce: makeOption(r.call_options),
+            pe: makeOption(r.put_options)
+          }))
+        };`;
 
-if (!engine.includes('createNoTrade(')) {
-    engine = engine.replace(/private async evaluateIndex/g, createNoTradeFn + '\n\n  private async evaluateIndex');
+if (content.includes("strikeCount: rawRows.length,")) {
+  content = content.replace(oldMapping, newMapping);
+  fs.writeFileSync('src/backend/upstox-service.ts', content);
+  console.log("Replaced backend successfully.");
+} else {
+  console.log("Could not find old mapping in upstox-service.ts");
 }
-fs.writeFileSync('src/backend/strategy-engine.ts', engine);

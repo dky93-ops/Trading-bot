@@ -114,6 +114,15 @@ async function startServer() {
   });
 
   // Option Chain Recorded History API for Backtest & Analysis Replay
+  app.get("/api/debug-oc", (req, res) => {
+    res.json({
+      isMarketOpen: upstoxService['strategyEngine'].isMarketOpen(),
+      time: new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }),
+      historyLength: upstoxService.getOptionChainHistory().length,
+      rawHistory: upstoxService.getOptionChainHistory()
+    });
+  });
+
   app.get("/api/option-chain/history", (req, res) => {
     try {
       const history = upstoxService.getOptionChainHistory();

@@ -117,7 +117,24 @@ export class EnhancedOptionChainRecorder {
   private processRows(rawRows: any[], spotPrice: number): EnhancedOptionChainRow[] {
     const enhanced: EnhancedOptionChainRow[] = [];
 
-    for (const row of rawRows) {
+    let atmStrike = 0;
+    let minDiff = Infinity;
+    for (const r of rawRows) {
+      const diff = Math.abs(r.strike_price - spotPrice);
+      if (diff < minDiff) {
+        minDiff = diff;
+        atmStrike = r.strike_price;
+      }
+    }
+    const atmIndex = rawRows.findIndex((r: any) => r.strike_price === atmStrike);
+    let filteredRows = rawRows;
+    if (atmIndex !== -1) {
+      const startIndex = Math.max(0, atmIndex - 12);
+      const endIndex = Math.min(rawRows.length - 1, atmIndex + 12);
+      filteredRows = rawRows.slice(startIndex, endIndex + 1);
+    }
+
+    for (const row of filteredRows) {
       const strike = Number(row.strike_price);
       if (!Number.isFinite(strike)) continue;
 
