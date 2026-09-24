@@ -99,6 +99,11 @@ export class UpstoxDataFetcher {
           );
       }
     } catch (error: any) {
+      const errCode = error.response?.data?.errors?.[0]?.errorCode || error.response?.data?.errors?.[0]?.error_code;
+      if (errCode === 'UDAPI1087') {
+        console.warn(`Upstox API: Invalid instrument key (${instrumentKey}) - skipping candles`);
+        return [];
+      }
       console.error(`Upstox API error for ${timeframeMinutes}m candles:`, error.message);
       if (error.response?.status === 429) {
         throw new Error('RATE_LIMIT');
@@ -143,6 +148,11 @@ export class UpstoxDataFetcher {
         );
       }
     } catch (error: any) {
+      const errCode = error.response?.data?.errors?.[0]?.errorCode || error.response?.data?.errors?.[0]?.error_code;
+      if (errCode === 'UDAPI1087') {
+        console.warn(`Upstox API: Invalid instrument key (${instrumentKey}) - skipping option chain`);
+        return [];
+      }
       console.error('Failed to fetch option chain:', error.message);
     }
 

@@ -1,59 +1,96 @@
 const fs = require('fs');
-let code = fs.readFileSync('src/App.tsx', 'utf8');
+let code = fs.readFileSync('src/components/LiveChart.tsx', 'utf8');
 
+// Al Brooks
 code = code.replace(
-`  const fetchData = async () => {
-    setLoading(true);
-    try {
-      const res = await fetch(\`/api/option-chain?instrument=\${encodeURIComponent(instrument)}&expiry=\${encodeURIComponent(expiry)}\`);
-      const json = await res.json();
-      if (json && json.status === 'success' && Array.isArray(json.data) && json.data.length > 0) {
-        setData(json.data);
-        setFetchError(null);
-      } else {
-        if (json && json.message) {
-          setFetchError(json.message);
-        } else {
-          setFetchError("No option chain data returned from Upstox API");
-        }
-      }
-    } catch (e: any) {
-      console.error("Error fetching option chain data:", e);
-      setFetchError(e.message || "Failed to reach backend option chain API");
-    }
-    setLoading(false);
-  };`,
-`  const fetchData = async () => {
-    setLoading(true);
-    try {
-      const res = await fetch(\`/api/option-chain?instrument=\${encodeURIComponent(instrument)}&expiry=\${encodeURIComponent(expiry)}\`);
-      if (!res.ok) {
-        setFetchError(\`Server Error: \${res.status}\`);
-        return;
-      }
-      const contentType = res.headers.get("content-type");
-      if (!contentType || contentType.indexOf("application/json") === -1) {
-        // Silently ignore non-JSON responses during server restart
-        return;
-      }
-      const json = await res.json();
-      if (json && json.status === 'success' && Array.isArray(json.data) && json.data.length > 0) {
-        setData(json.data);
-        setFetchError(null);
-      } else {
-        if (json && json.message) {
-          setFetchError(json.message);
-        } else {
-          setFetchError("No option chain data returned from Upstox API");
-        }
-      }
-    } catch (e: any) {
-      // Don't crash UI, just show a temporary fetch error
-      setFetchError("Connection interrupted (server restarting or offline)");
-    } finally {
-      setLoading(false);
-    }
-  };`
+  '// H1/L1, H2/L2',
+  '// H1/L1, H2/L2\n       if (activeStrategies.alBrooks) {'
+);
+code = code.replace(
+  '// II pattern setup',
+  '}\n       // II pattern setup'
 );
 
-fs.writeFileSync('src/App.tsx', code);
+code = code.replace(
+  '// II pattern setup',
+  '// II pattern setup\n       if (activeStrategies.alBrooks) {'
+);
+code = code.replace(
+  '// Pin Bars',
+  '}\n       // Pin Bars'
+);
+
+code = code.replace(
+  '// Pin Bars',
+  '// Pin Bars\n       if (activeStrategies.alBrooks) {'
+);
+code = code.replace(
+  '// Engulfing',
+  '}\n       // Engulfing'
+);
+
+code = code.replace(
+  '// Engulfing',
+  '// Engulfing\n       if (activeStrategies.alBrooks) {'
+);
+code = code.replace(
+  '// Hammer / Shooting Star',
+  '}\n       // Hammer / Shooting Star'
+);
+
+code = code.replace(
+  '// Hammer / Shooting Star',
+  '// Hammer / Shooting Star\n       if (activeStrategies.candlesticks) {'
+);
+code = code.replace(
+  '// Doji Sandwich',
+  '}\n       // Doji Sandwich'
+);
+
+code = code.replace(
+  '// Doji Sandwich',
+  '// Doji Sandwich\n       if (activeStrategies.alBrooks) {'
+);
+code = code.replace(
+  '// Upthrust / Downthrust',
+  '}\n       // Upthrust / Downthrust'
+);
+
+code = code.replace(
+  '// Upthrust / Downthrust',
+  '// Upthrust / Downthrust\n       if (activeStrategies.alBrooks) {'
+);
+code = code.replace(
+  '// Scalping PA',
+  '}\n       // Scalping PA'
+);
+
+code = code.replace(
+  '// Scalping PA',
+  '// Scalping PA\n       if (activeStrategies.scalping) {'
+);
+code = code.replace(
+  '// Support/Resistance SMA RSI',
+  '}\n       // Support/Resistance SMA RSI'
+);
+
+code = code.replace(
+  '// Support/Resistance SMA RSI',
+  '// Support/Resistance SMA RSI\n       if (activeStrategies.srRsi) {'
+);
+code = code.replace(
+  '// MAEE / MBEE Strategies',
+  '}\n       // MAEE / MBEE Strategies'
+);
+
+code = code.replace(
+  '// MAEE / MBEE Strategies',
+  '// MAEE / MBEE Strategies\n       if (activeStrategies.mbee) {'
+);
+code = code.replace(
+  '// 1. Manage open trade',
+  '}\n       // 1. Manage open trade'
+);
+
+fs.writeFileSync('src/components/LiveChart.tsx', code);
+console.log('Patched conditionals');

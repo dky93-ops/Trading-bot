@@ -1,76 +1,35 @@
 const fs = require('fs');
-let content = fs.readFileSync('src/backend/upstox-service.ts', 'utf8');
+let code = fs.readFileSync('src/components/LiveChart.tsx', 'utf8');
 
-// replace rows mapping
-const oldMapping = `        const snap: OptionChainSnapshot = {
-          id: \`OC_1M_\${nowMs}\`,
-          timestamp: nowMs,
-          timeISO: new Date(nowMs).toISOString(),
-          instrumentKey,
-          expiryDate: expiryDate || 'CURRENT',
-          spotPrice: spot,
-          totalCallOI,
-          totalPutOI,
-          pcr,
-          maxCallOIStrike: maxCallStrike,
-          maxPutOIStrike: maxPutStrike,
-          strikeCount: rawRows.length,
-          indexCandles,
-          ceWalls,
-          peWalls,
-          rows: rawRows.map((r: any) => ({
-            strike: r.strike_price,
-            spot: r.underlying_spot_price,
-            ce: makeOption(r.call_options),
-            pe: makeOption(r.put_options)
-          }))
-        };`;
+// The faulty injected lines:
+code = code.replace(/       }\n       \/\/ II pattern setup/g, '       // II pattern setup');
+code = code.replace(/\/\/ II pattern setup\n       if \(activeStrategies\.alBrooks\) \{/g, '// II pattern setup');
 
-const newMapping = `        let atmStrike = 0;
-        let minDiff = Infinity;
-        for (const r of rawRows) {
-          const diff = Math.abs(r.strike_price - spot);
-          if (diff < minDiff) {
-            minDiff = diff;
-            atmStrike = r.strike_price;
-          }
-        }
-        const atmIndex = rawRows.findIndex((r: any) => r.strike_price === atmStrike);
-        let filteredRows = rawRows;
-        if (atmIndex !== -1) {
-          const startIndex = Math.max(0, atmIndex - 12);
-          const endIndex = Math.min(rawRows.length - 1, atmIndex + 12);
-          filteredRows = rawRows.slice(startIndex, endIndex + 1);
-        }
+code = code.replace(/       }\n       \/\/ Pin Bars/g, '       // Pin Bars');
+code = code.replace(/\/\/ Pin Bars\n       if \(activeStrategies\.alBrooks\) \{/g, '// Pin Bars');
 
-        const snap: OptionChainSnapshot = {
-          id: \`OC_1M_\${nowMs}\`,
-          timestamp: nowMs,
-          timeISO: new Date(nowMs).toISOString(),
-          instrumentKey,
-          expiryDate: expiryDate || 'CURRENT',
-          spotPrice: spot,
-          totalCallOI,
-          totalPutOI,
-          pcr,
-          maxCallOIStrike: maxCallStrike,
-          maxPutOIStrike: maxPutStrike,
-          strikeCount: filteredRows.length,
-          indexCandles,
-          ceWalls,
-          peWalls,
-          rows: filteredRows.map((r: any) => ({
-            strike: r.strike_price,
-            spot: r.underlying_spot_price,
-            ce: makeOption(r.call_options),
-            pe: makeOption(r.put_options)
-          }))
-        };`;
+code = code.replace(/       }\n       \/\/ Engulfing/g, '       // Engulfing');
+code = code.replace(/\/\/ Engulfing\n       if \(activeStrategies\.alBrooks\) \{/g, '// Engulfing');
 
-if (content.includes("strikeCount: rawRows.length,")) {
-  content = content.replace(oldMapping, newMapping);
-  fs.writeFileSync('src/backend/upstox-service.ts', content);
-  console.log("Replaced backend successfully.");
-} else {
-  console.log("Could not find old mapping in upstox-service.ts");
-}
+code = code.replace(/       }\n       \/\/ Hammer \/ Shooting Star/g, '       // Hammer / Shooting Star');
+code = code.replace(/\/\/ Hammer \/ Shooting Star\n       if \(activeStrategies\.candlesticks\) \{/g, '// Hammer / Shooting Star');
+
+code = code.replace(/       }\n       \/\/ Doji Sandwich/g, '       // Doji Sandwich');
+code = code.replace(/\/\/ Doji Sandwich\n       if \(activeStrategies\.alBrooks\) \{/g, '// Doji Sandwich');
+
+code = code.replace(/       }\n       \/\/ Upthrust \/ Downthrust/g, '       // Upthrust / Downthrust');
+code = code.replace(/\/\/ Upthrust \/ Downthrust\n       if \(activeStrategies\.alBrooks\) \{/g, '// Upthrust / Downthrust');
+
+code = code.replace(/       }\n       \/\/ Scalping PA/g, '       // Scalping PA');
+code = code.replace(/\/\/ Scalping PA\n       if \(activeStrategies\.scalping\) \{/g, '// Scalping PA');
+
+code = code.replace(/       }\n       \/\/ Support\/Resistance SMA RSI/g, '       // Support/Resistance SMA RSI');
+code = code.replace(/\/\/ Support\/Resistance SMA RSI\n       if \(activeStrategies\.srRsi\) \{/g, '// Support/Resistance SMA RSI');
+
+code = code.replace(/       }\n       \/\/ MAEE \/ MBEE Strategies/g, '       // MAEE / MBEE Strategies');
+code = code.replace(/\/\/ MAEE \/ MBEE Strategies\n       if \(activeStrategies\.mbee\) \{/g, '// MAEE / MBEE Strategies');
+
+code = code.replace(/       }\n       \/\/ 1\. Manage open trade/g, '       // 1. Manage open trade');
+
+fs.writeFileSync('src/components/LiveChart.tsx', code);
+console.log('Cleaned up bad conditionals');

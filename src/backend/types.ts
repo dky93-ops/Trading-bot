@@ -31,7 +31,11 @@ export interface AppSettings {
     continuationBreakout: StrategyConfig;
     oiWallRejection: StrategyConfig;
     technicalConfluence?: StrategyConfig;
+    adxBreakout?: StrategyConfig;
+    alphaTrend?: StrategyConfig;
   };
+  goldInstrumentKey?: string;
+  goldEntryMode?: 'BREAKOUT' | 'RETEST' | 'ADAPTIVE';
 }
 
 export interface StrategyConfig {
@@ -46,6 +50,15 @@ export interface InstrumentData {
   lastPrice: number;
   change: number;
   timestamp: any;
+  open?: number;
+  high?: number;
+  low?: number;
+  close?: number;
+  volume?: number;
+  oi?: number;
+  symbol?: string;
+  instrumentToken?: string;
+  feedSource?: 'UPSTOX' | 'INSTITUTIONAL';
 }
 
 export interface AppState {
@@ -53,7 +66,9 @@ export interface AppState {
   spotFeedTimestamp: number;
   optionChainSnapshotTimestamp: number;
   nifty50: InstrumentData;
+  bankNifty?: InstrumentData;
   indiaVix: InstrumentData;
+  gold?: InstrumentData;
   isConnected: boolean;
   apiError?: string;
   signals: any[];
@@ -156,8 +171,8 @@ export interface SignalPrices {
 
 export interface EngineDecision {
   timestamp: string;
-  signal: 'BUY_CALL' | 'BUY_PUT' | 'NO_TRADE';
-  strategy_family: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION' | 'TECHNICAL_CONFLUENCE' | 'NONE';
+  signal: 'BUY_CALL' | 'BUY_PUT' | 'NO_TRADE' | 'BUY' | 'SELL';
+  strategy_family: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION' | 'TECHNICAL_CONFLUENCE' | 'ADX_BREAKOUT' | 'NONE';
   direction: 'CALL' | 'PUT' | 'NONE';
   spot?: number;
   broken_level?: number;
@@ -169,6 +184,7 @@ export interface EngineDecision {
   stoploss: number;
   target1: number;
   target2: number;
+  target?: number;
   confidence: number;
   reason: string[];
   fake_signal_filters_passed?: string[];
@@ -221,6 +237,7 @@ export interface InternalSignal extends EngineDecision {
   leg?: 'MAIN' | 'HEDGE';
   isStraddle?: boolean;
   firstTargetHitFlag?: boolean;
+  isBreakevenLocked?: boolean;
   secondTargetHitFlag?: boolean;
   isParabolic?: boolean;
   trailingStopActiveFlag?: boolean;
@@ -266,6 +283,8 @@ export interface OptionData {
 }
 
 export interface OptionChainSnapshot {
+  atmStrike?: number;
+  enhancedRows?: any[];
   id: string;
   timestamp: number;
   timeISO: string;

@@ -43,6 +43,10 @@ export class StrategySignalsGenerator {
 
     if (!(optionEntry > 0)) return null;
 
+    const optRisk = Math.max(optionEntry - optionStoploss, 8);
+    const optionTarget1 = Number((optionEntry + Math.max(optRisk * 1.3, 14)).toFixed(2));
+    const optionTarget2 = Number((optionEntry + Math.max(optRisk * 2.6, 28)).toFixed(2));
+
     return {
       id: `FR_${index}_${Date.now()}`,
       index,
@@ -64,10 +68,10 @@ export class StrategySignalsGenerator {
       stoploss: optionStoploss,
       optionEntry,
       optionStoploss,
-      optionTarget1: optionEntry + (optionEntry - optionStoploss),
-      optionTarget2: optionEntry + (optionEntry - optionStoploss) * 1.5,
-      target1: optionEntry + (optionEntry - optionStoploss),
-      target2: optionEntry + (optionEntry - optionStoploss) * 1.5,
+      optionTarget1,
+      optionTarget2,
+      target1: optionTarget1,
+      target2: optionTarget2,
       broken_level: level,
       confidence,
       reason: passed,
@@ -79,8 +83,8 @@ export class StrategySignalsGenerator {
         spotTarget2: setup.target2 || spot,
         optionEntry,
         optionStoploss,
-        optionTarget1: optionEntry + (optionEntry - optionStoploss),
-        optionTarget2: optionEntry + (optionEntry - optionStoploss) * 1.5
+        optionTarget1,
+        optionTarget2
       },
       latestPrice: optionEntry,
       latestSpot: spot,
@@ -117,6 +121,10 @@ export class StrategySignalsGenerator {
 
     if (!(optionEntry > 0)) return null;
 
+    const optRisk = Math.max(optionEntry - optionStoploss, 8);
+    const optionTarget1 = Number((optionEntry + Math.max(optRisk * 1.3, 14)).toFixed(2));
+    const optionTarget2 = Number((optionEntry + Math.max(optRisk * 2.6, 28)).toFixed(2));
+
     return {
       id: `OT_${index}_${Date.now()}`,
       index,
@@ -138,10 +146,10 @@ export class StrategySignalsGenerator {
       stoploss: optionStoploss,
       optionEntry,
       optionStoploss,
-      optionTarget1: optionEntry + (optionEntry - optionStoploss),
-      optionTarget2: optionEntry + (optionEntry - optionStoploss) * 1.5,
-      target1: optionEntry + (optionEntry - optionStoploss),
-      target2: optionEntry + (optionEntry - optionStoploss) * 1.5,
+      optionTarget1,
+      optionTarget2,
+      target1: optionTarget1,
+      target2: optionTarget2,
       broken_level: level,
       confidence,
       reason: passed,
@@ -153,8 +161,8 @@ export class StrategySignalsGenerator {
         spotTarget2: setup.target2 || spot,
         optionEntry,
         optionStoploss,
-        optionTarget1: optionEntry + (optionEntry - optionStoploss),
-        optionTarget2: optionEntry + (optionEntry - optionStoploss) * 1.5
+        optionTarget1,
+        optionTarget2
       },
       latestPrice: optionEntry,
       latestSpot: spot,
@@ -185,13 +193,14 @@ export class StrategySignalsGenerator {
   ): InternalSignal | null {
     if (!optionData) return null;
 
-    
-    
-
     const optionEntry = Number(optionData.price);
     const optionStoploss = (optionData as any).structuralOptionStop || (optionEntry * 0.65);
 
     if (!(optionEntry > 0)) return null;
+
+    const optRisk = Math.max(optionEntry - optionStoploss, 8);
+    const optionTarget1 = Number((optionEntry + Math.max(optRisk * 1.3, 14)).toFixed(2));
+    const optionTarget2 = Number((optionEntry + Math.max(optRisk * 2.6, 28)).toFixed(2));
 
     return {
       id: `CT_${index}_${Date.now()}`,
@@ -214,10 +223,10 @@ export class StrategySignalsGenerator {
       stoploss: optionStoploss,
       optionEntry,
       optionStoploss,
-      optionTarget1: optionEntry + (optionEntry - optionStoploss),
-      optionTarget2: optionEntry + (optionEntry - optionStoploss) * 1.5,
-      target1: optionEntry + (optionEntry - optionStoploss),
-      target2: optionEntry + (optionEntry - optionStoploss) * 1.5,
+      optionTarget1,
+      optionTarget2,
+      target1: optionTarget1,
+      target2: optionTarget2,
       broken_level: level,
       confidence,
       reason: passed,
@@ -229,8 +238,8 @@ export class StrategySignalsGenerator {
         spotTarget2: setup.target2 || spot,
         optionEntry,
         optionStoploss,
-        optionTarget1: optionEntry + (optionEntry - optionStoploss),
-        optionTarget2: optionEntry + (optionEntry - optionStoploss) * 1.5
+        optionTarget1,
+        optionTarget2
       },
       latestPrice: optionEntry,
       latestSpot: spot,
@@ -260,12 +269,14 @@ export class StrategySignalsGenerator {
   ): InternalSignal | null {
     if (!optionData) return null;
 
-    
-
     const optionEntry = Number(optionData.price);
     const optionStoploss = (optionData as any).structuralOptionStop || (optionEntry * 0.65);
 
     if (!(optionEntry > 0)) return null;
+
+    const optRisk = Math.max(optionEntry - optionStoploss, 8);
+    const optionTarget1 = Number((optionEntry + Math.max(optRisk * 1.3, 14)).toFixed(2));
+    const optionTarget2 = Number((optionEntry + Math.max(optRisk * 2.6, 28)).toFixed(2));
 
     return {
       id: `OW_${index}_${Date.now()}`,
@@ -288,10 +299,10 @@ export class StrategySignalsGenerator {
       stoploss: optionStoploss,
       optionEntry,
       optionStoploss,
-      optionTarget1: optionEntry + (optionEntry - optionStoploss),
-      optionTarget2: optionEntry + (optionEntry - optionStoploss) * 1.5,
-      target1: optionEntry + (optionEntry - optionStoploss),
-      target2: optionEntry + (optionEntry - optionStoploss) * 1.5,
+      optionTarget1,
+      optionTarget2,
+      target1: optionTarget1,
+      target2: optionTarget2,
       broken_level: wall,
       confidence,
       reason: passed,
@@ -303,8 +314,8 @@ export class StrategySignalsGenerator {
         spotTarget2: setup.target2 || spot,
         optionEntry,
         optionStoploss,
-        optionTarget1: optionEntry + (optionEntry - optionStoploss),
-        optionTarget2: optionEntry + (optionEntry - optionStoploss) * 1.5
+        optionTarget1,
+        optionTarget2
       },
       latestPrice: optionEntry,
       latestSpot: spot,

@@ -92,6 +92,15 @@ export const OptionChainReplay: React.FC = () => {
               <Download size={14} />
               <span>Export Replay JSON ({history.length})</span>
             </button>
+            <button
+              onClick={() => window.open('/api/option-chain/export-excel', '_blank')}
+              disabled={history.length === 0}
+              className="flex items-center space-x-1.5 px-4 py-2 rounded bg-brand-blue hover:bg-blue-400 text-black text-xs font-extrabold transition-all shadow-[0_0_12px_rgba(59,130,246,0.3)] disabled:opacity-50 cursor-pointer"
+            >
+              <Download size={14} />
+              <span>Export Excel</span>
+            </button>
+
 
             <button
               onClick={handleClear}

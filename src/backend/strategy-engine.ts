@@ -1,4 +1,4 @@
-import { computeEMA, computeSMA, computeRSI, computeMACD, computeBollinger, computeATR, computeSuperTrend } from './technical-indicators';
+import { computeEMA, computeSMA, computeRSI, computeMACD, computeBollinger, computeATR, computeSuperTrend, computeADX, computeAlphaTrend } from './technical-indicators';
 import {
   AppSettings,
   AppState,
@@ -322,18 +322,37 @@ export class StrategyEngine {
     }
   }
 
+  public isMcxMarketOpen(): boolean {
+    try {
+      const istString = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+      const istDate = new Date(istString);
+      const day = istDate.getDay(); // 0 = Sunday, 6 = Saturday
+      if (day === 0 || day === 6) return false;
+
+      const mins = istDate.getHours() * 60 + istDate.getMinutes();
+      // MCX Trading Hours: 09:00 AM (540 mins) to 11:30 PM (1410 mins) IST
+      return mins >= 540 && mins <= 1410;
+    } catch (e) {
+      return false;
+    }
+  }
+
   public async onTick(newState: AppState): Promise<any[]> {
     this.state = newState;
     const newSignals: InternalSignal[] = [];
     const decisions: EngineDecision[] = [];
 
-    // If global trading toggle is disabled or market is closed, exit active trades and return
-    if (!this.settings.isTradingEnabled || !this.isMarketOpen()) {
+    const nseOpen = this.isMarketOpen();
+    const mcxOpen = this.isMcxMarketOpen();
+    const anyMarketOpen = nseOpen || mcxOpen;
+
+    // If global trading toggle is disabled or all markets are closed, exit active trades and return
+    if (!this.settings.isTradingEnabled || !anyMarketOpen) {
       if (this.activeSignals.size > 0) {
         this.exitAllActiveTrades(
           !this.settings.isTradingEnabled 
             ? "Trading Paused" 
-            : "Market Closed (Outside NSE Trading Hours 09:15 - 15:30 IST)"
+            : "Market Closed (Outside Trading Hours)"
         );
       }
       return [
@@ -342,17 +361,43 @@ export class StrategyEngine {
       ].slice(0, 15);
     }
 
+    // If NSE closed, exit only NSE trades
+    if (!nseOpen) {
+      for (const [id, signal] of this.activeSignals.entries()) {
+        if (signal.index === 'NIFTY' && signal.status === 'ACTIVE') {
+          this.closeSignal(signal, signal.latestPrice || signal.entryPrice, 'Day End Close: Outside NSE Trading Hours (No Overnight Carry)');
+        }
+      }
+    }
+
+    // If MCX closed, exit MCX Gold trades
+    if (!mcxOpen) {
+      for (const [id, signal] of this.activeSignals.entries()) {
+        if (signal.index === 'GOLD' && signal.status === 'ACTIVE') {
+          this.closeSignal(signal, signal.latestPrice || signal.entryPrice, 'Day End Close: Outside MCX Trading Hours (No Overnight Carry)');
+        }
+      }
+    }
+
     // Manage active trades first
     this.manageActiveTrades(newSignals);
 
-    // Evaluate NIFTY ONLY
-    if (this.state.nifty50.lastPrice > 0) {
+    // Evaluate NIFTY ONLY when NSE open
+    if (nseOpen && this.state.nifty50.lastPrice > 0) {
       const sig = await this.evaluateIndex('NIFTY', this.state.nifty50.lastPrice);
       if (sig) {
         if (sig.signal !== 'NO_TRADE') {
           newSignals.push(sig);
         }
         decisions.push(this.mapToPublicDecision(sig));
+      }
+    }
+
+    // Evaluate GOLD (Rob Booker - ADX Breakout)
+    if (this.state.gold && this.state.gold.lastPrice > 0) {
+      const goldSig = await this.evaluateGold(this.state.gold.lastPrice);
+      if (goldSig && goldSig.signal !== 'NO_TRADE') {
+        newSignals.push(goldSig);
       }
     }
 
@@ -364,17 +409,360 @@ export class StrategyEngine {
       const curPrice = sig.latestPrice || sig.entryPrice;
       const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
       const lotConfig = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
-      const qty = 75 * lotConfig;
-      this.unrealizedPnL += (curPrice - sig.entryPrice) * qty;
+      const isGold = sig.index === 'GOLD';
+      const qty = isGold ? lotConfig : 75 * lotConfig;
+      const isShort = sig.signal === 'SELL' || sig.direction === 'PUT';
+      const pnlPerUnit = isShort ? (sig.entryPrice - curPrice) : (curPrice - sig.entryPrice);
+      this.unrealizedPnL += pnlPerUnit * qty;
     }
     this.overallPnL = this.realizedPnL + this.unrealizedPnL;
-        // Instead of just new decisions, return all active and recently closed signals so the frontend can display them properly
+    // Instead of just new decisions, return all active and recently closed signals so the frontend can display them properly
     const allSignals = [
       ...Array.from(this.activeSignals.values()),
       ...Array.from(this.history.values()).reverse()
     ].slice(0, 15);
     return allSignals;
   }
+
+  private async evaluateGold(spotPrice: number): Promise<InternalSignal | null> {
+    const isTradingEnabled = this.settings.isTradingEnabled !== false;
+    const isAdxBreakoutEnabled = (this.settings.strategies as any)?.adxBreakout?.enabled !== false;
+    const isAlphaTrendEnabled = (this.settings.strategies as any)?.alphaTrend?.enabled === true;
+    if (!isTradingEnabled || (!isAdxBreakoutEnabled && !isAlphaTrendEnabled)) return null;
+
+    // Intraday rule: Do NOT open fresh positions near day end (after 23:15 IST)
+    try {
+      const istString = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+      const istDate = new Date(istString);
+      const totalMins = istDate.getHours() * 60 + istDate.getMinutes();
+      if (totalMins >= 23 * 60 + 15) return null;
+    } catch (_) {}
+
+    // Check if there is already an active trade for GOLD
+    for (const signal of this.activeSignals.values()) {
+      if (signal.index === 'GOLD' && signal.status === 'ACTIVE') {
+        return null;
+      }
+    }
+
+    // Fetch GOLD 1m candles
+    let candles = await getCandles('GOLD', 1, 60);
+    if (!candles || candles.length < 35) return null;
+
+    candles = candles.slice().sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    const closePrices = candles.map(c => c.close);
+    const highPrices = candles.map(c => c.high);
+    const lowPrices = candles.map(c => c.low);
+    const volumes = candles.map(c => c.volume || 1);
+
+    const atrData = computeATR(highPrices, lowPrices, closePrices, 14);
+    const lastIdx = candles.length - 1;
+    const prevIdx = lastIdx - 1;
+    const currCandle = candles[lastIdx];
+    const prevCandle = candles[prevIdx];
+    const atr = atrData[lastIdx] || 1;
+    const currClose = currCandle.close;
+    const prevClose = prevCandle.close;
+
+    const timeObj = new Date();
+    const timestampISO = timeObj.toISOString();
+
+    // -------------------------------------------------------------------------
+    // Strategy 1: AlphaTrend Strategy for Gold (if enabled)
+    // -------------------------------------------------------------------------
+    if (isAlphaTrendEnabled) {
+      const alpha = computeAlphaTrend(highPrices, lowPrices, closePrices, volumes, 14, 1.0, false);
+      const isBuySignal = alpha.buySignal[lastIdx];
+      const isSellSignal = alpha.sellSignal[lastIdx];
+
+      if (isBuySignal) {
+        const entryPrice = currClose;
+        const targetDist = 1.8 * atr;
+        const riskDist = 1.2 * atr;
+        const target = entryPrice + targetDist;
+        const stopLoss = entryPrice - riskDist;
+        const id = `GOLD-${timeObj.getTime()}-ALPHATREND-BUY`;
+
+        return {
+          id,
+          timestamp: timestampISO,
+          signal: 'BUY',
+          strategy: 'alphaTrend',
+          strategy_family: 'ALPHATREND',
+          strategy_name: 'AlphaTrend Strategy (Gold)',
+          direction: 'CALL',
+          index: 'GOLD',
+          instrumentKey: this.state.gold?.instrumentToken || (this.settings as any).goldInstrumentKey || 'MCX_FO|483079',
+          entry: entryPrice,
+          entryPrice: entryPrice,
+          latestPrice: entryPrice,
+          stoploss: stopLoss,
+          optionStoploss: stopLoss,
+          target: target,
+          target1: target,
+          target2: target + 1.0 * atr,
+          optionTarget1: target,
+          optionTarget2: target + 1.0 * atr,
+          optionEntry: entryPrice,
+          spotEntry: entryPrice,
+          spotInvalidation: stopLoss,
+          spotTarget1: target,
+          spotTarget2: target + 1.0 * atr,
+          confidence: 89,
+          status: 'ACTIVE',
+          reason: [
+            `AlphaTrend Bullish Momentum Cross on Gold`,
+            `Dynamic AlphaTrend Support: ${alpha.alphaTrend[lastIdx]?.toFixed(1)}`,
+            `Target: +1.8x ATR (${target.toFixed(1)})`,
+            `Stop Loss: -1.2x ATR (${stopLoss.toFixed(1)})`,
+            `Breakeven Protection: Auto-locks SL to entry at 50% target`
+          ],
+          entryTime: timeObj.getTime(),
+          latestOptionTimestamp: timeObj.getTime()
+        } as any;
+      } else if (isSellSignal) {
+        const entryPrice = currClose;
+        const targetDist = 1.8 * atr;
+        const riskDist = 1.2 * atr;
+        const target = entryPrice - targetDist;
+        const stopLoss = entryPrice + riskDist;
+        const id = `GOLD-${timeObj.getTime()}-ALPHATREND-SELL`;
+
+        return {
+          id,
+          timestamp: timestampISO,
+          signal: 'SELL',
+          strategy: 'alphaTrend',
+          strategy_family: 'ALPHATREND',
+          strategy_name: 'AlphaTrend Strategy (Gold)',
+          direction: 'PUT',
+          index: 'GOLD',
+          instrumentKey: this.state.gold?.instrumentToken || (this.settings as any).goldInstrumentKey || 'MCX_FO|483079',
+          entry: entryPrice,
+          entryPrice: entryPrice,
+          latestPrice: entryPrice,
+          stoploss: stopLoss,
+          optionStoploss: stopLoss,
+          target: target,
+          target1: target,
+          target2: target - 1.0 * atr,
+          optionTarget1: target,
+          optionTarget2: target - 1.0 * atr,
+          optionEntry: entryPrice,
+          spotEntry: entryPrice,
+          spotInvalidation: stopLoss,
+          spotTarget1: target,
+          spotTarget2: target - 1.0 * atr,
+          confidence: 89,
+          status: 'ACTIVE',
+          reason: [
+            `AlphaTrend Bearish Momentum Cross on Gold`,
+            `Dynamic AlphaTrend Resistance: ${alpha.alphaTrend[lastIdx]?.toFixed(1)}`,
+            `Target: -1.8x ATR (${target.toFixed(1)})`,
+            `Stop Loss: +1.2x ATR (${stopLoss.toFixed(1)})`,
+            `Breakeven Protection: Auto-locks SL to entry at 50% target`
+          ],
+          entryTime: timeObj.getTime(),
+          latestOptionTimestamp: timeObj.getTime()
+        } as any;
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Strategy 2: Rob Booker - ADX Breakout & Retest Engine for Gold
+    // -------------------------------------------------------------------------
+    if (isAdxBreakoutEnabled) {
+      const adxData = computeADX(highPrices, lowPrices, closePrices, 14);
+      const sig = adxData.adx[lastIdx];
+      if (isNaN(sig)) return null;
+
+      // boxLookBack = 20
+      const boxLookBack = 20;
+      if (lastIdx < boxLookBack + 1) return null;
+
+      let prevBoxUpper = -Infinity;
+      let prevBoxLower = Infinity;
+      for (let k = lastIdx - boxLookBack; k < lastIdx; k++) {
+        prevBoxUpper = Math.max(prevBoxUpper, highPrices[k]);
+        prevBoxLower = Math.min(prevBoxLower, lowPrices[k]);
+      }
+      const boxWidth = prevBoxUpper - prevBoxLower;
+      if (boxWidth <= 0) return null;
+
+      // Reject climax exhaustion candles (avoids buying at peak blow-offs)
+      const barRange = currCandle.high - currCandle.low;
+      if (barRange > 2.5 * atr) return null;
+
+      const entryMode = (this.settings as any).goldEntryMode || 'BREAKOUT';
+
+      // 1. Direct Breakout Detection
+      const isADXLow = sig < 24;
+      const isBuyBreakout = isADXLow && prevClose <= prevBoxUpper && currClose > prevBoxUpper;
+      const isSellBreakout = isADXLow && prevClose >= prevBoxLower && currClose < prevBoxLower;
+
+      // 2. Retest Detection
+      // Check if price previously broke out 1 to 5 bars ago, and current bar confirms pullback retest of the broken level
+      let isBuyRetest = false;
+      let isSellRetest = false;
+
+      if (entryMode === 'RETEST' || entryMode === 'ADAPTIVE') {
+        for (let look = 1; look <= 5; look++) {
+          const testIdx = lastIdx - look;
+          if (testIdx < boxLookBack + 1) break;
+          const bPrev = candles[testIdx - 1];
+          const bCurr = candles[testIdx];
+          const bAdx = adxData.adx[testIdx];
+
+          // Check if a valid box breakout happened at testIdx
+          if (!isNaN(bAdx) && bAdx < 24) {
+            let bBoxUpper = -Infinity;
+            let bBoxLower = Infinity;
+            for (let k = testIdx - boxLookBack; k < testIdx; k++) {
+              bBoxUpper = Math.max(bBoxUpper, highPrices[k]);
+              bBoxLower = Math.min(bBoxLower, lowPrices[k]);
+            }
+
+            // Buy Retest: Broke upper level, pulled back to test upper level, confirmed bounce
+            if (bPrev.close <= bBoxUpper && bCurr.close > bBoxUpper) {
+              const touchedLevel = currCandle.low <= bBoxUpper + 0.35 * atr && currCandle.low >= bBoxUpper - 0.5 * atr;
+              const bounceConfirmed = currClose >= bBoxUpper - 0.15 * atr && (currClose >= currCandle.open || currClose > currCandle.low + 0.3 * barRange);
+              if (touchedLevel && bounceConfirmed) {
+                isBuyRetest = true;
+                prevBoxUpper = bBoxUpper;
+                break;
+              }
+            }
+
+            // Sell Retest: Broke lower level, pulled back to test lower level, confirmed rejection
+            if (bPrev.close >= bBoxLower && bCurr.close < bBoxLower) {
+              const touchedLevel = currCandle.high >= bBoxLower - 0.35 * atr && currCandle.high <= bBoxLower + 0.5 * atr;
+              const rejectConfirmed = currClose <= bBoxLower + 0.15 * atr && (currClose <= currCandle.open || currClose < currCandle.high - 0.3 * barRange);
+              if (touchedLevel && rejectConfirmed) {
+                isSellRetest = true;
+                prevBoxLower = bBoxLower;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      const shouldTakeBuy = entryMode === 'RETEST' ? isBuyRetest : (isBuyBreakout || (entryMode === 'ADAPTIVE' && isBuyRetest));
+      const shouldTakeSell = entryMode === 'RETEST' ? isSellRetest : (isSellBreakout || (entryMode === 'ADAPTIVE' && isSellRetest));
+
+      if (!shouldTakeBuy && !shouldTakeSell) return null;
+
+      const isRetestTrade = (shouldTakeBuy && isBuyRetest) || (shouldTakeSell && isSellRetest);
+      const id = `GOLD-${timeObj.getTime()}-${shouldTakeBuy ? 'BUY' : 'SELL'}-${isRetestTrade ? 'RETEST' : 'BO'}`;
+
+      if (shouldTakeBuy) {
+        const entryPrice = currClose;
+        const targetDist = 0.75 * boxWidth;
+        const target = entryPrice + targetDist;
+        
+        // Retest entry has tighter structural stop loss below retest low
+        const stopLoss = isRetestTrade 
+          ? Math.max(currCandle.low - 0.35 * atr, entryPrice - targetDist * 0.7)
+          : entryPrice - Math.min(targetDist * 0.85, Math.max(1.0 * atr, boxWidth * 0.45));
+
+        const newSig: InternalSignal = {
+          id,
+          timestamp: timestampISO,
+          signal: 'BUY',
+          strategy: 'adxBreakout',
+          strategy_family: 'ADX_BREAKOUT',
+          strategy_name: isRetestTrade ? 'Rob Booker ADX - Retest Confirmation' : 'Rob Booker - ADX Breakout',
+          direction: 'CALL',
+          index: 'GOLD',
+          instrumentKey: this.state.gold?.instrumentToken || (this.settings as any).goldInstrumentKey || 'MCX_FO|483079',
+          entry: entryPrice,
+          entryPrice: entryPrice,
+          latestPrice: entryPrice,
+          stoploss: stopLoss,
+          optionStoploss: stopLoss,
+          target: target,
+          target1: target,
+          target2: target + boxWidth * 0.5,
+          optionTarget1: target,
+          optionTarget2: target + boxWidth * 0.5,
+          optionEntry: entryPrice,
+          spotEntry: entryPrice,
+          spotInvalidation: stopLoss,
+          spotTarget1: target,
+          spotTarget2: target + boxWidth * 0.5,
+          confidence: isRetestTrade ? 95 : 92,
+          status: 'ACTIVE',
+          reason: [
+            isRetestTrade 
+              ? `Confirmed Retest Bounce at Box Upper: ${prevBoxUpper.toFixed(1)}`
+              : `Rob Booker ADX Breakout (ADX: ${sig.toFixed(1)} < 24)`,
+            `Breakout level: ${prevBoxUpper.toFixed(1)}`,
+            `Target: +0.75x Box Width (${target.toFixed(1)})`,
+            `Tight Structural Stop Loss: (${stopLoss.toFixed(1)})`,
+            `Breakeven Protection: Auto-locks SL to entry at 50% target`
+          ],
+          entryTime: timeObj.getTime(),
+          latestOptionTimestamp: timeObj.getTime()
+        } as any;
+
+        return newSig;
+      } else if (shouldTakeSell) {
+        const entryPrice = currClose;
+        const targetDist = 0.75 * boxWidth;
+        const target = entryPrice - targetDist;
+        
+        const stopLoss = isRetestTrade 
+          ? Math.min(currCandle.high + 0.35 * atr, entryPrice + targetDist * 0.7)
+          : entryPrice + Math.min(targetDist * 0.85, Math.max(1.0 * atr, boxWidth * 0.45));
+
+        const newSig: InternalSignal = {
+          id,
+          timestamp: timestampISO,
+          signal: 'SELL',
+          strategy: 'adxBreakout',
+          strategy_family: 'ADX_BREAKOUT',
+          strategy_name: isRetestTrade ? 'Rob Booker ADX - Retest Confirmation' : 'Rob Booker - ADX Breakout',
+          direction: 'PUT',
+          index: 'GOLD',
+          instrumentKey: this.state.gold?.instrumentToken || (this.settings as any).goldInstrumentKey || 'MCX_FO|483079',
+          entry: entryPrice,
+          entryPrice: entryPrice,
+          latestPrice: entryPrice,
+          stoploss: stopLoss,
+          optionStoploss: stopLoss,
+          target: target,
+          target1: target,
+          target2: target - boxWidth * 0.5,
+          optionTarget1: target,
+          optionTarget2: target - boxWidth * 0.5,
+          optionEntry: entryPrice,
+          spotEntry: entryPrice,
+          spotInvalidation: stopLoss,
+          spotTarget1: target,
+          spotTarget2: target - boxWidth * 0.5,
+          confidence: isRetestTrade ? 95 : 92,
+          status: 'ACTIVE',
+          reason: [
+            isRetestTrade 
+              ? `Confirmed Retest Rejection at Box Lower: ${prevBoxLower.toFixed(1)}`
+              : `Rob Booker ADX Breakout (ADX: ${sig.toFixed(1)} < 24)`,
+            `Breakdown level: ${prevBoxLower.toFixed(1)}`,
+            `Target: -0.75x Box Width (${target.toFixed(1)})`,
+            `Tight Structural Stop Loss: (${stopLoss.toFixed(1)})`,
+            `Breakeven Protection: Auto-locks SL to entry at 50% target`
+          ],
+          entryTime: timeObj.getTime(),
+          latestOptionTimestamp: timeObj.getTime()
+        } as any;
+
+        return newSig;
+      }
+    }
+
+    return null;
+  }
+
   private async evaluateIndex(index: string, spotPrice: number): Promise<any> {
     const timeObj = new Date();
     const timeStr = timeObj.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
@@ -1560,6 +1948,13 @@ export class StrategyEngine {
 
     if (!(optionEntry > 0) || !(dynamicOptionRisk > 0)) return null;
 
+    // Logical multi-targets for Nifty:
+    // Target 1: Base structural target (1.5x risk, min 14 pts on option premium)
+    // Target 2: Extended trend runner target (3.0x risk, min 28 pts on option premium)
+    // Strict Stoploss: Kept strictly unchanged (catastrophicOptionStoploss & structuralStopSpot)
+    const optT1Delta = Math.max(dynamicOptionRisk * 1.5, 14);
+    const optT2Delta = Math.max(dynamicOptionRisk * 3.0, 28);
+
     const prices = {
       spotEntry: spot,
       spotInvalidation: targets.structuralStopSpot,
@@ -1567,8 +1962,8 @@ export class StrategyEngine {
       spotTarget2: targets.target2Spot,
       optionEntry,
       optionStoploss: catastrophicOptionStoploss,
-      optionTarget1: Number((optionEntry + dynamicOptionRisk).toFixed(2)),
-      optionTarget2: Number((optionEntry + dynamicOptionRisk * 1.5).toFixed(2)),
+      optionTarget1: Number((optionEntry + optT1Delta).toFixed(2)),
+      optionTarget2: Number((optionEntry + optT2Delta).toFixed(2)),
     };
 
     const rewardSpot = Math.abs(prices.spotTarget1 - prices.spotEntry);
@@ -1699,44 +2094,153 @@ export class StrategyEngine {
   }
 
   private manageActiveTrades(newSignals: InternalSignal[]) {
+    let nseDayEndClose = false;
+    let mcxDayEndClose = false;
+    try {
+      const istString = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+      const istDate = new Date(istString);
+      const totalMins = istDate.getHours() * 60 + istDate.getMinutes();
+      // Auto square-off before market close (Strictly no overnight positions carried)
+      // NSE trades square-off at or after 15:20 IST
+      if (totalMins >= 15 * 60 + 20) nseDayEndClose = true;
+      // MCX Gold trades square-off at or after 23:20 IST
+      if (totalMins >= 23 * 60 + 20) mcxDayEndClose = true;
+    } catch (_) {}
+
     for (const [id, signal] of this.activeSignals.entries()) {
       if (signal.status === 'CLOSED') {
         this.activeSignals.delete(id);
         continue;
       }
 
+      // Handle GOLD active trade management (Rob Booker - ADX Breakout)
+      if (signal.index === 'GOLD') {
+        const curPrice = Number(this.state.gold?.lastPrice || signal.latestPrice || signal.entryPrice);
+        signal.latestPrice = curPrice;
+
+        // Day end square-off: Never carry gold position overnight
+        if (mcxDayEndClose) {
+          this.closeSignal(signal, curPrice, 'DAY END CLOSE: Square-off before session end (No overnight carry)');
+          newSignals.push(signal);
+          continue;
+        }
+
+        const isLong = signal.signal === 'BUY' || signal.direction === 'CALL';
+        if (isLong) {
+          // Dynamic Breakeven Lock: At 50% target progress, lock stoploss to entry
+          if (!signal.isBreakevenLocked) {
+            const favorableMove = curPrice - signal.entryPrice;
+            const targetDistance = signal.target - signal.entryPrice;
+            if (targetDistance > 0 && favorableMove >= targetDistance * 0.5) {
+              signal.stoploss = Math.max(signal.stoploss, signal.entryPrice);
+              signal.isBreakevenLocked = true;
+            }
+          }
+
+          if (curPrice >= signal.target) {
+            this.closeSignal(signal, signal.target, 'TARGET REACHED (close_long)');
+            newSignals.push(signal);
+            continue;
+          } else if (curPrice <= signal.stoploss) {
+            const exitReason = signal.isBreakevenLocked ? 'BREAKEVEN PROTECTED (close_long)' : 'STOPLOSS HIT (close_long)';
+            this.closeSignal(signal, signal.stoploss, exitReason);
+            newSignals.push(signal);
+            continue;
+          }
+        } else {
+          // Dynamic Breakeven Lock: At 50% target progress, lock stoploss to entry
+          if (!signal.isBreakevenLocked) {
+            const favorableMove = signal.entryPrice - curPrice;
+            const targetDistance = signal.entryPrice - signal.target;
+            if (targetDistance > 0 && favorableMove >= targetDistance * 0.5) {
+              signal.stoploss = Math.min(signal.stoploss, signal.entryPrice);
+              signal.isBreakevenLocked = true;
+            }
+          }
+
+          if (curPrice <= signal.target) {
+            this.closeSignal(signal, signal.target, 'TARGET REACHED (close_short)');
+            newSignals.push(signal);
+            continue;
+          } else if (curPrice >= signal.stoploss) {
+            const exitReason = signal.isBreakevenLocked ? 'BREAKEVEN PROTECTED (close_short)' : 'STOPLOSS HIT (close_short)';
+            this.closeSignal(signal, signal.stoploss, exitReason);
+            newSignals.push(signal);
+            continue;
+          }
+        }
+        continue;
+      }
+
       const currentOptPrice = Number(signal.latestPrice ?? signal.optionEntry);
       const currentSpot = Number(this.state.nifty50.lastPrice);
+
+      // Day end square-off: Never carry Nifty position overnight
+      if (nseDayEndClose) {
+        if (signal.firstTargetHitFlag) {
+          const blendedExit = Number(((signal.optionTarget1 + currentOptPrice) / 2).toFixed(2));
+          this.closeSignal(signal, blendedExit, 'DAY END CLOSE: Target 1 Secured (No Overnight Carry)');
+        } else {
+          this.closeSignal(signal, currentOptPrice, 'DAY END CLOSE: Square-off before session end (No overnight carry)');
+        }
+        newSignals.push(signal);
+        continue;
+      }
       const isCall = signal.direction === 'CALL';
       const spotInvalidation = signal.spotInvalidation;
+
+      // Target 1 Evaluation: Lock partial profit and strictly shift stoploss to breakeven (+ buffer)
+      const spotHitT1 = isCall ? currentSpot >= signal.spotTarget1 : currentSpot <= signal.spotTarget1;
+      const optHitT1 = currentOptPrice >= signal.optionTarget1;
+
+      if (!signal.firstTargetHitFlag && (optHitT1 || spotHitT1)) {
+        signal.firstTargetHitFlag = true;
+        signal.partialExit = true;
+        signal.isBreakevenLocked = true;
+        // Strictly protect trade: ratchet stoploss to entry (+1.0 pt BE buffer to eliminate risk)
+        signal.optionStoploss = Math.max(signal.optionStoploss, signal.optionEntry + 1.0);
+        signal.stoploss = signal.optionStoploss;
+      }
+
+      // Target 2 Evaluation: Runner reached full extended profit target!
+      const spotHitT2 = isCall ? currentSpot >= signal.spotTarget2 : currentSpot <= signal.spotTarget2;
+      const optHitT2 = currentOptPrice >= signal.optionTarget2;
+
+      if (optHitT2 || spotHitT2) {
+        signal.secondTargetHitFlag = true;
+        signal.isParabolic = true;
+        // Multi-target completion: 50% booked at Target 1, 50% booked at Target 2
+        const blendedExit = Number(((signal.optionTarget1 + signal.optionTarget2) / 2).toFixed(2));
+        this.closeSignal(signal, blendedExit, 'TARGET 2 REACHED (Multi-Target TP2 Complete)');
+        newSignals.push(signal);
+        continue;
+      }
 
       const structuralInvalidation = isCall
         ? currentSpot <= spotInvalidation
         : currentSpot >= spotInvalidation;
       
       if (structuralInvalidation) {
-        this.closeSignal(signal, currentOptPrice, 'SPOT STRUCTURAL INVALIDATION');
+        if (signal.firstTargetHitFlag) {
+          const blendedExit = Number(((signal.optionTarget1 + currentOptPrice) / 2).toFixed(2));
+          this.closeSignal(signal, blendedExit, 'TARGET 1 SECURED (Spot Retraced)');
+        } else {
+          this.closeSignal(signal, currentOptPrice, 'SPOT STRUCTURAL INVALIDATION');
+        }
         newSignals.push(signal);
         continue;
       }
 
       if (currentOptPrice <= signal.optionStoploss) {
-        this.closeSignal(signal, signal.optionStoploss, 'OPTION PREMIUM STOPLOSS');
+        if (signal.firstTargetHitFlag) {
+          // Target 1 was secured; runner exited at protected breakeven/trail stop (positive net PnL, win preserved)
+          const blendedExit = Number(((signal.optionTarget1 + signal.optionStoploss) / 2).toFixed(2));
+          this.closeSignal(signal, blendedExit, 'TARGET 1 SECURED (Runner BE Protected)');
+        } else {
+          this.closeSignal(signal, signal.optionStoploss, 'OPTION PREMIUM STOPLOSS');
+        }
         newSignals.push(signal);
         continue;
-      }
-
-      if (
-        !signal.firstTargetHitFlag &&
-        currentOptPrice >= signal.optionTarget1
-      ) {
-        signal.firstTargetHitFlag = true;
-        signal.optionStoploss = Math.max(signal.optionStoploss, signal.optionEntry);
-        signal.stoploss = signal.optionStoploss;
-      }
-
-      if (currentOptPrice >= signal.optionTarget2) {
-        signal.isParabolic = true;
       }
 
       const optionRisk = signal.optionTarget1 - signal.optionEntry;
@@ -1848,7 +2352,9 @@ export class StrategyEngine {
 
     signal.status = 'CLOSED';
     signal.latestPrice = exitPrice;
-    signal.realizedPnL = (exitPrice - (signal.optionEntry || signal.entryPrice));
+    const isShort = signal.signal === 'SELL' || signal.direction === 'PUT';
+    const entry = (signal.optionEntry || signal.entryPrice);
+    signal.realizedPnL = isShort ? (entry - exitPrice) : (exitPrice - entry);
     signal.exitReason = reason;
     
     this.realizedPnL += signal.realizedPnL;

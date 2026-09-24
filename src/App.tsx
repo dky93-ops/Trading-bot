@@ -5,7 +5,7 @@ import { LiveChart } from './components/LiveChart';
  */
 
 import React, { useEffect, useState, useRef, useMemo } from 'react';
-import { Settings, Activity, Clock, ShieldAlert, BarChart3, TrendingUp, Power, Server, RefreshCw, Lock, Unlock, CheckCircle2 } from 'lucide-react';
+import { Settings, Download, Trash2, Activity, Clock, ShieldAlert, BarChart3, TrendingUp, Power, Server, RefreshCw, Lock, Unlock, CheckCircle2 } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
@@ -17,8 +17,11 @@ function cn(...inputs: ClassValue[]) {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [activeInstrument, setActiveInstrument] = useState<'NIFTY' | 'GOLD'>('NIFTY');
+  const [chartViewMode, setChartViewMode] = useState<'SINGLE' | 'DUAL'>('SINGLE');
   const [state, setState] = useState<any>({
     nifty50: { lastPrice: 0, change: 0 },
+    gold: { lastPrice: 154263, change: 1282 },
     bankNifty: { lastPrice: 0, change: 0 },
     indiaVix: { lastPrice: 0, change: 0 },
     isConnected: false,
@@ -78,7 +81,8 @@ export default function App() {
                 const newPoint = {
                   time: new Date().toLocaleTimeString(),
                   nifty: msg.data.nifty50?.lastPrice || 0,
-                  bankNifty: msg.data.bankNifty?.lastPrice || 0
+                  bankNifty: msg.data.bankNifty?.lastPrice || 0,
+                  gold: msg.data.gold?.lastPrice || 0
                 };
                 const updated = [...prev, newPoint];
                 return updated.length > 50 ? updated.slice(updated.length - 50) : updated;
@@ -107,7 +111,24 @@ export default function App() {
 
     connectWs();
 
+    // High-reliability 1.5s state polling fallback
+    const pollState = async () => {
+      try {
+        const res = await fetch('/api/state');
+        if (res.ok) {
+          const data = await res.json();
+          if (data) {
+            setState(data);
+          }
+        }
+      } catch (e) {
+        // silent
+      }
+    };
+    const pollInterval = setInterval(pollState, 1500);
+
     return () => {
+      clearInterval(pollInterval);
       clearTimeout(reconnectTimeout);
       if (ws) {
         ws.onclose = null;
@@ -201,15 +222,53 @@ export default function App() {
       {/* Main Layout */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex flex-col gap-6">
         
-        {/* Top Info Bar */}
-        <div className="flex flex-wrap items-center gap-4 text-xs font-bold bg-[#111827] border border-[#1F2937] rounded-lg p-3">
-          <span className="text-yellow-500">NSE Trading Hours:</span>
-          <span className="text-gray-400">Mon-Fri 09:15 - 15:30 IST</span>
-          <div className="h-4 w-px bg-[#1F2937] mx-2"></div>
-          <button className="flex items-center space-x-2 px-3 py-1 bg-brand-green/10 text-brand-green border border-brand-green/30 rounded">
-            <Power size={12} />
-            <span>Mode: Upstox Live REST API</span>
-          </button>
+        {/* Top Info Bar & Instrument Quick-Select */}
+        <div className="flex flex-wrap items-center justify-between gap-4 text-xs font-bold bg-[#111827] border border-[#1F2937] rounded-lg p-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-gray-400 uppercase tracking-wider">Trading Session:</span>
+            {activeInstrument === 'GOLD' ? (
+              <span className="px-2.5 py-1 rounded bg-amber-500/10 text-amber-300 border border-amber-500/30 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+                MCX Commodity Hours: Mon-Fri 09:00 - 23:30 IST (Open Evening Session)
+              </span>
+            ) : (
+              <span className="px-2.5 py-1 rounded bg-blue-500/10 text-blue-300 border border-blue-500/30 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-blue-400"></span>
+                NSE Trading Hours: Mon-Fri 09:15 - 15:30 IST
+              </span>
+            )}
+            <div className="h-4 w-px bg-[#1F2937] mx-1"></div>
+            <button className="flex items-center space-x-2 px-3 py-1 bg-brand-green/10 text-brand-green border border-brand-green/30 rounded">
+              <Power size={12} />
+              <span>Engine: Upstox Live Feed + PA Bot</span>
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-gray-500 text-[11px]">Quick Switch:</span>
+            <button
+              onClick={() => setActiveInstrument('NIFTY')}
+              className={cn(
+                "px-2.5 py-1 rounded text-xs font-bold transition-colors cursor-pointer",
+                activeInstrument === 'NIFTY' 
+                  ? "bg-brand-blue text-black font-extrabold" 
+                  : "bg-[#0A0F1C] border border-[#1F2937] text-gray-400 hover:text-white"
+              )}
+            >
+              🇮🇳 NIFTY 50
+            </button>
+            <button
+              onClick={() => setActiveInstrument('GOLD')}
+              className={cn(
+                "px-2.5 py-1 rounded text-xs font-bold transition-colors cursor-pointer",
+                activeInstrument === 'GOLD' 
+                  ? "bg-amber-400 text-black font-extrabold" 
+                  : "bg-[#0A0F1C] border border-[#1F2937] text-gray-400 hover:text-white"
+              )}
+            >
+              🟡 GOLD (MCX)
+            </button>
+          </div>
         </div>
 
         {/* Global API Error Alert Banner */}
@@ -232,10 +291,30 @@ export default function App() {
 
         {/* Top Stats Grid */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <StatBox title="INDEX SPOT (NIFTY 50)" value={`₹${state.nifty50?.lastPrice || '---'}`} sub={`Change: ${state.nifty50?.change || 0}`} color="green" />
-          <StatBox title="INDIA VIX" value={state.indiaVix?.lastPrice || '---'} sub={`Vol Change: ${state.indiaVix?.change || 0}`} color="yellow" />
-          <StatBox title="VWAP / SPOT DELTA" value={`₹${state.nifty50?.lastPrice ? (state.nifty50.lastPrice - 10).toFixed(2) : '---'}`} sub="Vol Δ: +0" color="purple" />
-          <StatBox title="NET REALIZED P&L" value={`${(state.overallPnL || 0) >= 0 ? '+' : ''}₹${(state.overallPnL || 0).toLocaleString('en-IN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}`} sub={`Realized: ₹${(state.realizedPnL || 0).toFixed(1)} | Live: ₹${(state.unrealizedPnL || 0).toFixed(1)}`} color={(state.overallPnL || 0) >= 0 ? "green" : "red"} />
+          <StatBox 
+            title={activeInstrument === 'GOLD' ? "COMMODITY SPOT (MCX GOLD)" : "INDEX SPOT (NIFTY 50)"} 
+            value={`₹${(activeInstrument === 'GOLD' ? state.gold?.lastPrice : state.nifty50?.lastPrice) || '---'}`} 
+            sub={`Change: ${(activeInstrument === 'GOLD' ? state.gold?.change : state.nifty50?.change) || 0}`} 
+            color={activeInstrument === 'GOLD' ? "yellow" : "green"} 
+          />
+          <StatBox 
+            title={activeInstrument === 'GOLD' ? "MCX GOLD CONTRACT" : "INDIA VIX"} 
+            value={activeInstrument === 'GOLD' ? "10g LOT (MCX)" : (state.indiaVix?.lastPrice || '---')} 
+            sub={activeInstrument === 'GOLD' ? `Day Δ: ${(state.gold?.change || 0) >= 0 ? '+' : ''}${state.gold?.change || 0} pts` : `Vol Change: ${state.indiaVix?.change || 0}`} 
+            color="yellow" 
+          />
+          <StatBox 
+            title="VWAP / SPOT DELTA" 
+            value={`₹${activeInstrument === 'GOLD' ? (state.gold?.lastPrice ? (state.gold.lastPrice - 18.5).toFixed(2) : '---') : (state.nifty50?.lastPrice ? (state.nifty50.lastPrice - 10).toFixed(2) : '---')}`} 
+            sub={activeInstrument === 'GOLD' ? "MCX Commodity Spread: Normal" : "Vol Δ: +0"} 
+            color="purple" 
+          />
+          <StatBox 
+            title="NET REALIZED P&L" 
+            value={`${(state.overallPnL || 0) >= 0 ? '+' : ''}₹${(state.overallPnL || 0).toLocaleString('en-IN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}`} 
+            sub={`Realized: ₹${(state.realizedPnL || 0).toFixed(1)} | Live: ₹${(state.unrealizedPnL || 0).toFixed(1)}`} 
+            color={(state.overallPnL || 0) >= 0 ? "green" : "red"} 
+          />
         </div>
 
         {/* Controls */}
@@ -274,25 +353,27 @@ export default function App() {
         </div>
 
         {/* Tabs */}
-        <div className="flex overflow-x-auto space-x-1 border-b border-[#1F2937] pb-px hide-scrollbar">
+        <div className="flex overflow-x-auto space-x-1 border-b border-[#1F2937] pb-px hide-scrollbar touch-pan-x">
           {[
-            { id: 'dashboard', label: '5 Core Strategies Dashboard' },
-            { id: 'settings', label: 'Configure 5 Strategies' },
-            { id: 'options', label: 'Live Option Chain' },
-            { id: 'replay', label: 'Option Chain Replay & History' },
-            { id: 'logs', label: 'Execution Signals Log' },
+            { id: 'dashboard', label: '5 Core Strategies Dashboard', short: 'Dashboard', icon: BarChart3 },
+            { id: 'settings', label: 'Configure 5 Strategies', short: 'Settings', icon: Settings },
+            { id: 'options', label: 'Live Option Chain', short: 'Option Chain', icon: Activity },
+            { id: 'replay', label: 'Option Chain Replay & History', short: 'Replay', icon: Clock },
+            { id: 'logs', label: 'Execution Signals Log', short: 'Signals Log', icon: ShieldAlert },
           ].map(item => (
             <button
               key={item.id}
               onClick={() => setActiveTab(item.id)}
               className={cn(
-                "px-6 py-3 text-sm font-bold uppercase tracking-wider transition-all whitespace-nowrap",
+                "px-3 sm:px-6 py-2.5 sm:py-3 text-xs sm:text-sm font-bold uppercase tracking-wider transition-all whitespace-nowrap flex items-center gap-1.5 cursor-pointer shrink-0",
                 activeTab === item.id 
                   ? "text-brand-green border-b-2 border-brand-green bg-brand-green/5" 
                   : "text-gray-500 hover:text-gray-300 hover:bg-[#111827]"
               )}
             >
-              {item.label}
+              <item.icon size={15} className="shrink-0" />
+              <span className="sm:hidden">{item.short}</span>
+              <span className="hidden sm:inline">{item.label}</span>
             </button>
           ))}
         </div>
@@ -325,12 +406,96 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Live Candlestick Chart */}
-              <div className="bg-[#111827] rounded-lg border border-[#1F2937] overflow-hidden h-96 p-4 flex flex-col">
-                <h3 className="text-lg font-bold text-white mb-4">NIFTY 50 Live Intraday (1m)</h3>
-                <div className="flex-1 min-h-0">
-                  <LiveChart livePrice={state.nifty50?.lastPrice} instrument="NIFTY" />
+              {/* Asset Selector & Live Candlestick Chart Controls */}
+              <div className="bg-[#111827] border border-[#1F2937] rounded-lg p-3 flex flex-wrap items-center justify-between gap-4">
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">Active Chart:</span>
+                  <button
+                    onClick={() => setActiveInstrument('NIFTY')}
+                    className={cn(
+                      "flex items-center space-x-2 px-3.5 py-1.5 rounded-md font-bold text-xs transition-all cursor-pointer",
+                      activeInstrument === 'NIFTY'
+                        ? "bg-brand-blue text-black shadow-[0_0_12px_rgba(0,180,255,0.4)]"
+                        : "bg-[#0A0F1C] border border-[#1F2937] text-gray-300 hover:text-white hover:border-gray-600"
+                    )}
+                  >
+                    <span>🇮🇳</span>
+                    <span>NIFTY 50</span>
+                    <span className="font-mono text-[11px] opacity-90">₹{state.nifty50?.lastPrice || '---'}</span>
+                    <span className={cn("text-[10px] font-mono", (state.nifty50?.change || 0) >= 0 ? "text-emerald-400" : "text-red-400")}>
+                      {(state.nifty50?.change || 0) >= 0 ? '+' : ''}{state.nifty50?.change || 0}
+                    </span>
+                  </button>
+
+                  <button
+                    onClick={() => setActiveInstrument('GOLD')}
+                    className={cn(
+                      "flex items-center space-x-2 px-3.5 py-1.5 rounded-md font-bold text-xs transition-all cursor-pointer",
+                      activeInstrument === 'GOLD'
+                        ? "bg-amber-400 text-black shadow-[0_0_12px_rgba(251,191,36,0.4)]"
+                        : "bg-[#0A0F1C] border border-[#1F2937] text-gray-300 hover:text-white hover:border-gray-600"
+                    )}
+                  >
+                    <span>🟡</span>
+                    <span>MCX GOLD COMMODITY</span>
+                    <span className="font-mono text-[11px] opacity-90">₹{state.gold?.lastPrice || '---'}</span>
+                    <span className={cn("text-[10px] font-mono", (state.gold?.change || 0) >= 0 ? "text-emerald-400" : "text-red-400")}>
+                      {(state.gold?.change || 0) >= 0 ? '+' : ''}{state.gold?.change || 0}
+                    </span>
+                  </button>
                 </div>
+
+                {/* Chart View Mode Switcher */}
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">View:</span>
+                  <button
+                    onClick={() => setChartViewMode('SINGLE')}
+                    className={cn(
+                      "px-3 py-1.5 rounded text-xs font-bold transition-all cursor-pointer",
+                      chartViewMode === 'SINGLE'
+                        ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-bold"
+                        : "bg-[#0A0F1C] text-gray-400 border border-[#1F2937] hover:text-white"
+                    )}
+                  >
+                    Single Asset ({activeInstrument})
+                  </button>
+                  <button
+                    onClick={() => setChartViewMode('DUAL')}
+                    className={cn(
+                      "flex items-center space-x-1.5 px-3 py-1.5 rounded text-xs font-bold transition-all cursor-pointer",
+                      chartViewMode === 'DUAL'
+                        ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-bold"
+                        : "bg-[#0A0F1C] text-gray-400 border border-[#1F2937] hover:text-white"
+                    )}
+                  >
+                    <span>◫</span>
+                    <span>Dual Charts (Nifty + Gold)</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Live Candlestick Chart(s) */}
+              <div className="flex flex-col gap-6">
+                {chartViewMode === 'SINGLE' ? (
+                  <LiveChart 
+                    key={activeInstrument}
+                    livePrice={activeInstrument === 'GOLD' ? state.gold?.lastPrice : state.nifty50?.lastPrice} 
+                    instrument={activeInstrument} 
+                  />
+                ) : (
+                  <div className="flex flex-col gap-6">
+                    <LiveChart 
+                      key="nifty-chart"
+                      livePrice={state.nifty50?.lastPrice} 
+                      instrument="NIFTY" 
+                    />
+                    <LiveChart 
+                      key="gold-chart"
+                      livePrice={state.gold?.lastPrice} 
+                      instrument="GOLD" 
+                    />
+                  </div>
+                )}
               </div>
 
               {/* Performance Matrix */}
@@ -364,8 +529,9 @@ export default function App() {
                         { id: 'continuationBreakdown', familyKey: 'CONTINUATION_BREAKDOWN', name: '2. Continuation Breakdown (CONTINUATION_BREAKDOWN)', desc: 'Priority 2 | Trades bearish continuation after level breakdown and consolidation pause.', rr: '>= 0.8R to 1.5R' },
                         { id: 'continuationBreakout', familyKey: 'CONTINUATION_BREAKOUT', name: '3. Continuation Breakout (CONTINUATION_BREAKOUT)', desc: 'Priority 3 | Trades bullish continuation after level breakout and consolidation pause.', rr: '>= 0.8R to 1.5R' },
                         { id: 'openingTrap', familyKey: 'OPENING_TRAP', name: '4. Opening Breakout Trap (OPENING_TRAP)', desc: 'Priority 4 | Catches opening range fake breakouts/breakdowns upon retest confirmation.', rr: '>= 0.8R to 1.0R' },
-                                                { id: 'oiWallRejection', familyKey: 'OI_WALL_REJECTION', name: '5. OI Wall Rejection (OI_WALL_REJECTION)', desc: 'Priority 5 | Rejection trades when 1.5x dominant OI walls reject price 2+ times & begin unwinding.', rr: '>= 0.8R to 1.2R' },
+                        { id: 'oiWallRejection', familyKey: 'OI_WALL_REJECTION', name: '5. OI Wall Rejection (OI_WALL_REJECTION)', desc: 'Priority 5 | Rejection trades when 1.5x dominant OI walls reject price 2+ times & begin unwinding.', rr: '>= 0.8R to 1.2R' },
                         { id: 'technicalConfluence', familyKey: 'TECHNICAL_CONFLUENCE', name: '6. Technical Confluence (TECHNICAL_CONFLUENCE)', desc: 'Priority 1 | Trades based on technical indicators (RSI, MACD, EMA, BB, SuperTrend) voting consensus.', rr: '>= 1.0R' },
+                        { id: 'adxBreakout', familyKey: 'ADX_BREAKOUT', name: '7. Rob Booker - ADX Breakout (ADX_BREAKOUT) [GOLD ONLY]', desc: 'Gold Only Strategy | Consolidations when ADX < 18, trades 20-candle box breakout with candle extreme SL and 1x box target.', rr: '1.0x Box Width' },
                       ].map(strat => {
                         const isEnabled = !!settings?.strategies?.[strat.id]?.enabled;
                         const toggleStrat = () => {
@@ -449,7 +615,25 @@ export default function App() {
                   <h3 className="text-lg font-bold text-white">Execution Signals Log</h3>
                   <p className="text-xs text-gray-500">Live JSON signal outputs generated by the 5-strategy option buying engine.</p>
                 </div>
+                <div className="flex space-x-2">
+                  <button
+                    onClick={() => window.open('/api/signals/export-excel', '_blank')}
+                    disabled={state.signals.length === 0}
+                    className="flex items-center space-x-1.5 px-4 py-2 rounded bg-brand-blue hover:bg-blue-400 text-black text-xs font-extrabold transition-all shadow-[0_0_12px_rgba(59,130,246,0.3)] disabled:opacity-50 cursor-pointer"
+                  >
+                    <Download size={14} />
+                    <span>Download Excel</span>
+                  </button>
+                  <button
+                    onClick={handleResetLogs}
+                    className="flex items-center space-x-1.5 px-3 py-2 rounded bg-red-950/60 border border-red-800/50 hover:bg-red-900/60 text-xs font-bold text-red-300 transition-colors cursor-pointer"
+                  >
+                    <Trash2 size={14} />
+                    <span>Reset</span>
+                  </button>
+                </div>
               </div>
+
               <div className="overflow-x-auto">
                 <table className="w-full text-sm text-left font-mono">
                   <thead className="text-xs text-gray-500 uppercase bg-[#0A0F1C] border-b border-[#1F2937]">
@@ -849,16 +1033,17 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
   const [chainMode, setChainMode] = useState<'FOCUSED' | 'FULL'>('FULL');
   const [fetchError, setFetchError] = useState<string | null>(null);
 
+  const isGold = instrument.includes('GOLD');
   const isBankNifty = instrument.includes('Bank');
   const realSpotFromData = data && data.length > 0 && data[0]?.underlying_spot_price ? Number(data[0].underlying_spot_price) : null;
   const spotPrice = realSpotFromData !== null
     ? realSpotFromData
-    : (isBankNifty ? (state?.bankNifty?.lastPrice || 52000) : (state?.nifty50?.lastPrice || 24125.10));
-  const spotChange = isBankNifty
-    ? (state?.bankNifty?.change || 0)
-    : (state?.nifty50?.change || 0);
+    : (isGold ? (state?.gold?.lastPrice || 154263) : (isBankNifty ? (state?.bankNifty?.lastPrice || 52000) : (state?.nifty50?.lastPrice || 24125.10)));
+  const spotChange = isGold
+    ? (state?.gold?.change || 0)
+    : (isBankNifty ? (state?.bankNifty?.change || 0) : (state?.nifty50?.change || 0));
 
-  const step = isBankNifty ? 100 : 50;
+  const step = isGold ? 100 : (isBankNifty ? 100 : 50);
   const atmStrike = Math.round(spotPrice / step) * step;
 
   const tableContainerRef = useRef<HTMLDivElement>(null);
@@ -1380,7 +1565,8 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
           </button>
 
           <select value={instrument} onChange={e => setInstrument(e.target.value)} className="px-2.5 py-1 bg-[#111827] border border-[#1F2937] rounded text-xs font-bold text-white outline-none cursor-pointer">
-            <option value="NSE_INDEX|Nifty 50">NIFTY 50 ONLY</option>
+            <option value="NSE_INDEX|Nifty 50">🇮🇳 NIFTY 50 (NSE INDEX)</option>
+            <option value="MCX_GOLD">🟡 MCX GOLD (COMMODITY)</option>
           </select>
 
           <select value={expiry} onChange={e => setExpiry(e.target.value)} className="px-2.5 py-1 bg-[#111827] border border-[#1F2937] rounded text-xs font-bold text-white outline-none cursor-pointer">

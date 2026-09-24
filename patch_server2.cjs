@@ -2,8 +2,21 @@ const fs = require('fs');
 
 let server = fs.readFileSync('server.ts', 'utf8');
 
-const newCandleRoute = `
-  app.get("/api/candles", async (req, res) => {
+const oldCode = `  app.get("/api/candles", async (req, res) => {
+    try {
+      const instrument = req.query.instrument || 'NIFTY';
+      const timeframe = Number(req.query.timeframe) || 1;
+      const limit = Number(req.query.limit) || 100;
+      
+      const { getCandles } = await import("./src/db/market.ts");
+      const candles = await getCandles(instrument.toString(), timeframe, limit);
+      res.json(candles);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });`;
+
+const newCode = `  app.get("/api/candles", async (req, res) => {
     try {
       const instrument = req.query.instrument || 'NIFTY';
       const timeframe = Number(req.query.timeframe) || 1;
@@ -29,8 +42,10 @@ const newCandleRoute = `
       
       for (const c of rawCandles) {
          const ts = new Date(c.timestamp).getTime();
-         // align to period boundary
-         const boundary = Math.floor(ts / periodMs) * periodMs;
+         // align to period boundary (IST is UTC + 5:30. 5h30m = 330 mins = 19800000 ms)
+         // Need to align boundaries to IST so that 9:15 starts properly for 5m, 15m etc.
+         // Better simple boundary: 
+         const boundary = Math.floor((ts + 19800000) / periodMs) * periodMs - 19800000;
          
          if (!currentCandle || boundary !== currentPeriodMs) {
             if (currentCandle) aggregated.push(currentCandle);
@@ -58,10 +73,8 @@ const newCandleRoute = `
     } catch (error) {
       res.status(500).json({ error: error.message });
     }
-  });
-`;
+  });`;
 
-server = server.replace(/app\.get\("\/api\/candles", async \(req, res\) => \{[\s\S]*?res\.status\(500\)\.json\(\{ error: error\.message \}\);\s*\}\);\s*\}\);/, newCandleRoute + "\n  });");
-
+server = server.replace(oldCode, newCode);
 fs.writeFileSync('server.ts', server);
-console.log("Server API patched");
+console.log("Server API patched 2");
