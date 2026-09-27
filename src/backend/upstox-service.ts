@@ -414,48 +414,9 @@ export class UpstoxService {
     if (!this.settings.accessToken) return;
     if (Date.now() < this.candleSyncBackoffUntil) return;
     try {
-      const decisionMinutes = Number(this.settings.DECISION_TIMEFRAME_MINUTES || 5);
-      
-      const response1m = await axios.get(
-        `https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/1`,
-        { headers: { Accept: 'application/json', Authorization: `Bearer ${this.settings.accessToken}` }, timeout: 5000 }
-      );
-      if (response1m.data?.status === 'success' && response1m.data.data?.candles) {
-        await seedHistoricalCandles('NIFTY', 1, response1m.data.data.candles);
-      }
-      
-      if (decisionMinutes > 1) {
-          const responseDt = await axios.get(
-            `https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/${decisionMinutes}`,
-            { headers: { Accept: 'application/json', Authorization: `Bearer ${this.settings.accessToken}` }, timeout: 5000 }
-          );
-          if (responseDt.data?.status === 'success' && responseDt.data.data?.candles) {
-            await seedHistoricalCandles('NIFTY', decisionMinutes, responseDt.data.data.candles);
-          }
-      }
-
-      // Sync MCX Gold historical candles from Upstox (only if valid key and not blacklisted)
-      try {
-        const today = new Date().toISOString().split('T')[0];
-        const startDate = new Date(Date.now() - 4 * 86400000).toISOString().split('T')[0];
-        const rawGoldKey = (this.settings.goldInstrumentKey || 'MCX_FO|483079').replace(':', '|');
-        if (this.isValidUpstoxKey(rawGoldKey) && !this.invalidInstrumentKeys.has(rawGoldKey)) {
-          const encodedKey = encodeURIComponent(rawGoldKey);
-          const goldRes = await axios.get(
-            `https://api.upstox.com/v2/historical-candle/${encodedKey}/1minute/${today}/${startDate}`,
-            { headers: { Accept: 'application/json', Authorization: `Bearer ${this.settings.accessToken}` }, timeout: 6000 }
-          );
-          if (goldRes.data?.status === 'success' && goldRes.data.data?.candles?.length > 0) {
-            await seedHistoricalCandles('GOLD', 1, goldRes.data.data.candles);
-          }
-        }
-      } catch (ge: any) {
-        const errCode = ge.response?.data?.errors?.[0]?.errorCode || ge.response?.data?.errors?.[0]?.error_code;
-        if (errCode === 'UDAPI1087') {
-          const rawGoldKey = (this.settings.goldInstrumentKey || 'MCX_FO|483079').replace(':', '|');
-          this.invalidInstrumentKeys.add(rawGoldKey);
-        }
-      }
+      const { ensureNiftyCandles, ensureGoldCandles } = await import('../db/market.js');
+      await ensureNiftyCandles(this.settings.accessToken);
+      await ensureGoldCandles(this.settings.accessToken);
     } catch(e: any) {
       if (e.response?.status === 429) {
         this.candleSyncBackoffUntil = Date.now() + 10000;

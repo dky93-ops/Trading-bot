@@ -52,11 +52,13 @@ async function startServer() {
       const timeframe = Number(req.query.timeframe) || 1;
       const limit = Number(req.query.limit) || 100;
       
-      const { getCandles, ensureGoldCandles } = await import("./src/db/market.ts");
+      const { getCandles, ensureGoldCandles, ensureNiftyCandles } = await import("./src/db/market.ts");
       
+      const token = (upstoxService as any)?.settings?.accessToken || process.env.UPSTOX_ACCESS_TOKEN;
       if (isGold) {
-        const token = (upstoxService as any)?.settings?.accessToken || process.env.UPSTOX_ACCESS_TOKEN;
         await ensureGoldCandles(token);
+      } else {
+        await ensureNiftyCandles(token);
       }
 
       // Fetch excess candles to account for out-of-market hour filtering

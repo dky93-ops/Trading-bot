@@ -33,9 +33,13 @@ export interface AppSettings {
     technicalConfluence?: StrategyConfig;
     adxBreakout?: StrategyConfig;
     alphaTrend?: StrategyConfig;
+    comboUnfiltered?: StrategyConfig;
+    comboFiltered?: StrategyConfig;
   };
   goldInstrumentKey?: string;
   goldEntryMode?: 'BREAKOUT' | 'RETEST' | 'ADAPTIVE';
+  maxTradeDurationMinutes?: 30 | 60 | 120 | number;
+  oneTradeAtATime?: boolean;
 }
 
 export interface StrategyConfig {
@@ -172,7 +176,7 @@ export interface SignalPrices {
 export interface EngineDecision {
   timestamp: string;
   signal: 'BUY_CALL' | 'BUY_PUT' | 'NO_TRADE' | 'BUY' | 'SELL';
-  strategy_family: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION' | 'TECHNICAL_CONFLUENCE' | 'ADX_BREAKOUT' | 'NONE';
+  strategy_family: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION' | 'TECHNICAL_CONFLUENCE' | 'ADX_BREAKOUT' | 'ALPHATREND' | 'COMBO_UNFILTERED' | 'COMBO_FILTERED' | 'NONE';
   direction: 'CALL' | 'PUT' | 'NONE';
   spot?: number;
   broken_level?: number;

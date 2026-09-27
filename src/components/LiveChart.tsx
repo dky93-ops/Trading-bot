@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createChart, ColorType, CrosshairMode, ISeriesApi, LineStyle, Time } from 'lightweight-charts';
 import { computeATR, computeT3, computeAlphaTrend, computeADX, computeEMA, computeSMA, computeRSI } from '../backend/technical-indicators';
+import { computeKMeansAdaptiveSuperTrend, computeCMMACD } from '../backend/ml-adaptive-supertrend';
 
 type Trade = {
   id: string;
@@ -14,11 +15,15 @@ type Trade = {
   target1Hit?: boolean;
   exitTime?: number;
   exitPrice?: number;
-  exitReason?: 'TARGET' | 'STOPLOSS' | 'DAY_END' | 'BREAKEVEN';
+  exitReason?: 'TARGET' | 'STOPLOSS' | 'DAY_END' | 'BREAKEVEN' | 'MAX_TIME' | 'OPPOSITE_SIGNAL';
   duration?: string;
   pnl?: number;
   status: 'OPEN' | 'WIN' | 'LOSS' | 'BE';
   isBreakevenLocked?: boolean;
+  isComboTrade?: boolean;
+  strategyFamily?: string;
+  riskDist?: number;
+  peakPrice?: number;
 };
 
 // Formats elapsed duration from entry to exit (e.g. "14m", "1h 25m")
@@ -90,8 +95,11 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
   const targetLineRef = useRef<ISeriesApi<"Line"> | null>(null);
   const target2LineRef = useRef<ISeriesApi<"Line"> | null>(null);
   const stopLossLineRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const priceLinesRef = useRef<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [showVolume, setShowVolume] = useState<boolean>(true);
+  const [volumeMetrics, setVolumeMetrics] = useState<{ lastVol: number; volSma: number; rvol: number }>({ lastVol: 0, volSma: 0, rvol: 1.0 });
   const [backtestTrades, setBacktestTrades] = useState<Trade[]>([]);
   const [timeframe, setTimeframe] = useState<number>(1);
   const [isFiltersOpen, setIsFiltersOpen] = useState<boolean>(true);
@@ -118,16 +126,41 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
   const [strategies, setStrategies] = useState({
     t3Striped: !isGold,
     alphaTrend: true,
-    adxBreakout: isGold
+    adxBreakout: isGold,
+    comboUnfiltered: false,
+    comboFiltered: !isGold
+  });
+
+  // COMBINATION STRATEGY (T3 Striped + AlphaTrend): Filtered & Unfiltered
+  // Special Conditions: One trade at a time & Maximum Time for each trade (30m, 1h, 2h)
+  const [comboConfig, setComboConfig] = useState<{
+    maxTradeDurationMinutes: 30 | 60 | 120;
+    oneTradeAtATime: boolean;
+    slMultiple: number;
+    tp1Multiple: number;
+    tp2Multiple: number;
+  }>(() => {
+    try {
+      const saved = localStorage.getItem(`quant_combo_config_${instrument}`);
+      if (saved) return JSON.parse(saved);
+    } catch (_) {}
+    return {
+      maxTradeDurationMinutes: 60, // 30 mins, 1 hour (60), 2 hours (120)
+      oneTradeAtATime: true,
+      slMultiple: 1.2,
+      tp1Multiple: 1.5,
+      tp2Multiple: 2.5,
+    };
   });
 
   // NIFTY-CALIBRATED STRATEGY PARAMETERS
-  // AlphaTrend: KivancOzbilgic PineScript optimized for Nifty 1m (Coeff 1.6 vs tight 1.0; Period 18; RSI mode; Dual TP)
+  // AlphaTrend: KivancOzbilgic PineScript (Uses MFI with Upstox Volume by default; Coeff 1.6; Period 18; Dual TP)
   const [alphaTrendConfig, setAlphaTrendConfig] = useState<{
     period: number;
     coeff: number;
     useRsi: boolean;
     candleConfirm: boolean;
+    volumeConfirm: boolean;
     slMultiple: number;
     tp1Multiple: number;
     tp2Multiple: number;
@@ -139,21 +172,24 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     return {
       period: isGold ? 14 : 18,
       coeff: isGold ? 1.0 : 1.6,
-      useRsi: !isGold,
+      useRsi: false, // Default to FALSE to utilize real Upstox Volume via MFI!
       candleConfirm: true,
+      volumeConfirm: true,
       slMultiple: isGold ? 1.2 : 1.2,
       tp1Multiple: isGold ? 1.8 : 1.6,
       tp2Multiple: isGold ? 2.8 : 2.5,
     };
   });
 
-  // T3 Striped [Loxx]: Optimized for Nifty 1m (Period 21 vs jittery 14; Hot 0.55; Min Ribbon Spread 0.12x ATR; Candle confirm)
+  // T3 Striped [Loxx]: Optimized with Volume confirmation and smoothing
   const [t3Config, setT3Config] = useState<{
     period: number;
     hot: number;
     type: 'T3 New' | 'T3 Original';
     minRibbonExpansion: number;
     candleConfirm: boolean;
+    volumeConfirm: boolean;
+    volumeWeighted: boolean;
     slMultiple: number;
     tp1Multiple: number;
     tp2Multiple: number;
@@ -168,13 +204,15 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       type: 'T3 New',
       minRibbonExpansion: 0.12,
       candleConfirm: true,
+      volumeConfirm: true,
+      volumeWeighted: false,
       slMultiple: 1.1,
       tp1Multiple: 1.4,
       tp2Multiple: 2.2,
     };
   });
 
-  const [showStrategySettingsModal, setShowStrategySettingsModal] = useState<null | 'ALPHATREND' | 'T3'>(null);
+  const [showStrategySettingsModal, setShowStrategySettingsModal] = useState<null | 'ALPHATREND' | 'T3' | 'COMBO'>(null);
 
   const [adxBreakoutConfig, setAdxBreakoutConfig] = useState<{
     adxSmoothPeriod: number;
@@ -328,7 +366,22 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
   const t3ConfigRef = useRef(t3Config);
   t3ConfigRef.current = t3Config;
 
+  const comboConfigRef = useRef(comboConfig);
+  comboConfigRef.current = comboConfig;
+
   // Persist user modifications so state never flips back
+  useEffect(() => {
+    try {
+      localStorage.setItem(`quant_combo_config_${instrument}`, JSON.stringify(comboConfig));
+    } catch (_) {}
+  }, [comboConfig, instrument]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(`quant_strategies_${instrument}`, JSON.stringify(strategies));
+    } catch (_) {}
+  }, [strategies, instrument]);
+
   useEffect(() => {
     try {
       localStorage.setItem(`quant_alphatrend_config_${instrument}`, JSON.stringify(alphaTrendConfig));
@@ -386,7 +439,9 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     setStrategies(prev => ({
       t3Striped: !isGold,
       alphaTrend: isGold ? (prev.alphaTrend ?? true) : true,
-      adxBreakout: isGold ? (prev.adxBreakout ?? true) : false
+      adxBreakout: isGold ? (prev.adxBreakout ?? true) : false,
+      comboUnfiltered: prev.comboUnfiltered ?? false,
+      comboFiltered: prev.comboFiltered ?? !isGold
     }));
     setAdxBreakoutConfig(prev => ({
       ...prev,
@@ -409,13 +464,14 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
           filterMode,
           filterSettings,
           alphaTrendConfig,
-          t3Config
+          t3Config,
+          comboConfig
         );
       } catch (e: any) {
         if (e?.message?.includes('disposed')) return;
       }
     }
-  }, [strategies, adxChopFilter, adxBreakoutConfig, filterMode, filterSettings, alphaTrendConfig, t3Config]);
+  }, [strategies, adxChopFilter, adxBreakoutConfig, filterMode, filterSettings, alphaTrendConfig, t3Config, comboConfig]);
 
   useEffect(() => {
     if (!chartContainerRef.current) return;
@@ -480,6 +536,21 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     });
     seriesRef.current = candlestickSeries;
 
+    const volumeSeries = chart.addHistogramSeries({
+      color: '#26a69a',
+      priceFormat: {
+        type: 'volume',
+      },
+      priceScaleId: '', // overlay
+    });
+    chart.priceScale('').applyOptions({
+      scaleMargins: {
+        top: 0.8, // highest volume bar will occupy bottom 20%
+        bottom: 0,
+      },
+    });
+    volumeSeriesRef.current = volumeSeries;
+
     t3Lev0Ref.current = chart.addLineSeries({ color: '#2DD204', lineWidth: 2, title: 'T3 Lev0' });
     t3Lev5Ref.current = chart.addLineSeries({ color: '#D2042D', lineWidth: 2, title: 'T3 Lev5' });
     alphaTrendRef.current = chart.addLineSeries({ color: '#0022fc', lineWidth: 3, title: 'AlphaTrend' });
@@ -532,6 +603,14 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
           dataRef.current = unique;
           try {
             candlestickSeries.setData(unique);
+            if (volumeSeriesRef.current) {
+              const volData = unique.map(c => ({
+                time: c.time,
+                value: c.volume || 0,
+                color: c.close >= c.open ? 'rgba(38, 166, 154, 0.45)' : 'rgba(239, 83, 80, 0.45)',
+              }));
+              volumeSeriesRef.current.setData(volData);
+            }
             applyPriceActionAnalysis(
               unique, 
               candlestickSeries, 
@@ -541,7 +620,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
               filterModeRef.current,
               filterSettingsRef.current,
               alphaTrendConfigRef.current,
-              t3ConfigRef.current
+              t3ConfigRef.current,
+              comboConfigRef.current
             );
           } catch (err: any) {
             if (err?.message?.includes('disposed')) return;
@@ -608,6 +688,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       targetLineRef.current = null;
       target2LineRef.current = null;
       stopLossLineRef.current = null;
+      volumeSeriesRef.current = null;
       priceLinesRef.current = [];
 
       try {
@@ -619,6 +700,14 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       }
     };
   }, [instrument, timeframe]);
+
+  useEffect(() => {
+    if (!isDisposedRef.current && volumeSeriesRef.current) {
+      try {
+        volumeSeriesRef.current.applyOptions({ visible: showVolume });
+      } catch (_) {}
+    }
+  }, [showVolume]);
 
   useEffect(() => {
     if (!livePrice || isDisposedRef.current || !seriesRef.current || !chartRef.current) return;
@@ -640,6 +729,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
              close: livePrice,
              high: Math.max(lastBar.high, livePrice),
              low: Math.min(lastBar.low, livePrice),
+             volume: (lastBar.volume || 0) + 1,
            };
            data[data.length - 1] = newBar;
         } else {
@@ -649,11 +739,19 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
              high: Math.max(lastBar.close, livePrice),
              low: Math.min(lastBar.close, livePrice),
              close: livePrice,
+             volume: 1,
            };
            data.push(newBar);
         }
         if (!isDisposedRef.current && seriesRef.current) {
           seriesRef.current.update(newBar);
+        }
+        if (!isDisposedRef.current && volumeSeriesRef.current) {
+          volumeSeriesRef.current.update({
+            time: newBar.time,
+            value: newBar.volume || 1,
+            color: newBar.close >= newBar.open ? 'rgba(38, 166, 154, 0.45)' : 'rgba(239, 83, 80, 0.45)',
+          });
         }
       }
     } catch (e: any) {
@@ -671,7 +769,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     activeFilterMode = filterModeRef.current,
     activeFilterSettings = filterSettingsRef.current,
     activeAlphaTrendConfig = alphaTrendConfigRef.current,
-    activeT3Config = t3ConfigRef.current
+    activeT3Config = t3ConfigRef.current,
+    activeComboConfig = comboConfigRef.current
   ) => {
     if (isDisposedRef.current || !chartRef.current || !seriesRef.current) return;
     if (candles.length < 50) return;
@@ -680,7 +779,15 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     const closePrices = candles.map(c => c.close);
     const highPrices = candles.map(c => c.high);
     const lowPrices = candles.map(c => c.low);
-    const volumes = candles.map(c => c.volume);
+    const volumes = candles.map(c => c.volume || 0);
+    const volSma20 = computeSMA(volumes, 20);
+
+    // Update live volume metrics for the chart header
+    const lastIdx = candles.length - 1;
+    const lastVol = volumes[lastIdx] || 0;
+    const lastVolSma = volSma20[lastIdx] || 0;
+    const rvol = lastVolSma > 0 ? Number((lastVol / lastVolSma).toFixed(2)) : 1.0;
+    setVolumeMetrics({ lastVol, volSma: Math.round(lastVolSma), rvol });
     
     const mapSeriesData = (dataArray: number[]) => dataArray.map((v, i) => ({ time: candles[i].time, value: v })).filter(d => !isNaN(d.value) && d.time !== undefined) as any[];
 
@@ -1893,7 +2000,18 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     } catch (_) {}
 
     const atr14 = computeATR(highPrices, lowPrices, closePrices, 14);
-    const t3 = computeT3(closePrices, activeT3Config.period, activeT3Config.hot, activeT3Config.type);
+
+    // T3 series source: can use Volume-Weighted Typical Price (VWTP) if volumeWeighted is on
+    const t3Source = activeT3Config.volumeWeighted
+      ? candles.map((c, idx) => {
+          const vSma = volSma20[idx] || 1;
+          const volRatio = Math.min(2.5, Math.max(0.4, (c.volume || 1) / vSma));
+          const hlc3 = (c.high + c.low + c.close) / 3;
+          return hlc3 * volRatio + c.close * (1 - volRatio * 0.5);
+        })
+      : closePrices;
+
+    const t3 = computeT3(t3Source, activeT3Config.period, activeT3Config.hot, activeT3Config.type);
     const alpha = computeAlphaTrend(
       highPrices, 
       lowPrices, 
@@ -1906,6 +2024,10 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     const adxData = computeADX(highPrices, lowPrices, closePrices, 14);
     const ema50 = computeEMA(closePrices, 50);
     const rsi14 = computeRSI(closePrices, 14);
+    
+    // PDF Strategies (NIFTY MACD + ML Adaptive SuperTrend: BEFORE & AFTER)
+    const mlST = computeKMeansAdaptiveSuperTrend(highPrices, lowPrices, closePrices, 10, 3.0, 100, 0.75, 0.50, 0.25);
+    const cmMACD = computeCMMACD(closePrices);
     
     const validAdx = adxData.adx.filter(v => !isNaN(v));
     if (validAdx.length > 0) {
@@ -2023,18 +2145,22 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       };
 
       if (activeStrategies.t3Striped) {
-        if (t3.lev0[i-1] <= t3.lev5[i-1] && t3.lev0[i] > t3.lev5[i]) {
+        const currVolSma = volSma20[i];
+        const t3VolOk = !activeT3Config.volumeConfirm || !currVolSma || (c.volume >= currVolSma * 0.85);
+        if (t3.lev0[i-1] <= t3.lev5[i-1] && t3.lev0[i] > t3.lev5[i] && t3VolOk) {
           openShadowTrade('LONG', 'T3L', a * activeT3Config.slMultiple, a * activeT3Config.tp1Multiple);
         }
-        if (t3.lev0[i-1] >= t3.lev5[i-1] && t3.lev0[i] < t3.lev5[i]) {
+        if (t3.lev0[i-1] >= t3.lev5[i-1] && t3.lev0[i] < t3.lev5[i] && t3VolOk) {
           openShadowTrade('SHORT', 'T3S', a * activeT3Config.slMultiple, a * activeT3Config.tp1Multiple);
         }
       }
       if (activeStrategies.alphaTrend) {
-        if (alpha.buySignal[i]) {
+        const currVolSma = volSma20[i];
+        const alphaVolOk = !activeAlphaTrendConfig.volumeConfirm || !currVolSma || (c.volume >= currVolSma * 0.85);
+        if (alpha.buySignal[i] && alphaVolOk) {
           openShadowTrade('LONG', 'AlphaB', a * activeAlphaTrendConfig.slMultiple, a * activeAlphaTrendConfig.tp1Multiple);
         }
-        if (alpha.sellSignal[i]) {
+        if (alpha.sellSignal[i] && alphaVolOk) {
           openShadowTrade('SHORT', 'AlphaS', a * activeAlphaTrendConfig.slMultiple, a * activeAlphaTrendConfig.tp1Multiple);
         }
       }
@@ -2056,6 +2182,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     let wickFiltered = 0;
     let exhaustionFiltered = 0;
     let rsiFiltered = 0;
+    let volumeFiltered = 0;
     let beSavedCount = 0;
     let profitTradesFiltered = 0;
     let lossTradesFiltered = 0;
@@ -2076,8 +2203,74 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
        for (let j = openTrades.length - 1; j >= 0; j--) {
          const t = openTrades[j];
 
-         // Dynamic Breakeven trailing
-         if (activeFilterSettings.breakevenTrail && t.status === 'OPEN' && !t.isBreakevenLocked) {
+         // 1. Special Condition: Maximum Time for Each Trade (Configurable: 30 minutes, 1 hour, 2 hours)
+         const elapsedSecs = Math.max(0, (curr.time as number) - t.entryTime);
+         const elapsedMins = elapsedSecs / 60;
+         const maxAllowedMins = activeComboConfig?.maxTradeDurationMinutes || 60;
+
+         if (t.isComboTrade && t.status === 'OPEN' && elapsedMins >= maxAllowedMins) {
+           const isLong = t.type === 'LONG';
+           const exitP = curr.close;
+           t.exitPrice = exitP;
+           t.exitTime = curr.time as number;
+           t.exitReason = 'MAX_TIME';
+           t.pnl = isLong ? Number((exitP - t.entryPrice).toFixed(2)) : Number((t.entryPrice - exitP).toFixed(2));
+           t.status = t.pnl >= 0 ? 'WIN' : 'LOSS';
+           t.duration = formatDuration(t.entryTime, t.exitTime);
+           openTrades.splice(j, 1);
+           markers.push({
+             time: curr.time,
+             position: isLong ? 'aboveBar' : 'belowBar',
+             color: '#F59E0B',
+             shape: 'circle',
+             text: `close_${isLong ? 'long' : 'short'} (${t.signal} Time Exit ⏱️)`
+           });
+           continue;
+         }
+
+         // 2. Opposite Signal / Trend Reversal Exit for Combo Trades
+         if (t.status === 'OPEN' && t.isComboTrade) {
+           const isBearishReversal = alpha.sellSignal[i] || (t3.lev0[i-1] >= t3.lev5[i-1] && t3.lev0[i] < t3.lev5[i]);
+           if (t.type === 'LONG' && isBearishReversal) {
+             t.exitPrice = curr.close;
+             t.exitTime = curr.time as number;
+             t.exitReason = 'OPPOSITE_SIGNAL';
+             t.pnl = Number((curr.close - t.entryPrice).toFixed(2));
+             t.status = t.pnl >= 0 ? 'WIN' : 'LOSS';
+             t.duration = formatDuration(t.entryTime, t.exitTime);
+             openTrades.splice(j, 1);
+             markers.push({
+               time: curr.time,
+               position: 'aboveBar',
+               color: '#EC4899',
+               shape: 'circle',
+               text: `close_long (${t.signal} Rev Exit 🔄)`
+             });
+             continue;
+           }
+
+           const isBullishReversal = alpha.buySignal[i] || (t3.lev0[i-1] <= t3.lev5[i-1] && t3.lev0[i] > t3.lev5[i]);
+           if (t.type === 'SHORT' && isBullishReversal) {
+             t.exitPrice = curr.close;
+             t.exitTime = curr.time as number;
+             t.exitReason = 'OPPOSITE_SIGNAL';
+             t.pnl = Number((t.entryPrice - curr.close).toFixed(2));
+             t.status = t.pnl >= 0 ? 'WIN' : 'LOSS';
+             t.duration = formatDuration(t.entryTime, t.exitTime);
+             openTrades.splice(j, 1);
+             markers.push({
+               time: curr.time,
+               position: 'belowBar',
+               color: '#EC4899',
+               shape: 'circle',
+               text: `close_short (${t.signal} Rev Exit 🔄)`
+             });
+             continue;
+           }
+         }
+
+                  // Dynamic Breakeven trailing for standard strategies (Never applied to combo strategies)
+         if (!t.isComboTrade && activeFilterSettings.breakevenTrail && t.status === 'OPEN' && !t.isBreakevenLocked) {
            if (t.type === 'LONG') {
              const halfTarget = t.entryPrice + (t.target - t.entryPrice) * 0.5;
              if (curr.high >= halfTarget) {
@@ -2096,11 +2289,20 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
          }
 
          if (t.type === 'LONG') {
+           // Track highest price reached for dynamic trailing (PDF Section 4)
+           t.peakPrice = Math.max(t.peakPrice || t.entryPrice, curr.high);
+
            // Check Target 1 Hit
            if (!t.target1Hit && curr.high >= t.target) {
              t.target1Hit = true;
-             t.stoploss = Math.max(t.stoploss, t.entryPrice + 0.05 * atr);
              t.isBreakevenLocked = true;
+             if (t.strategyFamily === 'COMBO_FILTERED') {
+               // PDF Rule: Lock breakeven + buffer, activate dynamic trail
+               t.stoploss = Math.max(t.stoploss, t.entryPrice + 0.05 * atr);
+             } else {
+               // Unfiltered: Immediate Breakeven lock
+               t.stoploss = Math.max(t.stoploss, t.entryPrice);
+             }
              markers.push({
                time: curr.time,
                position: 'aboveBar',
@@ -2110,8 +2312,18 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
              });
            }
 
+           // PDF Dynamic Trailing SL Mechanics for Filtered Strategy:
+           // "As the price continues to make new highs, the stop loss dynamically trails at 50% of the maximum risk distance behind the peak price, locking in profits while giving the trade room to run."
+           if (t.target1Hit && t.strategyFamily === 'COMBO_FILTERED') {
+             const risk = t.riskDist || (t.entryPrice - t.stoploss) || atr;
+             const dynamicTrailStop = Number((t.peakPrice! - 0.5 * risk).toFixed(2));
+             if (dynamicTrailStop > t.stoploss) {
+               t.stoploss = dynamicTrailStop;
+             }
+           }
+
            if (t.target1Hit) {
-             const t2 = t.target2 || (t.entryPrice + (t.target - t.entryPrice) * 1.85);
+             const t2 = t.target2 || (t.entryPrice + (t.target - t.entryPrice) * (t.strategyFamily === 'COMBO_FILTERED' ? 1.5 : 1.67));
              if (curr.high >= t2) {
                // Target 2 reached! Multi-target exit (50% booked at T1, 50% at T2)
                t.exitPrice = Number(((t.target + t2) / 2).toFixed(2));
@@ -2129,7 +2341,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                  text: `close_long (${t.signal} TP2 Complete 🎯)`
                });
              } else if (curr.low <= t.stoploss) {
-               // Runner stopped out at Breakeven! (50% secured at T1, 50% at BE -> Guaranteed Net Win)
+               // Runner stopped out at Breakeven / Dynamic Trail! (50% secured at T1, 50% at trail -> Guaranteed Net Win)
                t.exitPrice = Number(((t.target + t.stoploss) / 2).toFixed(2));
                t.exitTime = curr.time as number;
                t.exitReason = 'BREAKEVEN';
@@ -2142,7 +2354,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                  position: 'aboveBar',
                  color: '#10B981',
                  shape: 'circle',
-                 text: `close_long (${t.signal} T1 Secured / BE Runner)`
+                 text: `close_long (${t.signal} T1 Secured / Trail Runner)`
                });
              } else if (isDayEnd) {
                t.exitPrice = Number(((t.target + curr.close) / 2).toFixed(2));
@@ -2188,11 +2400,20 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
              }
            }
          } else { // SHORT
+           // Track lowest price reached for dynamic trailing (PDF Section 4)
+           t.peakPrice = Math.min(t.peakPrice || t.entryPrice, curr.low);
+
            // Check Target 1 Hit
            if (!t.target1Hit && curr.low <= t.target) {
              t.target1Hit = true;
-             t.stoploss = Math.min(t.stoploss, t.entryPrice - 0.05 * atr);
              t.isBreakevenLocked = true;
+             if (t.strategyFamily === 'COMBO_FILTERED') {
+               // PDF Rule: Lock breakeven + buffer, activate dynamic trail
+               t.stoploss = Math.min(t.stoploss, t.entryPrice - 0.05 * atr);
+             } else {
+               // Unfiltered: Immediate Breakeven lock
+               t.stoploss = Math.min(t.stoploss, t.entryPrice);
+             }
              markers.push({
                time: curr.time,
                position: 'belowBar',
@@ -2202,8 +2423,18 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
              });
            }
 
+           // PDF Dynamic Trailing SL Mechanics for Filtered Strategy:
+           // "As the price continues to make new lows, the stop loss dynamically trails at 50% of the maximum risk distance behind the peak price, locking in profits while giving the trade room to run."
+           if (t.target1Hit && t.strategyFamily === 'COMBO_FILTERED') {
+             const risk = t.riskDist || (t.stoploss - t.entryPrice) || atr;
+             const dynamicTrailStop = Number((t.peakPrice! + 0.5 * risk).toFixed(2));
+             if (dynamicTrailStop < t.stoploss) {
+               t.stoploss = dynamicTrailStop;
+             }
+           }
+
            if (t.target1Hit) {
-             const t2 = t.target2 || (t.entryPrice - (t.entryPrice - t.target) * 1.85);
+             const t2 = t.target2 || (t.entryPrice - (t.entryPrice - t.target) * (t.strategyFamily === 'COMBO_FILTERED' ? 1.5 : 1.67));
              if (curr.low <= t2) {
                // Target 2 reached! Multi-target exit (50% booked at T1, 50% at T2)
                t.exitPrice = Number(((t.target + t2) / 2).toFixed(2));
@@ -2221,7 +2452,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                  text: `close_short (${t.signal} TP2 Complete 🎯)`
                });
              } else if (curr.high >= t.stoploss) {
-               // Runner stopped out at Breakeven! (50% secured at T1, 50% at BE -> Guaranteed Net Win)
+               // Runner stopped out at Breakeven / Dynamic Trail! (50% secured at T1, 50% at trail -> Guaranteed Net Win)
                t.exitPrice = Number(((t.target + t.stoploss) / 2).toFixed(2));
                t.exitTime = curr.time as number;
                t.exitReason = 'BREAKEVEN';
@@ -2234,7 +2465,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                  position: 'belowBar',
                  color: '#10B981',
                  shape: 'circle',
-                 text: `close_short (${t.signal} T1 Secured / BE Runner)`
+                 text: `close_short (${t.signal} T1 Secured / Trail Runner)`
                });
              } else if (isDayEnd) {
                t.exitPrice = Number(((t.target + curr.close) / 2).toFixed(2));
@@ -2282,7 +2513,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
          }
        }
 
-       // Function to evaluate whether a trade passes filter checks
+// Function to evaluate whether a trade passes filter checks
        const checkSignalFilter = (type: 'LONG'|'SHORT'): string | null => {
          if (activeFilterMode === 'RAW') return null;
 
@@ -2386,6 +2617,15 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
            }
          }
 
+         // 7. Volume Confirmation Filter
+         const currVolSma = volSma20[i];
+         if (activeFilterSettings.volumeConfirm && currVolSma > 0 && curr.volume > 0) {
+           if (curr.volume < currVolSma * 0.85) {
+             volumeFiltered++;
+             return 'LOW_VOLUME_CHOP';
+           }
+         }
+
          return null;
        };
 
@@ -2449,7 +2689,11 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
          const candleOkLong = !activeT3Config.candleConfirm || (curr.close >= curr.open && curr.close >= t3_0);
          const candleOkShort = !activeT3Config.candleConfirm || (curr.close <= curr.open && curr.close <= t3_0);
 
-         if (isCrossOver && hasSpread && candleOkLong) {
+         // Volume Confirmation Check
+         const currVolSma = volSma20[i];
+         const t3VolOk = !activeT3Config.volumeConfirm || !currVolSma || (curr.volume >= currVolSma * 0.85);
+
+         if (isCrossOver && hasSpread && candleOkLong && t3VolOk) {
            const reason = checkSignalFilter('LONG');
            if (!reason) {
              markers.push({ time: curr.time, position: 'belowBar', color: '#EAB308', shape: 'arrowUp', text: 'T3 L' });
@@ -2462,7 +2706,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
              atr * activeT3Config.tp2Multiple
            );
          }
-         if (isCrossUnder && hasSpread && candleOkShort) {
+         if (isCrossUnder && hasSpread && candleOkShort && t3VolOk) {
            const reason = checkSignalFilter('SHORT');
            if (!reason) {
              markers.push({ time: curr.time, position: 'aboveBar', color: '#D946EF', shape: 'arrowDown', text: 'T3 S' });
@@ -2483,7 +2727,11 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
          const candleOkLong = !activeAlphaTrendConfig.candleConfirm || (curr.close >= curr.open);
          const candleOkShort = !activeAlphaTrendConfig.candleConfirm || (curr.close <= curr.open);
 
-         if (alpha.buySignal[i] && candleOkLong) {
+         // Volume Confirmation Check
+         const currVolSma = volSma20[i];
+         const alphaVolOk = !activeAlphaTrendConfig.volumeConfirm || !currVolSma || (curr.volume >= currVolSma * 0.85);
+
+         if (alpha.buySignal[i] && candleOkLong && alphaVolOk) {
            const reason = checkSignalFilter('LONG');
            if (!reason) {
              markers.push({ time: curr.time, position: 'belowBar', color: '#0022fc', shape: 'arrowUp', text: 'BUY' });
@@ -2496,7 +2744,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
              atr * activeAlphaTrendConfig.tp2Multiple
            );
          }
-         if (alpha.sellSignal[i] && candleOkShort) {
+         if (alpha.sellSignal[i] && candleOkShort && alphaVolOk) {
            const reason = checkSignalFilter('SHORT');
            if (!reason) {
              markers.push({ time: curr.time, position: 'aboveBar', color: '#800000', shape: 'arrowDown', text: 'SELL' });
@@ -2510,9 +2758,202 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
            );
          }
        }
+
+       // =====================================================================
+       // COMBINATION STRATEGY (T3 Striped + AlphaTrend)
+       // Two versions: UNFILTERED and FILTERED
+       // Special Conditions:
+       // 1. One trade at a time (strictly enforced)
+       // 2. Maximum time for each trade (30 mins, 1 hour, 2 hours)
+       // Works on 5m timeframe and ALL other timeframes (1m, 3m, 15m, etc.)
+       // =====================================================================
+       const t3_0 = t3.lev0[i];
+       const t3_5 = t3.lev5[i];
+       const prev_t3_0 = t3.lev0[i-1];
+       const prev_t3_5 = t3.lev5[i-1];
+       
+       const t3Bullish = !isNaN(t3_0) && !isNaN(t3_5) && t3_0 > t3_5;
+       const t3Bearish = !isNaN(t3_0) && !isNaN(t3_5) && t3_0 < t3_5;
+       const t3CrossOver = prev_t3_0 <= prev_t3_5 && t3Bullish;
+       const t3CrossUnder = prev_t3_0 >= prev_t3_5 && t3Bearish;
+
+       const atLine = alpha.alphaTrend[i];
+       const atTrig = alpha.trigger[i];
+       const alphaBullish = !isNaN(atLine) && !isNaN(atTrig) && atLine > atTrig;
+       const alphaBearish = !isNaN(atLine) && !isNaN(atTrig) && atLine < atTrig;
+       const alphaBuyCross = alpha.buySignal[i];
+       const alphaSellCross = alpha.sellSignal[i];
+
+       // Combination Trigger Signals:
+       // Bullish Long: AlphaTrend Buy cross while T3 is Bullish OR T3 Crossover while AlphaTrend is Bullish
+       const comboLongTrigger = (alphaBuyCross && t3Bullish) || (t3CrossOver && alphaBullish);
+       // Bearish Short: AlphaTrend Sell cross while T3 is Bearish OR T3 Crossunder while AlphaTrend is Bearish
+       const comboShortTrigger = (alphaSellCross && t3Bearish) || (t3CrossUnder && alphaBearish);
+
+              // 1. Unfiltered Version: "unfiltered"
+       // Evaluated strictly on its own rules without interference from any other strategy
+       if (activeStrategies.comboUnfiltered && !isDayEnd) {
+         const hasActiveTrade = (activeComboConfig?.oneTradeAtATime ?? true) && openTrades.some(t => t.status === 'OPEN' && t.strategyFamily === 'COMBO_UNFILTERED');
+         if (!hasActiveTrade) {
+           if (comboLongTrigger) {
+             markers.push({ time: curr.time, position: 'belowBar', color: '#06B6D4', shape: 'arrowUp', text: 'Unfiltered L' });
+             const entry = curr.close;
+             // Pure Technical Pivot SL: Recent Swing Low or AlphaTrend support
+             const recentLow = Math.min(...candles.slice(Math.max(0, i - 4), i + 1).map(c => c.low));
+             const alphaLine = alpha.alphaTrend[i];
+             const rawSL = (!isNaN(alphaLine) && alphaLine < entry) ? Math.min(recentLow, alphaLine) : recentLow;
+             const rawRisk = entry - rawSL;
+             const riskDist = Math.min(2.5 * atr, Math.max(1.0 * atr, rawRisk > 0 ? rawRisk : atr * 1.0));
+             const stoploss = Number((entry - riskDist).toFixed(2));
+             // Unfiltered Momentum Targets: 1:1.5 R:R and 1:2.5 R:R
+             const tp1Points = riskDist * 1.5;
+             const tp2Points = riskDist * 2.5;
+
+             const newTrade: Trade = {
+               id: `${curr.time}-COMBO-UNFILTERED-L`,
+               type: 'LONG',
+               signal: 'Unfiltered Long',
+               strategyFamily: 'COMBO_UNFILTERED',
+               entryTime: curr.time as number,
+               entryPrice: entry,
+               stoploss: stoploss,
+               target: Number((entry + tp1Points).toFixed(2)),
+               target2: Number((entry + tp2Points).toFixed(2)),
+               riskDist: riskDist,
+               peakPrice: entry,
+               status: 'OPEN',
+               isComboTrade: true
+             };
+             openTrades.push(newTrade);
+             allTrades.push(newTrade);
+           } else if (comboShortTrigger) {
+             markers.push({ time: curr.time, position: 'aboveBar', color: '#F43F5E', shape: 'arrowDown', text: 'Unfiltered S' });
+             const entry = curr.close;
+             // Pure Technical Pivot SL: Recent Swing High or AlphaTrend resistance
+             const recentHigh = Math.max(...candles.slice(Math.max(0, i - 4), i + 1).map(c => c.high));
+             const alphaLine = alpha.alphaTrend[i];
+             const rawSL = (!isNaN(alphaLine) && alphaLine > entry) ? Math.max(recentHigh, alphaLine) : recentHigh;
+             const rawRisk = rawSL - entry;
+             const riskDist = Math.min(2.5 * atr, Math.max(1.0 * atr, rawRisk > 0 ? rawRisk : atr * 1.0));
+             const stoploss = Number((entry + riskDist).toFixed(2));
+             // Unfiltered Momentum Targets: 1:1.5 R:R and 1:2.5 R:R
+             const tp1Points = riskDist * 1.5;
+             const tp2Points = riskDist * 2.5;
+
+             const newTrade: Trade = {
+               id: `${curr.time}-COMBO-UNFILTERED-S`,
+               type: 'SHORT',
+               signal: 'Unfiltered Short',
+               strategyFamily: 'COMBO_UNFILTERED',
+               entryTime: curr.time as number,
+               entryPrice: entry,
+               stoploss: stoploss,
+               target: Number((entry - tp1Points).toFixed(2)),
+               target2: Number((entry - tp2Points).toFixed(2)),
+               riskDist: riskDist,
+               peakPrice: entry,
+               status: 'OPEN',
+               isComboTrade: true
+             };
+             openTrades.push(newTrade);
+             allTrades.push(newTrade);
+           }
+         }
+       }
+
+       // 2. Filtered Version: "filtered"
+       // Evaluated SOLELY by its own 5 strategy rules: (1) Confluence Trigger, (2) Upstox Volume confirmation,
+       // (3) Green/Red Candle Conviction, (4) Ribbon Spread Expansion, and (5) 50 EMA trend alignment.
+       // NO outside or other strategy filters apply. Isolated One Trade at a Time without interference.
+       if (activeStrategies.comboFiltered && !isDayEnd) {
+         const hasActiveTrade = (activeComboConfig?.oneTradeAtATime ?? true) && openTrades.some(t => t.status === 'OPEN' && t.strategyFamily === 'COMBO_FILTERED');
+         if (!hasActiveTrade) {
+           // Strict Strategy Confirmation Filters:
+           // a) Real Upstox Volume confirmation (>= 0.85x 20-period Vol SMA)
+           const currVolSma = volSma20[i];
+           const volOk = !currVolSma || (curr.volume >= currVolSma * 0.85);
+
+           // b) Confirmation Candle: Green candle for Long (Close >= Open), Red candle for Short (Close <= Open)
+           const candleOkLong = curr.close >= curr.open;
+           const candleOkShort = curr.close <= curr.open;
+
+           // c) Ribbon Spread Expansion: abs(t3_0 - t3_5) >= minRibbonExpansion * ATR
+           const ribbonSpread = Math.abs(t3_0 - t3_5);
+           const minSpread = (activeT3Config.minRibbonExpansion || 0.12) * atr;
+           const spreadOk = ribbonSpread >= minSpread;
+
+           // d) Trend Alignment (50 EMA)
+           const trendOkLong = isNaN(currEma50) || (curr.close >= currEma50 - 0.25 * atr);
+           const trendOkShort = isNaN(currEma50) || (curr.close <= currEma50 + 0.25 * atr);
+
+           if (comboLongTrigger && volOk && candleOkLong && spreadOk && trendOkLong) {
+             markers.push({ time: curr.time, position: 'belowBar', color: '#10B981', shape: 'arrowUp', text: 'Filtered L' });
+             const entry = curr.close;
+             // Structural Stop Loss as per PDF Section 4: Invalidation level with dynamic buffer
+             const recentLow = Math.min(...candles.slice(Math.max(0, i - 4), i + 1).map(c => c.low));
+             const alphaLine = alpha.alphaTrend[i];
+             const rawSL = (!isNaN(alphaLine) && alphaLine < entry) ? Math.min(recentLow, alphaLine) : recentLow;
+             const rawRisk = entry - rawSL;
+             const riskDist = Math.min(2.5 * atr, Math.max(1.2 * atr, rawRisk > 0 ? rawRisk : atr * 1.2));
+             const stoploss = Number((entry - riskDist).toFixed(2));
+             // Dynamic Risk-to-Reward Targets as per PDF Section 4: Spot Target 1: 1:2 R:R (Risk x 2.0); Target 2: 1:3 R:R
+             const tp1Points = riskDist * 2.0;
+             const tp2Points = riskDist * 3.0;
+
+             const newTrade: Trade = {
+               id: `${curr.time}-COMBO-FILTERED-L`,
+               type: 'LONG',
+               signal: 'Filtered Long',
+               strategyFamily: 'COMBO_FILTERED',
+               entryTime: curr.time as number,
+               entryPrice: entry,
+               stoploss: stoploss,
+               target: Number((entry + tp1Points).toFixed(2)),
+               target2: Number((entry + tp2Points).toFixed(2)),
+               riskDist: riskDist,
+               peakPrice: entry,
+               status: 'OPEN',
+               isComboTrade: true
+             };
+             openTrades.push(newTrade);
+             allTrades.push(newTrade);
+           } else if (comboShortTrigger && volOk && candleOkShort && spreadOk && trendOkShort) {
+             markers.push({ time: curr.time, position: 'aboveBar', color: '#E11D48', shape: 'arrowDown', text: 'Filtered S' });
+             const entry = curr.close;
+             // Structural Stop Loss as per PDF Section 4: Invalidation level with dynamic buffer
+             const recentHigh = Math.max(...candles.slice(Math.max(0, i - 4), i + 1).map(c => c.high));
+             const alphaLine = alpha.alphaTrend[i];
+             const rawSL = (!isNaN(alphaLine) && alphaLine > entry) ? Math.max(recentHigh, alphaLine) : recentHigh;
+             const rawRisk = rawSL - entry;
+             const riskDist = Math.min(2.5 * atr, Math.max(1.2 * atr, rawRisk > 0 ? rawRisk : atr * 1.2));
+             const stoploss = Number((entry + riskDist).toFixed(2));
+             // Dynamic Risk-to-Reward Targets as per PDF Section 4: Spot Target 1: 1:2 R:R (Risk x 2.0); Target 2: 1:3 R:R
+             const tp1Points = riskDist * 2.0;
+             const tp2Points = riskDist * 3.0;
+
+             const newTrade: Trade = {
+               id: `${curr.time}-COMBO-FILTERED-S`,
+               type: 'SHORT',
+               signal: 'Filtered Short',
+               strategyFamily: 'COMBO_FILTERED',
+               entryTime: curr.time as number,
+               entryPrice: entry,
+               stoploss: stoploss,
+               target: Number((entry - tp1Points).toFixed(2)),
+               target2: Number((entry - tp2Points).toFixed(2)),
+               riskDist: riskDist,
+               peakPrice: entry,
+               status: 'OPEN',
+               isComboTrade: true
+             };
+             openTrades.push(newTrade);
+             allTrades.push(newTrade);
+           }
+         }
+       }
      }
 
-    // Failsafe: Only square off if session actually ended, otherwise keep trade actively OPEN
+// Failsafe: Only square off if session actually ended, otherwise keep trade actively OPEN
     for (const t of openTrades) {
       if (t.status === 'OPEN') {
         const lastC = candles[candles.length - 1];
@@ -2546,7 +2987,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       exhaustionFiltered,
       rsiFiltered,
       wickFiltered,
-      volumeFiltered: 0,
+      volumeFiltered,
       trendFiltered,
       boxFiltered: 0,
       adxFiltered: chopFiltered,
@@ -2632,6 +3073,35 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                 {tf.label}
               </button>
             ))}
+          </div>
+
+          {/* Volume Indicator Controls & Stats */}
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={() => setShowVolume(v => !v)}
+              className={`px-2.5 py-1 rounded text-xs font-bold border transition-colors cursor-pointer flex items-center gap-1.5 ${
+                showVolume
+                  ? 'bg-emerald-950/60 border-emerald-500/50 text-emerald-300 shadow-sm'
+                  : 'bg-[#1F2937] border-gray-700 text-gray-400 hover:text-white'
+              }`}
+              title="Toggle Volume Histogram overlay on chart"
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${showVolume ? 'bg-emerald-400 animate-pulse' : 'bg-gray-500'}`}></span>
+              <span>VOL</span>
+            </button>
+            {volumeMetrics.lastVol > 0 && (
+              <div className="hidden sm:flex items-center gap-1.5 text-[11px] font-mono bg-[#111827] px-2 py-0.5 rounded border border-[#1F2937]">
+                <span className="text-gray-400">Vol:</span>
+                <span className="text-white font-bold">{volumeMetrics.lastVol.toLocaleString()}</span>
+                <span className="text-gray-600">|</span>
+                <span className="text-gray-400">20SMA:</span>
+                <span className="text-gray-300">{volumeMetrics.volSma.toLocaleString()}</span>
+                <span className="text-gray-600">|</span>
+                <span className={`font-bold ${volumeMetrics.rvol >= 1.0 ? 'text-emerald-400' : 'text-gray-400'}`}>
+                  {volumeMetrics.rvol}x
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="hidden lg:flex items-center space-x-3 text-[10px] uppercase font-bold text-gray-500">
@@ -2843,6 +3313,18 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     </select>
                   </div>
                   <button
+                    onClick={() => setT3Config(c => ({ ...c, volumeConfirm: !c.volumeConfirm }))}
+                    disabled={!strategies.t3Striped}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
+                      t3Config.volumeConfirm
+                        ? 'bg-emerald-950/60 border-emerald-500/50 text-emerald-300'
+                        : 'bg-[#0A0F1C] border-gray-700 text-gray-500'
+                    }`}
+                    title={t3Config.volumeConfirm ? "T3 Volume confirmation ACTIVE (>= 0.85x Vol SMA required for cross)" : "T3 Volume confirmation disabled"}
+                  >
+                    Vol
+                  </button>
+                  <button
                     onClick={() => setShowStrategySettingsModal('T3')}
                     className="px-1.5 py-0.5 rounded text-[11px] bg-[#1F2937] hover:bg-[#374151] text-gray-300 hover:text-white transition-colors flex items-center gap-1 cursor-pointer"
                     title="Configure advanced T3 parameters (Ribbon filter, TP1/TP2, SL)"
@@ -2898,11 +3380,83 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     </select>
                   </div>
                   <button
+                    onClick={() => setAlphaTrendConfig(c => ({ ...c, useRsi: !c.useRsi }))}
+                    disabled={!strategies.alphaTrend}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
+                      !alphaTrendConfig.useRsi
+                        ? 'bg-blue-950/70 border-blue-500/60 text-blue-300'
+                        : 'bg-[#0A0F1C] border-gray-700 text-gray-400'
+                    }`}
+                    title={!alphaTrendConfig.useRsi ? "MFI Upstox Volume Mode ACTIVE (Click to toggle RSI)" : "RSI Mode (Click for Upstox Volume MFI)"}
+                  >
+                    {!alphaTrendConfig.useRsi ? "MFI(Vol)" : "RSI"}
+                  </button>
+                  <button
                     onClick={() => setShowStrategySettingsModal('ALPHATREND')}
                     className="px-1.5 py-0.5 rounded text-[11px] bg-[#1F2937] hover:bg-[#374151] text-gray-300 hover:text-white transition-colors flex items-center gap-1 cursor-pointer"
                     title="Configure advanced AlphaTrend parameters (RSI/MFI mode, Candle confirm, TP1/TP2, SL)"
                   >
                     <span>⚙️</span>
+                  </button>
+                </div>
+
+                {/* COMBO STRATEGY (T3 Striped + AlphaTrend): Filtered & Unfiltered Controls */}
+                <div className="flex items-center gap-2 bg-[#111827] px-2.5 sm:px-3 py-1.5 rounded-lg border border-[#1F2937] shrink-0">
+                  <div className="flex items-center gap-2.5">
+                    {/* Filtered Combo Toggle */}
+                    <label className="flex items-center gap-1.5 cursor-pointer text-white font-semibold" title="T3 Striped + AlphaTrend Filtered (Volume, Candle, Spread & 50 EMA Confirmed)">
+                      <input 
+                        type="checkbox" 
+                        checked={strategies.comboFiltered} 
+                        onChange={e => setStrategies(s => ({...s, comboFiltered: e.target.checked}))} 
+                        className="accent-emerald-400 cursor-pointer" 
+                      />
+                      <span className="flex items-center gap-1.5 whitespace-nowrap">
+                        <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                        <span className="text-emerald-400">Filtered</span>
+                      </span>
+                    </label>
+
+                    <div className="h-3 w-px bg-gray-700"></div>
+
+                    {/* Unfiltered Combo Toggle */}
+                    <label className="flex items-center gap-1.5 cursor-pointer text-white font-semibold" title="T3 Striped + AlphaTrend Unfiltered (Raw Confluence)">
+                      <input 
+                        type="checkbox" 
+                        checked={strategies.comboUnfiltered} 
+                        onChange={e => setStrategies(s => ({...s, comboUnfiltered: e.target.checked}))} 
+                        className="accent-cyan-400 cursor-pointer" 
+                      />
+                      <span className="flex items-center gap-1.5 whitespace-nowrap">
+                        <span className="w-2 h-2 rounded-full bg-cyan-400"></span>
+                        <span className="text-cyan-300">Unfiltered</span>
+                      </span>
+                    </label>
+                  </div>
+
+                  <div className="h-3 w-px bg-gray-700"></div>
+
+                  {/* Max Time for Trade Selector (30 mins, 1 hour, 2 hours) */}
+                  <div className="flex items-center gap-1 text-gray-400 text-xs">
+                    <span title="Maximum allowed time for each trade before auto time exit (30m, 1h, 2h)">⏱️ Max:</span>
+                    <select
+                      value={comboConfig.maxTradeDurationMinutes}
+                      onChange={e => setComboConfig(c => ({ ...c, maxTradeDurationMinutes: Number(e.target.value) as 30 | 60 | 120 }))}
+                      className="bg-[#0A0F1C] border border-[#374151] rounded px-1.5 py-0.5 text-xs text-amber-300 font-mono focus:outline-none cursor-pointer font-bold"
+                      title="Select maximum trade duration (Special Condition: 30 minutes, 1 hour, or 2 hours)"
+                    >
+                      <option value={30}>30m</option>
+                      <option value={60}>1h</option>
+                      <option value={120}>2h</option>
+                    </select>
+                  </div>
+
+                  <button
+                    onClick={() => setShowStrategySettingsModal('COMBO')}
+                    className="px-1.5 py-0.5 rounded text-[11px] bg-[#1F2937] hover:bg-[#374151] text-amber-300 hover:text-white transition-colors flex items-center gap-1 cursor-pointer font-medium"
+                    title="Configure Combo Strategy (Max Time: 30m/1h/2h, 1-Trade Rule, Targets, SL)"
+                  >
+                    <span>⚙️ Combo</span>
                   </button>
                 </div>
 
@@ -3505,6 +4059,10 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                         <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-red-500/20 text-red-400 border border-red-500/30">Stoploss</span>
                       ) : t.exitReason === 'BREAKEVEN' ? (
                         <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">BE Lock</span>
+                      ) : t.exitReason === 'MAX_TIME' ? (
+                        <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">⏱️ Time Exit</span>
+                      ) : t.exitReason === 'OPPOSITE_SIGNAL' ? (
+                        <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-pink-500/20 text-pink-300 border border-pink-500/30">🔄 Trend Rev</span>
                       ) : t.exitReason === 'DAY_END' ? (
                         <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-amber-500/20 text-amber-400 border border-amber-500/30">Day End</span>
                       ) : (
@@ -3605,6 +4163,14 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                         <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30" title="Stoploss shifted to breakeven after 50% progress toward target">
                           BE Protected
                         </span>
+                      ) : t.exitReason === 'MAX_TIME' ? (
+                        <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30" title="Max trade time reached (30m, 1h, 2h)">
+                          ⏱️ Time Exit
+                        </span>
+                      ) : t.exitReason === 'OPPOSITE_SIGNAL' ? (
+                        <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-pink-500/20 text-pink-300 border border-pink-500/30" title="Opposite trend reversal">
+                          🔄 Trend Rev
+                        </span>
                       ) : t.exitReason === 'DAY_END' ? (
                         <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-400 border border-amber-500/30" title="Squared off at Market Session Close (No Overnight Carry)">
                           Day End Close
@@ -3694,6 +4260,17 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
               >
                 <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
                 T3 Striped [Loxx]
+              </button>
+              <button
+                onClick={() => setShowStrategySettingsModal('COMBO')}
+                className={`py-3 px-4 text-xs font-semibold border-b-2 transition-colors flex items-center gap-2 cursor-pointer ${
+                  showStrategySettingsModal === 'COMBO'
+                    ? 'border-amber-500 text-amber-400'
+                    : 'border-transparent text-gray-400 hover:text-gray-200'
+                }`}
+              >
+                <span className="w-2 h-2 rounded-full bg-amber-400"></span>
+                Combo Strategy (Filtered &amp; Unfiltered)
               </button>
             </div>
 
@@ -3825,9 +4402,42 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                         Ensures signal candle closes green for BUY, and red for SELL. Prevents entering into violent counter-trend rejection wicks.
                       </p>
                     </div>
+
+                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
+                      <div className="flex justify-between items-center">
+                        <label className="font-medium text-gray-300">Momentum Engine Source</label>
+                        <span className="font-mono text-cyan-300 font-bold">{!alphaTrendConfig.useRsi ? "MFI (Upstox Volume)" : "RSI (Price-Only)"}</span>
+                      </div>
+                      <select
+                        value={alphaTrendConfig.useRsi ? 'RSI' : 'MFI'}
+                        onChange={e => setAlphaTrendConfig(c => ({ ...c, useRsi: e.target.value === 'RSI' }))}
+                        className="w-full bg-[#111827] border border-[#374151] rounded px-2.5 py-1.5 text-xs text-white cursor-pointer focus:outline-none"
+                      >
+                        <option value="MFI">MFI with Upstox Volume (Kivanc PineScript Original ⭐)</option>
+                        <option value="RSI">RSI (Price-Only, Disregard Volume)</option>
+                      </select>
+                      <p className="text-[10px] text-gray-500">
+                        PineScript original AlphaTrend utilizes MFI (Money Flow Index) calculated from real Upstox candle volume to establish true institutional support/resistance levels.
+                      </p>
+                    </div>
+
+                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-3 flex flex-col justify-center">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={alphaTrendConfig.volumeConfirm}
+                          onChange={e => setAlphaTrendConfig(c => ({ ...c, volumeConfirm: e.target.checked }))}
+                          className="accent-brand-blue cursor-pointer"
+                        />
+                        <span className="text-gray-300 font-medium">Volume Breakout Filter (&ge; 0.85x Vol SMA)</span>
+                      </label>
+                      <p className="text-[10px] text-gray-500">
+                        Requires breakout candle to carry institutional volume &ge; 85% of 20 SMA. Eliminates low-volume traps and fake breakouts.
+                      </p>
+                    </div>
                   </div>
                 </div>
-              ) : (
+              ) : showStrategySettingsModal === 'T3' ? (
                 <div className="space-y-5">
                   {/* T3 Diagnosis Notice */}
                   <div className="p-3.5 rounded-xl bg-emerald-950/30 border border-emerald-800/40 text-emerald-200 space-y-1.5">
@@ -3957,9 +4567,189 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                         1.1x ATR ensures strict loss limitation if crossover immediately stalls.
                       </p>
                     </div>
+
+                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-3 flex flex-col justify-center">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={t3Config.volumeConfirm}
+                          onChange={e => setT3Config(c => ({ ...c, volumeConfirm: e.target.checked }))}
+                          className="accent-emerald-400 cursor-pointer"
+                        />
+                        <span className="text-gray-300 font-medium">Volume Confirmation (&ge; 0.85x Vol SMA)</span>
+                      </label>
+                      <p className="text-[10px] text-gray-500">
+                        Requires T3 ribbon crossover candle to carry volume &ge; 85% of 20 SMA. Eliminates low-volume false ribbon tangles.
+                      </p>
+                    </div>
+
+                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-3 flex flex-col justify-center">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={t3Config.volumeWeighted}
+                          onChange={e => setT3Config(c => ({ ...c, volumeWeighted: e.target.checked }))}
+                          className="accent-cyan-400 cursor-pointer"
+                        />
+                        <span className="text-gray-300 font-medium">Volume-Weighted Ribbon (VWTP Source)</span>
+                      </label>
+                      <p className="text-[10px] text-gray-500">
+                        Dynamically weights T3 ribbon input by volume momentum, curving faster on institutional volume bursts and flattening in quiet lulls.
+                      </p>
+                    </div>
                   </div>
                 </div>
-              )}
+              ) : showStrategySettingsModal === 'COMBO' ? (
+                <div className="space-y-5">
+                  <div className="p-3.5 rounded-xl bg-amber-950/30 border border-amber-800/40 text-amber-200 space-y-1.5">
+                    <div className="font-semibold flex items-center gap-1.5 text-amber-300">
+                      <span>⚡</span>
+                      <span>Combined Strategy: T3 Striped Ribbon + AlphaTrend</span>
+                    </div>
+                    <p className="text-gray-300 text-[11px] leading-relaxed">
+                      Merges two elite trading systems: Kivanc Ozbilgic's <strong>AlphaTrend</strong> (institutional trend support/resistance via Upstox volume MFI) and Loxx's <strong>T3 Striped Trend Ribbon</strong> (zero-lag Tilson moving average bands). 
+                      Supports both <strong>Filtered</strong> (institutional confirmation suite) and <strong>Unfiltered</strong> (raw confluence momentum) versions.
+                    </p>
+                  </div>
+
+                  {/* Special Conditions: Max Trade Time & One Trade At A Time */}
+                  <div className="p-3.5 rounded-xl bg-[#111827] border border-[#1F2937] space-y-4">
+                    <div className="font-semibold text-white flex items-center gap-1.5">
+                      <span className="text-amber-400">⏱️</span>
+                      <span>Special Conditions (Rules &amp; Limits)</span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      {/* Maximum Time of Trade */}
+                      <div className="space-y-1.5">
+                        <label className="font-medium text-gray-300 block">
+                          Maximum Time for Each Trade
+                        </label>
+                        <div className="grid grid-cols-3 gap-2">
+                          {[
+                            { value: 30, label: '30 Minutes' },
+                            { value: 60, label: '1 Hour' },
+                            { value: 120, label: '2 Hours' }
+                          ].map(opt => (
+                            <button
+                              key={opt.value}
+                              type="button"
+                              onClick={() => setComboConfig(c => ({ ...c, maxTradeDurationMinutes: opt.value as 30 | 60 | 120 }))}
+                              className={`py-2 px-2.5 rounded-lg border text-center transition-all cursor-pointer ${
+                                comboConfig.maxTradeDurationMinutes === opt.value
+                                  ? 'bg-amber-500/20 border-amber-500 text-amber-300 font-bold shadow-sm'
+                                  : 'bg-[#0A0F1C] border-[#1F2937] text-gray-400 hover:text-gray-200'
+                              }`}
+                            >
+                              <div className="text-xs">{opt.label}</div>
+                            </button>
+                          ))}
+                        </div>
+                        <p className="text-[10px] text-gray-500 mt-1">
+                          If trade has not reached Target or Stoploss within this elapsed time, it automatically squares off.
+                        </p>
+                      </div>
+
+                      {/* One Trade At A Time */}
+                      <div className="space-y-1.5">
+                        <label className="font-medium text-gray-300 block">
+                          Execution Constraint
+                        </label>
+                        <div className="p-2.5 rounded-lg bg-[#0A0F1C] border border-[#1F2937]">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={comboConfig.oneTradeAtATime}
+                              onChange={e => setComboConfig(c => ({ ...c, oneTradeAtATime: e.target.checked }))}
+                              className="accent-amber-400 cursor-pointer"
+                            />
+                            <span className="text-gray-200 font-semibold text-xs">One Trade at a Time</span>
+                          </label>
+                          <p className="text-[10px] text-gray-400 mt-1">
+                            Strict risk control: Never opens overlapping trades. Waits until current active trade closes before seeking new setups.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Target & Risk Parameters */}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div className="space-y-1 bg-[#111827] p-3 rounded-lg border border-[#1F2937]">
+                      <div className="flex justify-between items-center text-gray-400">
+                        <label className="font-medium text-gray-300">Stop Loss Risk</label>
+                        <span className="font-mono text-red-400 font-bold">{comboConfig.slMultiple.toFixed(1)}x ATR</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0.8"
+                        max="2.5"
+                        step="0.1"
+                        value={comboConfig.slMultiple}
+                        onChange={e => setComboConfig(c => ({ ...c, slMultiple: Number(e.target.value) }))}
+                        className="w-full accent-red-400 cursor-pointer"
+                      />
+                      <p className="text-[10px] text-gray-500">Structural SL beyond invalidation candle</p>
+                    </div>
+
+                    <div className="space-y-1 bg-[#111827] p-3 rounded-lg border border-[#1F2937]">
+                      <div className="flex justify-between items-center text-gray-400">
+                        <label className="font-medium text-gray-300">Target 1 (TP1)</label>
+                        <span className="font-mono text-emerald-400 font-bold">{comboConfig.tp1Multiple.toFixed(1)}x ATR</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="1.0"
+                        max="3.0"
+                        step="0.1"
+                        value={comboConfig.tp1Multiple}
+                        onChange={e => setComboConfig(c => ({ ...c, tp1Multiple: Number(e.target.value) }))}
+                        className="w-full accent-emerald-400 cursor-pointer"
+                      />
+                      <p className="text-[10px] text-gray-500">Secures 50% &amp; moves SL to Breakeven</p>
+                    </div>
+
+                    <div className="space-y-1 bg-[#111827] p-3 rounded-lg border border-[#1F2937]">
+                      <div className="flex justify-between items-center text-gray-400">
+                        <label className="font-medium text-gray-300">Target 2 (Runner)</label>
+                        <span className="font-mono text-purple-400 font-bold">{comboConfig.tp2Multiple.toFixed(1)}x ATR</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="1.8"
+                        max="4.5"
+                        step="0.1"
+                        value={comboConfig.tp2Multiple}
+                        onChange={e => setComboConfig(c => ({ ...c, tp2Multiple: Number(e.target.value) }))}
+                        className="w-full accent-purple-400 cursor-pointer"
+                      />
+                      <p className="text-[10px] text-gray-500">Full target runner with dynamic trail</p>
+                    </div>
+                  </div>
+
+                  {/* Versions Comparison Box */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div className="p-3 rounded-lg bg-[#0A0F1C] border border-cyan-500/20">
+                      <div className="flex items-center gap-1.5 text-cyan-300 font-semibold mb-1">
+                        <span className="w-2 h-2 rounded-full bg-cyan-400"></span>
+                        <span>Unfiltered Version</span>
+                      </div>
+                      <p className="text-[11px] text-gray-300 leading-relaxed">
+                        Fires immediately when AlphaTrend momentum cross and T3 Ribbon direction agree. Ideal for high-momentum runaway trending sessions where waiting for pullbacks causes missed entries.
+                      </p>
+                    </div>
+                    <div className="p-3 rounded-lg bg-[#0A0F1C] border border-emerald-500/20">
+                      <div className="flex items-center gap-1.5 text-emerald-400 font-semibold mb-1">
+                        <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                        <span>Filtered Version</span>
+                      </div>
+                      <p className="text-[11px] text-gray-300 leading-relaxed">
+                        Requires Upstox Volume &ge; 0.85x Vol SMA, Green/Red candle confirmation, Ribbon spread expansion &gt; 0.12x ATR, and 50 EMA trend alignment. Prevents fake-outs in choppy consolidation ranges.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
             </div>
 
             {/* Footer Buttons */}
@@ -3970,22 +4760,33 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     setAlphaTrendConfig({
                       period: 18,
                       coeff: 1.6,
-                      useRsi: true,
+                      useRsi: false, // MFI with Upstox Volume
                       candleConfirm: true,
+                      volumeConfirm: true,
                       slMultiple: 1.2,
                       tp1Multiple: 1.6,
                       tp2Multiple: 2.5
                     });
-                  } else {
+                  } else if (showStrategySettingsModal === 'T3') {
                     setT3Config({
                       period: 21,
                       hot: 0.55,
                       type: 'T3 New',
                       minRibbonExpansion: 0.12,
                       candleConfirm: true,
+                      volumeConfirm: true,
+                      volumeWeighted: false,
                       slMultiple: 1.1,
                       tp1Multiple: 1.4,
                       tp2Multiple: 2.2
+                    });
+                  } else {
+                    setComboConfig({
+                      maxTradeDurationMinutes: 60,
+                      oneTradeAtATime: true,
+                      slMultiple: 1.2,
+                      tp1Multiple: 1.5,
+                      tp2Multiple: 2.5
                     });
                   }
                 }}

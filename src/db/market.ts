@@ -86,17 +86,20 @@ async function buildCandles(instrument: string, currentTimestamp: number) {
         if (t.price < low) low = t.price;
       }
 
+      const existingVol = existing[0]?.volume || 0;
+      const vol = existingVol > 0 ? existingVol : 1;
+
       if (existing.length > 0) {
         // Update candle
         await db.update(candles).set({
-          open, high, low, close
+          open, high, low, close, volume: vol
         }).where(eq(candles.id, existing[0].id));
       } else {
         // Insert candle
         await db.insert(candles).values({
           instrument,
           timeframe: tf,
-          open, high, low, close,
+          open, high, low, close, volume: vol,
           timestamp: candleStart
         });
       }
@@ -199,41 +202,63 @@ export async function ensureGoldCandles(forceToken?: string): Promise<void> {
     ).orderBy(desc(candles.timestamp)).limit(5);
 
     const nowMs = Date.now();
-    const hasOutdatedData = existing.length > 0 && (
+    const hasOutdatedData = existing.length === 0 || (
       existing.some(c => c.close < 100000) ||
-      (nowMs - new Date(existing[0].timestamp).getTime() > 4 * 3600000)
+      (nowMs - new Date(existing[0].timestamp).getTime() > 4 * 3600000) ||
+      existing.every(c => !c.volume || c.volume === 0)
     );
 
     if (hasOutdatedData) {
-      console.log("[DB] Detected stale or outdated Gold candles. Refreshing with live real-time Gold data...");
+      console.log("[DB] Detected stale Gold candles or candles lacking volume. Refreshing with live Upstox Gold data...");
       await db.delete(candles).where(eq(candles.instrument, 'GOLD'));
-    } else if (existing.length >= 5) {
-      return; // Already populated with fresh real data
+    } else if (existing.length >= 5 && existing.some(c => c.volume && c.volume > 0)) {
+      return; // Already populated with fresh real data including volume
     }
 
     const token = forceToken || process.env.UPSTOX_ACCESS_TOKEN;
-    const configuredGoldKey = process.env.UPSTOX_GOLD_INSTRUMENT_KEY;
+    const configuredGoldKey = process.env.UPSTOX_GOLD_INSTRUMENT_KEY || 'MCX_FO|483079';
     if (token && configuredGoldKey) {
       try {
-        console.log("[DB] Fetching REAL Upstox MCX Gold 1-minute historical candles...");
+        console.log(`[DB] Fetching REAL Upstox MCX Gold 1-minute historical candles (${configuredGoldKey})...`);
         const today = new Date().toISOString().split('T')[0];
         const startDate = new Date(Date.now() - 4 * 86400000).toISOString().split('T')[0];
         const encodedKey = encodeURIComponent(configuredGoldKey.replace(':', '|'));
-        const res = await axios.get(
-          `https://api.upstox.com/v2/historical-candle/${encodedKey}/1minute/${today}/${startDate}`,
-          {
-            headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
-            timeout: 6000
-          }
-        );
 
-        if (res.data?.status === 'success' && res.data.data?.candles?.length > 0) {
-          console.log(`[DB] Received ${res.data.data.candles.length} real Upstox MCX Gold candles. Storing in database...`);
-          await seedHistoricalCandles('GOLD', 1, res.data.data.candles);
+        // First try intraday endpoint
+        let goldCandles: any[] = [];
+        try {
+          const intraRes = await axios.get(
+            `https://api.upstox.com/v3/historical-candle/intraday/${encodedKey}/minutes/1`,
+            {
+              headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+              timeout: 5000
+            }
+          );
+          if (intraRes.data?.status === 'success' && intraRes.data.data?.candles?.length > 0) {
+            goldCandles = intraRes.data.data.candles;
+          }
+        } catch (_) {}
+
+        if (goldCandles.length === 0) {
+          const res = await axios.get(
+            `https://api.upstox.com/v2/historical-candle/${encodedKey}/1minute/${today}/${startDate}`,
+            {
+              headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+              timeout: 6000
+            }
+          );
+          if (res.data?.status === 'success' && res.data.data?.candles?.length > 0) {
+            goldCandles = res.data.data.candles;
+          }
+        }
+
+        if (goldCandles.length > 0) {
+          console.log(`[DB] Received ${goldCandles.length} real Upstox MCX Gold candles with volume. Storing in database...`);
+          await seedHistoricalCandles('GOLD', 1, goldCandles);
           return;
         }
       } catch (err: any) {
-        console.warn("[DB] Upstox Gold historical API unavailable, syncing from real-time institutional Gold feed");
+        console.warn("[DB] Upstox Gold historical API unavailable, syncing from real-time institutional Gold feed:", err.message);
       }
     }
 
@@ -287,6 +312,140 @@ export async function ensureGoldCandles(forceToken?: string): Promise<void> {
     console.error("[DB] Error seeding Gold candles:", err);
   } finally {
     isSeedingGold = false;
+  }
+}
+
+let isSeedingNifty = false;
+let cachedNiftyFutKey: string | null = null;
+let cachedNiftyFutTime = 0;
+
+export async function getActiveNiftyFutureKey(): Promise<string> {
+  if (cachedNiftyFutKey && Date.now() - cachedNiftyFutTime < 6 * 3600000) {
+    return cachedNiftyFutKey;
+  }
+  try {
+    const res = await axios.get('https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz', {
+      responseType: 'arraybuffer',
+      timeout: 10000
+    });
+    const zlib = await import('zlib');
+    const buf = await new Promise<Buffer>((resolve, reject) => {
+      zlib.gunzip(res.data, (err, b) => err ? reject(err) : resolve(b));
+    });
+    const data = JSON.parse(buf.toString('utf-8'));
+    const now = Date.now();
+    const niftyFuts = data.filter((d: any) => 
+      d.name === 'NIFTY' && 
+      d.instrument_type === 'FUT' && 
+      d.expiry > now
+    ).sort((a: any, b: any) => a.expiry - b.expiry);
+    if (niftyFuts.length > 0) {
+      cachedNiftyFutKey = niftyFuts[0].instrument_key;
+      cachedNiftyFutTime = Date.now();
+      return cachedNiftyFutKey;
+    }
+  } catch (e: any) {
+    console.warn("[DB] Failed to resolve active Nifty FUT contract key:", e.message);
+  }
+  return 'NSE_FO|68407'; // Fallback to current contract
+}
+
+export async function ensureNiftyCandles(forceToken?: string): Promise<void> {
+  if (isSeedingNifty) return;
+  try {
+    isSeedingNifty = true;
+    const existing = await db.select().from(candles).where(
+      and(
+        eq(candles.instrument, 'NIFTY'),
+        eq(candles.timeframe, 1)
+      )
+    ).orderBy(desc(candles.timestamp)).limit(20);
+
+    const nowMs = Date.now();
+    const hasOutdatedData = existing.length === 0 || (
+      // If older than 4 hours or all candles have volume === 0
+      (nowMs - new Date(existing[0].timestamp).getTime() > 4 * 3600000) ||
+      existing.every(c => !c.volume || c.volume === 0)
+    );
+
+    if (hasOutdatedData) {
+      console.log("[DB] Detected stale Nifty candles or candles lacking volume. Syncing real Upstox volume data...");
+      await db.delete(candles).where(eq(candles.instrument, 'NIFTY'));
+    } else if (existing.length >= 20 && existing.some(c => c.volume && c.volume > 0)) {
+      return; // Already populated with fresh real data including volume
+    }
+
+    const token = forceToken || process.env.UPSTOX_ACCESS_TOKEN;
+    if (!token) return;
+
+    const today = new Date().toISOString().split('T')[0];
+    const startDate = new Date(Date.now() - 4 * 86400000).toISOString().split('T')[0];
+
+    // 1. Fetch spot candles
+    let spotCandles: any[] = [];
+    try {
+      const sIntra = await axios.get(
+        'https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/1',
+        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 5000 }
+      );
+      if (sIntra.data?.status === 'success' && sIntra.data.data?.candles?.length > 0) {
+        spotCandles = sIntra.data.data.candles;
+      }
+    } catch (_) {}
+
+    if (spotCandles.length === 0) {
+      const sHist = await axios.get(
+        `https://api.upstox.com/v2/historical-candle/NSE_INDEX%7CNifty%2050/1minute/${today}/${startDate}`,
+        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 6000 }
+      );
+      spotCandles = sHist.data?.data?.candles || [];
+    }
+
+    if (spotCandles.length === 0) return;
+
+    // 2. Fetch active Nifty Future candles to extract real market volume
+    const futKey = await getActiveNiftyFutureKey();
+    const encodedFutKey = encodeURIComponent(futKey.replace(':', '|'));
+    let futCandles: any[] = [];
+    try {
+      const fIntra = await axios.get(
+        `https://api.upstox.com/v3/historical-candle/intraday/${encodedFutKey}/minutes/1`,
+        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 5000 }
+      );
+      if (fIntra.data?.status === 'success' && fIntra.data.data?.candles?.length > 0) {
+        futCandles = fIntra.data.data.candles;
+      }
+    } catch (_) {}
+
+    if (futCandles.length === 0) {
+      try {
+        const fHist = await axios.get(
+          `https://api.upstox.com/v2/historical-candle/${encodedFutKey}/1minute/${today}/${startDate}`,
+          { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 6000 }
+        );
+        futCandles = fHist.data?.data?.candles || [];
+      } catch (_) {}
+    }
+
+    const volMap = new Map<number, number>();
+    for (const fc of futCandles) {
+      const tMs = Math.floor(new Date(fc[0]).getTime() / 60000) * 60000;
+      volMap.set(tMs, Number(fc[5]) || 0);
+    }
+
+    // 3. Merge genuine Upstox volume with Nifty spot candles
+    const mergedCandles = spotCandles.map((sc: any): [string, number, number, number, number, number, number] => {
+      const tMs = Math.floor(new Date(sc[0]).getTime() / 60000) * 60000;
+      const vol = volMap.get(tMs) || Number(sc[5]) || 0;
+      return [String(sc[0]), Number(sc[1]), Number(sc[2]), Number(sc[3]), Number(sc[4]), Number(vol), Number(sc[6] || 0)];
+    });
+
+    console.log(`[DB] Seeding ${mergedCandles.length} Upstox Nifty candles with real trading volume...`);
+    await seedHistoricalCandles('NIFTY', 1, mergedCandles);
+  } catch (err: any) {
+    console.error("[DB] Error seeding Nifty candles with volume:", err.message);
+  } finally {
+    isSeedingNifty = false;
   }
 }
 
