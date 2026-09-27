@@ -35,6 +35,7 @@ export interface AppSettings {
     alphaTrend?: StrategyConfig;
     comboUnfiltered?: StrategyConfig;
     comboFiltered?: StrategyConfig;
+    macdAdaptiveSupertrend?: StrategyConfig;
   };
   goldInstrumentKey?: string;
   goldEntryMode?: 'BREAKOUT' | 'RETEST' | 'ADAPTIVE';
@@ -176,7 +177,7 @@ export interface SignalPrices {
 export interface EngineDecision {
   timestamp: string;
   signal: 'BUY_CALL' | 'BUY_PUT' | 'NO_TRADE' | 'BUY' | 'SELL';
-  strategy_family: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION' | 'TECHNICAL_CONFLUENCE' | 'ADX_BREAKOUT' | 'ALPHATREND' | 'COMBO_UNFILTERED' | 'COMBO_FILTERED' | 'NONE';
+  strategy_family: 'OPENING_TRAP' | 'FAILED_RETEST' | 'CONTINUATION_BREAKDOWN' | 'CONTINUATION_BREAKOUT' | 'OI_WALL_REJECTION' | 'TECHNICAL_CONFLUENCE' | 'ADX_BREAKOUT' | 'ALPHATREND' | 'COMBO_UNFILTERED' | 'COMBO_FILTERED' | 'MACD_ADAPTIVE_SUPERTREND' | 'NONE';
   direction: 'CALL' | 'PUT' | 'NONE';
   spot?: number;
   broken_level?: number;

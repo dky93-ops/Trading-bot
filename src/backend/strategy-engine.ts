@@ -1,5 +1,6 @@
 import { computeEMA, computeSMA, computeRSI, computeMACD, computeBollinger, computeATR, computeSuperTrend, computeADX, computeAlphaTrend, computeT3 } from './technical-indicators';
 import { computeKMeansAdaptiveSuperTrend, computeCMMACD } from './ml-adaptive-supertrend';
+import { NiftyMacdAdaptiveSupertrend } from './nifty-macd-adaptive-supertrend';
 import {
   AppSettings,
   AppState,
@@ -7,7 +8,8 @@ import {
   InternalSignal,
   StrategySessionState,
   Candle,
-  OptionChainSnapshot
+  OptionChainSnapshot,
+  TradingSymbol
 } from './types';
 import { runGlobalPreChecks, runSetupValidation, ValidationContext, ProposedSetup } from './validation-rules';
 import { StrategySignalsGenerator } from './strategy-signals-generator.js';
@@ -1025,6 +1027,27 @@ export class StrategyEngine {
       }
     }
 
+    // 0.1 NIFTY MACD + Adaptive SuperTrend Strategy
+    // Evaluated SOLELY on its own rules without interference from global prechecks or other strategy filters
+    if (this.settings.strategies?.macdAdaptiveSupertrend?.enabled) {
+      const macdStSig = await this.checkMacdAdaptiveSupertrendStrategy(
+        valCtx,
+        index,
+        spotPrice,
+        candles,
+        rows,
+        sessState,
+        passed,
+        failed,
+      );
+      if (macdStSig) {
+        sessState.tradeTakenFlag = true;
+        sessState.totalTradesToday = (sessState.totalTradesToday || 0) + 1;
+        sessState.lastProcessedCandleTimestamp = candleIso;
+        return macdStSig;
+      }
+    }
+
     if (!precheck.passed) {
       return this.createNoTrade(
         index,
@@ -1349,6 +1372,107 @@ export class StrategyEngine {
       failedRules: failed,
       targets,
       structuralLevel: sl,
+    } as any;
+  }
+
+  /**
+   * NIFTY MACD + Adaptive SuperTrend Strategy
+   * Evaluated strictly on its own rules without interference from other strategies.
+   */
+  private async checkMacdAdaptiveSupertrendStrategy(
+    valCtx: ValidationContext,
+    index: string,
+    spot: number,
+    candles: Candle[],
+    chainRows: any[],
+    sessState: LocalSessionState,
+    passed: string[],
+    failed: string[],
+  ): Promise<any | null> {
+    const variant = 'MACD_ADAPTIVE_SUPERTREND';
+
+    // Strictly enforce One trade at a time for THIS strategy variant
+    const hasActiveTrade = Array.from(this.activeSignals.values()).some(
+      s => s.status === 'ACTIVE' && s.strategy_family === variant
+    );
+    if (hasActiveTrade) return null;
+
+    if (candles.length < 35) return null;
+
+    const strat = new NiftyMacdAdaptiveSupertrend({
+      macdFast: 12,
+      macdSlow: 26,
+      macdSignal: 9,
+      atrPeriod: 10,
+      superTrendMultiplier: 3,
+      riskPerTrade: 0.02,
+      maxDailyLoss: 0.05,
+      profitTarget: 0.03,
+      minVolume: 0,
+      enableAdaptiveMultiplier: true,
+      lookbackPeriod: 100,
+    });
+
+    for (let c = 0; c < candles.length - 1; c++) {
+      strat.updatePriceData(candles[c]);
+    }
+
+    const lastCandle = candles[candles.length - 1];
+    const timeStr = valCtx.timeStr || '10:00';
+    const sigRes = strat.generateSignals(lastCandle, 100000, timeStr);
+
+    if (sigRes.signal !== 'BUY' && sigRes.signal !== 'SELL') {
+      return null;
+    }
+
+    const direction: 'CALL' | 'PUT' = sigRes.signal === 'BUY' ? 'CALL' : 'PUT';
+    const option = this.selectStrike(direction, spot, chainRows);
+    if (!option) return null;
+
+    const spotSL = sigRes.stopLoss ?? (direction === 'CALL' ? spot - 30 : spot + 30);
+    const spotTP = sigRes.takeProfit ?? (direction === 'CALL' ? spot + 60 : spot - 60);
+    const riskDist = Math.abs(spot - spotSL);
+
+    const targets: any = {
+      target1Spot: spotTP,
+      target2Spot: direction === 'CALL' ? spot + riskDist * 3 : spot - riskDist * 3,
+      target1Option: option.ltp + riskDist * 0.5,
+      target2Option: option.ltp + riskDist * 1.0,
+      stopLossSpot: spotSL,
+      stopLossOption: Math.max(1, option.ltp - riskDist * 0.5),
+      breakEvenThresholdOption: option.ltp,
+      trailingStepOption: 5,
+      riskRewardRatio: 2.0,
+      reason: sigRes.reason,
+      superTrendLevel: sigRes.superTrendLevel,
+    };
+
+    passed.push(variant);
+
+    return {
+      decision: {
+        signal: direction === 'CALL' ? 'BUY_CALL' : 'BUY_PUT',
+        strategy_family: variant,
+        direction,
+        entryPrice: option.ltp,
+        entrySpot: spot,
+        underlying: index,
+        instrumentKey: option.instrumentKey,
+        strike: option.strike,
+        optionType: direction === 'CALL' ? 'CE' : 'PE',
+        stopLoss: targets.stopLossOption,
+        target1: targets.target1Option,
+        target2: targets.target2Option,
+        invalidationLevel: spotSL,
+        confidence: 0.90,
+        status: 'OPEN',
+        targets,
+      } as any,
+      reason: [`${variant}: ${sigRes.reason}`],
+      passedRules: passed,
+      failedRules: failed,
+      targets,
+      structuralLevel: spotSL,
     } as any;
   }
 
@@ -2440,6 +2564,56 @@ export class StrategyEngine {
             continue;
           }
         }
+      } else if (signal.strategy_family === 'MACD_ADAPTIVE_SUPERTREND') {
+        const entryTs = signal.entryTime || (typeof signal.timestamp === 'string' ? new Date(signal.timestamp).getTime() : signal.timestamp) || Date.now();
+        const elapsedMins = Math.max(0, (Date.now() - entryTs) / 60000);
+        const maxMins = (this.settings as any).maxTradeDurationMinutes || 60;
+        if (elapsedMins >= maxMins) {
+          const blendedExit = signal.firstTargetHitFlag ? Number(((signal.optionTarget1 + currentOptPrice) / 2).toFixed(2)) : currentOptPrice;
+          this.closeSignal(signal, blendedExit, `MAX TRADE DURATION EXPIRED (${maxMins}m limit reached)`);
+          newSignals.push(signal);
+          continue;
+        }
+
+        // MACD + Adaptive SuperTrend Reversal Exit
+        const candles = (this.state.nifty50 as any)?.candles1m || [];
+        if (candles.length >= 25) {
+          const strat = new NiftyMacdAdaptiveSupertrend({
+            macdFast: 12,
+            macdSlow: 26,
+            macdSignal: 9,
+            atrPeriod: 10,
+            superTrendMultiplier: 3,
+            enableAdaptiveMultiplier: true,
+          });
+          for (const c of candles) {
+            strat.updatePriceData(c);
+          }
+          const macd = strat.calculateMACD(strat.priceData.close);
+          const supertrend = strat.calculateAdaptiveSupertrend(
+            strat.priceData.high,
+            strat.priceData.low,
+            strat.priceData.close,
+            strat.priceData.volume
+          );
+          if (macd && supertrend) {
+            const isBearishReversal = supertrend.trend === 'downtrend' || (macd.macdPrev > macd.signalPrev && macd.macdLine < macd.signalLine);
+            const isBullishReversal = supertrend.trend === 'uptrend' || (macd.macdPrev < macd.signalPrev && macd.macdLine > macd.signalLine);
+
+            if (signal.direction === 'CALL' && isBearishReversal) {
+              const blendedExit = signal.firstTargetHitFlag ? Number(((signal.optionTarget1 + currentOptPrice) / 2).toFixed(2)) : currentOptPrice;
+              this.closeSignal(signal, blendedExit, 'OPPOSITE REVERSAL: MACD / Adaptive SuperTrend Bearish Reversal');
+              newSignals.push(signal);
+              continue;
+            }
+            if (signal.direction === 'PUT' && isBullishReversal) {
+              const blendedExit = signal.firstTargetHitFlag ? Number(((signal.optionTarget1 + currentOptPrice) / 2).toFixed(2)) : currentOptPrice;
+              this.closeSignal(signal, blendedExit, 'OPPOSITE REVERSAL: MACD / Adaptive SuperTrend Bullish Reversal');
+              newSignals.push(signal);
+              continue;
+            }
+          }
+        }
       }
 
       // Day end square-off: Never carry Nifty position overnight
@@ -2521,8 +2695,8 @@ export class StrategyEngine {
              signal.optionStoploss = dynamicTrailStop;
              signal.stoploss = dynamicTrailStop;
            }
-         } else if (signal.strategy_family === 'COMBO_UNFILTERED') {
-           // Unfiltered: Breakeven lock is already set upon Target 1, no other strategy rules apply
+         } else if (signal.strategy_family === 'COMBO_UNFILTERED' || signal.strategy_family === 'MACD_ADAPTIVE_SUPERTREND') {
+           // Unfiltered / MACD+ST: Breakeven lock is already set upon Target 1, no other strategy rules apply
          } else {
          // 5. Market Structure (Swing) Trailing Stop-Loss
          const candles = (this.state.nifty50 as any)?.candles1m || [];

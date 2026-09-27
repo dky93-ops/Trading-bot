@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createChart, ColorType, CrosshairMode, ISeriesApi, LineStyle, Time } from 'lightweight-charts';
 import { computeATR, computeT3, computeAlphaTrend, computeADX, computeEMA, computeSMA, computeRSI } from '../backend/technical-indicators';
 import { computeKMeansAdaptiveSuperTrend, computeCMMACD } from '../backend/ml-adaptive-supertrend';
+import { NiftyMacdAdaptiveSupertrend } from '../backend/nifty-macd-adaptive-supertrend';
 
 type Trade = {
   id: string;
@@ -128,7 +129,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     alphaTrend: true,
     adxBreakout: isGold,
     comboUnfiltered: false,
-    comboFiltered: !isGold
+    comboFiltered: !isGold,
+    macdAdaptiveSupertrend: false
   });
 
   // COMBINATION STRATEGY (T3 Striped + AlphaTrend): Filtered & Unfiltered
@@ -441,7 +443,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       alphaTrend: isGold ? (prev.alphaTrend ?? true) : true,
       adxBreakout: isGold ? (prev.adxBreakout ?? true) : false,
       comboUnfiltered: prev.comboUnfiltered ?? false,
-      comboFiltered: prev.comboFiltered ?? !isGold
+      comboFiltered: prev.comboFiltered ?? !isGold,
+      macdAdaptiveSupertrend: (prev as any).macdAdaptiveSupertrend ?? false
     }));
     setAdxBreakoutConfig(prev => ({
       ...prev,
@@ -2951,6 +2954,91 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
            }
          }
        }
+
+        // 3. NIFTY MACD + Adaptive SuperTrend Strategy
+        // Evaluated SOLELY by its own rules: MACD crossover + Adaptive SuperTrend trend.
+        // NO outside or other strategy filters apply. Isolated One Trade at a Time without interference.
+        if (activeStrategies.macdAdaptiveSupertrend && !isDayEnd && i >= 35) {
+          const hasActiveTrade = openTrades.some(t => t.status === 'OPEN' && t.strategyFamily === 'MACD_ADAPTIVE_SUPERTREND');
+          if (!hasActiveTrade) {
+            const strat = new NiftyMacdAdaptiveSupertrend({
+              macdFast: 12,
+              macdSlow: 26,
+              macdSignal: 9,
+              atrPeriod: 10,
+              superTrendMultiplier: 3,
+              enableAdaptiveMultiplier: true,
+              lookbackPeriod: 100,
+              minVolume: 0,
+            });
+            const subCandles = candles.slice(0, i + 1);
+            for (let sc = 0; sc < subCandles.length - 1; sc++) {
+              strat.updatePriceData({
+                open: subCandles[sc].open,
+                high: subCandles[sc].high,
+                low: subCandles[sc].low,
+                close: subCandles[sc].close,
+                volume: subCandles[sc].volume || 0,
+              });
+            }
+            const currC = subCandles[subCandles.length - 1];
+            const sigRes = strat.generateSignals({
+              open: currC.open,
+              high: currC.high,
+              low: currC.low,
+              close: currC.close,
+              volume: currC.volume || 0,
+            }, 100000, '10:00');
+
+            if (sigRes.signal === 'BUY') {
+              markers.push({ time: curr.time, position: 'belowBar', color: '#A855F7', shape: 'arrowUp', text: 'MACD+ST L' });
+              const entry = curr.close;
+              const stoploss = sigRes.stopLoss ? Number(sigRes.stopLoss.toFixed(2)) : Number((entry - atr * 1.5).toFixed(2));
+              const target = sigRes.takeProfit ? Number(sigRes.takeProfit.toFixed(2)) : Number((entry + (entry - stoploss) * 2).toFixed(2));
+              const riskDist = Math.abs(entry - stoploss);
+              const newTrade: Trade = {
+                id: `${curr.time}-MACD-ST-L`,
+                type: 'LONG',
+                signal: 'MACD+ST Long',
+                strategyFamily: 'MACD_ADAPTIVE_SUPERTREND',
+                entryTime: curr.time as number,
+                entryPrice: entry,
+                stoploss: stoploss,
+                target: target,
+                target2: Number((entry + riskDist * 3).toFixed(2)),
+                riskDist: riskDist,
+                peakPrice: entry,
+                status: 'OPEN',
+                isComboTrade: true,
+              };
+              openTrades.push(newTrade);
+              allTrades.push(newTrade);
+            } else if (sigRes.signal === 'SELL') {
+              markers.push({ time: curr.time, position: 'aboveBar', color: '#A855F7', shape: 'arrowDown', text: 'MACD+ST S' });
+              const entry = curr.close;
+              const stoploss = sigRes.stopLoss ? Number(sigRes.stopLoss.toFixed(2)) : Number((entry + atr * 1.5).toFixed(2));
+              const target = sigRes.takeProfit ? Number(sigRes.takeProfit.toFixed(2)) : Number((entry - (stoploss - entry) * 2).toFixed(2));
+              const riskDist = Math.abs(stoploss - entry);
+              const newTrade: Trade = {
+                id: `${curr.time}-MACD-ST-S`,
+                type: 'SHORT',
+                signal: 'MACD+ST Short',
+                strategyFamily: 'MACD_ADAPTIVE_SUPERTREND',
+                entryTime: curr.time as number,
+                entryPrice: entry,
+                stoploss: stoploss,
+                target: target,
+                target2: Number((entry - riskDist * 3).toFixed(2)),
+                riskDist: riskDist,
+                peakPrice: entry,
+                status: 'OPEN',
+                isComboTrade: true,
+              };
+              openTrades.push(newTrade);
+              allTrades.push(newTrade);
+            }
+          }
+        }
      }
 
 // Failsafe: Only square off if session actually ended, otherwise keep trade actively OPEN
@@ -3430,6 +3518,22 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                       <span className="flex items-center gap-1.5 whitespace-nowrap">
                         <span className="w-2 h-2 rounded-full bg-cyan-400"></span>
                         <span className="text-cyan-300">Unfiltered</span>
+                      </span>
+                    </label>
+
+                    <div className="h-3 w-px bg-gray-700"></div>
+
+                    {/* MACD + Adaptive SuperTrend Toggle */}
+                    <label className="flex items-center gap-1.5 cursor-pointer text-white font-semibold" title="NIFTY MACD + Adaptive SuperTrend Strategy">
+                      <input 
+                        type="checkbox" 
+                        checked={strategies.macdAdaptiveSupertrend} 
+                        onChange={e => setStrategies(s => ({...s, macdAdaptiveSupertrend: e.target.checked}))} 
+                        className="accent-purple-400 cursor-pointer" 
+                      />
+                      <span className="flex items-center gap-1.5 whitespace-nowrap">
+                        <span className="w-2 h-2 rounded-full bg-purple-400"></span>
+                        <span className="text-purple-300">MACD + ST</span>
                       </span>
                     </label>
                   </div>
