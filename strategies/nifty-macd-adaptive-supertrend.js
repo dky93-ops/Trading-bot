@@ -9,7 +9,8 @@
  */
 
 const { EventEmitter } = require('events');
-const TALib = require('talib'); // Technical Analysis Library
+let TALib;
+try { TALib = require('talib'); } catch (_) { TALib = null; }
 
 class NiftyMacdAdaptiveSupertrend extends EventEmitter {
   constructor(config = {}) {
@@ -527,3 +528,5 @@ class NiftyMacdAdaptiveSupertrend extends EventEmitter {
 }
 
 module.exports = NiftyMacdAdaptiveSupertrend;
+module.exports.default = NiftyMacdAdaptiveSupertrend;
+module.exports.NiftyMacdAdaptiveSupertrend = NiftyMacdAdaptiveSupertrend;

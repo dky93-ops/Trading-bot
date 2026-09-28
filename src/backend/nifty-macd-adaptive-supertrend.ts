@@ -97,8 +97,16 @@ export interface SignalDetails {
 }
 
 export interface SignalResult extends SignalDetails {
-  signal: 'BUY' | 'SELL' | 'EXIT_BUY' | 'EXIT_SELL' | 'NONE';
+  signal: 'BUY' | 'SELL' | 'EXIT' | 'EXIT_BUY' | 'EXIT_SELL' | 'NONE';
   reason: string;
+  indicators?: {
+    macd: number;
+    signal: number;
+    histogram: number;
+    supertrend: number;
+    trend: string;
+    atr: number;
+  };
 }
 
 export class NiftyMacdAdaptiveSupertrend extends UniversalEventEmitter {
@@ -573,6 +581,14 @@ export class NiftyMacdAdaptiveSupertrend extends UniversalEventEmitter {
     return {
       signal,
       reason: signalDetails.reason || (signal === 'NONE' ? 'No signal condition met' : signal),
+      indicators: {
+        macd: macd.macdLine,
+        signal: macd.signalLine,
+        histogram: macd.histogram,
+        supertrend: supertrend.supertrend,
+        trend: supertrend.trend,
+        atr: supertrend.atr,
+      },
       ...signalDetails,
     };
   }
@@ -589,8 +605,22 @@ export class NiftyMacdAdaptiveSupertrend extends UniversalEventEmitter {
       this.state.stopLoss = signalDetails.stopLoss ?? null;
       this.state.takeProfit = signalDetails.takeProfit ?? null;
       this.state.currentTrend = signal as any;
-      this.emit('trade_entry', { signal, ...signalDetails, time: currentTime });
-    } else if (signal === 'EXIT_BUY' || signal === 'EXIT_SELL') {
+
+      const tradeData = {
+        signal,
+        type: signal,
+        ...signalDetails,
+        entryPrice: this.state.entryPrice,
+        positionSize: this.state.positionSize,
+        stopLoss: this.state.stopLoss,
+        takeProfit: this.state.takeProfit,
+        time: currentTime,
+        timestamp: currentTime,
+      };
+
+      this.emit('trade_entry', tradeData);
+      this.emit('trade', tradeData);
+    } else if (signal === 'EXIT' || signal === 'EXIT_BUY' || signal === 'EXIT_SELL') {
       const pnl = signalDetails.pnl || 0;
       this.state.dailyPnL += pnl;
 
@@ -613,8 +643,76 @@ export class NiftyMacdAdaptiveSupertrend extends UniversalEventEmitter {
       this.state.stopLoss = null;
       this.state.takeProfit = null;
       this.state.currentTrend = null;
+
       this.emit('trade_exit', tradeRecord);
+      this.emit('exit', tradeRecord);
     }
+  }
+
+  /**
+   * Exit current position manually or from trigger
+   */
+  exitPosition(exitData: { exitPrice?: number; reason?: string }, currentTime: string = '10:00') {
+    if (!this.state.isInPosition) return;
+    const currentPrice = exitData.exitPrice ?? this.state.entryPrice ?? 0;
+    const isLong = this.state.currentTrend === 'BUY' || this.state.currentTrend === 'uptrend';
+    const pnl = isLong
+      ? (currentPrice - (this.state.entryPrice ?? currentPrice)) * (this.state.positionSize ?? 1)
+      : ((this.state.entryPrice ?? currentPrice) - currentPrice) * (this.state.positionSize ?? 1);
+
+    this.executeTrade('EXIT', {
+      exitPrice: currentPrice,
+      pnl,
+      reason: exitData.reason || 'Position exited',
+    }, currentTime);
+  }
+
+  /**
+   * Check stop loss and take profit
+   */
+  checkStopLossAndTakeProfit(currentPrice: number, currentTime: string = '10:00') {
+    if (!this.state.isInPosition) return;
+
+    const isLong = this.state.currentTrend === 'BUY' || this.state.currentTrend === 'uptrend';
+    const isShort = this.state.currentTrend === 'SELL' || this.state.currentTrend === 'downtrend';
+
+    if (isLong) {
+      if (this.state.stopLoss !== null && currentPrice <= this.state.stopLoss) {
+        this.exitPosition({ exitPrice: this.state.stopLoss, reason: 'Stop Loss Hit' }, currentTime);
+      } else if (this.state.takeProfit !== null && currentPrice >= this.state.takeProfit) {
+        this.exitPosition({ exitPrice: this.state.takeProfit, reason: 'Take Profit Hit' }, currentTime);
+      }
+    } else if (isShort) {
+      if (this.state.stopLoss !== null && currentPrice >= this.state.stopLoss) {
+        this.exitPosition({ exitPrice: this.state.stopLoss, reason: 'Stop Loss Hit' }, currentTime);
+      } else if (this.state.takeProfit !== null && currentPrice <= this.state.takeProfit) {
+        this.exitPosition({ exitPrice: this.state.takeProfit, reason: 'Take Profit Hit' }, currentTime);
+      }
+    }
+  }
+
+  /**
+   * Get strategy status
+   */
+  getStatus() {
+    return {
+      isInPosition: this.state.isInPosition,
+      currentTrend: this.state.currentTrend,
+      entryPrice: this.state.entryPrice,
+      stopLoss: this.state.stopLoss,
+      takeProfit: this.state.takeProfit,
+      positionSize: this.state.positionSize,
+      dailyPnL: this.state.dailyPnL,
+      totalTrades: this.state.trades.length,
+      canTrade: this.state.canTrade,
+    };
+  }
+
+  /**
+   * Reset daily stats alias
+   */
+  resetDaily() {
+    this.resetDailyState();
   }
 
   /**

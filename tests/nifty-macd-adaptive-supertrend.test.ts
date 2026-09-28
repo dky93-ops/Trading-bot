@@ -272,4 +272,41 @@ describe('NIFTY MACD + Adaptive SuperTrend Strategy', () => {
       expect(result.decision.targets.riskRewardRatio).toBe(2.0);
     }
   });
+
+  it('should return indicators in generateSignals and report status correctly', () => {
+    vi.spyOn(strategy, 'calculateMACD').mockReturnValue({
+      macdLine: 3.5,
+      signalLine: 2.1,
+      histogram: 1.4,
+      macdPrev: 1.8,
+      signalPrev: 2.0,
+    });
+
+    vi.spyOn(strategy, 'calculateAdaptiveSupertrend').mockReturnValue({
+      supertrend: 22000,
+      trend: 'uptrend',
+      upperBand: 22100,
+      lowerBand: 22000,
+      atr: 25,
+    });
+
+    const res = strategy.generateSignals({ open: 22050, high: 22080, low: 22040, close: 22070, volume: 5000 });
+    expect(res.indicators).toBeDefined();
+    expect(res.indicators?.macd).toBe(3.5);
+    expect(res.indicators?.trend).toBe('uptrend');
+
+    const status = strategy.getStatus();
+    expect(status.isInPosition).toBe(false);
+    expect(status.canTrade).toBe(true);
+
+    // Enter trade and check status
+    strategy.executeTrade('BUY', res);
+    const inPositionStatus = strategy.getStatus();
+    expect(inPositionStatus.isInPosition).toBe(true);
+    expect(inPositionStatus.currentTrend).toBe('BUY');
+
+    // Test checkStopLossAndTakeProfit
+    strategy.checkStopLossAndTakeProfit(21900); // below SL 22000
+    expect(strategy.getStatus().isInPosition).toBe(false);
+  });
 });
