@@ -1,0 +1,20 @@
+--- src/backend/upstox-service.ts
++++ src/backend/upstox-service.ts
+@@ Settings Strategies @@
+     strategies: {
+       ...
++      comboFiltered: { enabled: true, lotSize: 1 },
++      comboUnfiltered: { enabled: true, lotSize: 1 },
++      macdAdaptiveSupertrend: { enabled: true, lotSize: 1 },
+     },
+
+--- server.ts
++++ server.ts
+@@ /api/candles handler @@
++      if (timeframe === 5 && !isGold) {
++        const direct5m = await getCandles('NIFTY', 5, limit);
++        if (direct5m.length >= Math.min(20, limit)) {
++          res.json(direct5m);
++          return;
++        }
++      }

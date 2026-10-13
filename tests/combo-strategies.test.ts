@@ -183,4 +183,49 @@ describe('Isolated Filtered vs Unfiltered Combo Strategies', () => {
     // (If the technical triggers match, it produces a signal without being blocked)
     expect(engine.activeSignals.get('SIG-1')?.strategy_family).toBe('COMBO_FILTERED');
   });
+
+  it('rejects COMBO_FILTERED when ADX is below threshold or MFI is insufficient', async () => {
+    // Generate choppy sideways candles where ADX is low and ribbon is compressed
+    const choppyCandles: Candle[] = [];
+    let base = 22000;
+    for (let i = 0; i < 35; i++) {
+      base += (i % 2 === 0 ? 1 : -1);
+      choppyCandles.push({
+        timestamp: new Date(Date.now() - (35 - i) * 60000).toISOString(),
+        open: base,
+        high: base + 1,
+        low: base - 1,
+        close: base,
+        volume: 500,
+      });
+    }
+
+    const chainRows = [
+      {
+        strike_price: 22000,
+        call_options: {
+          instrument_key: 'NSE_INDEX|NIFTY24JAN22000CE',
+          market_data: { ltp: 100, oi: 50000, oi_change: 1000 }
+        }
+      }
+    ];
+
+    const failedReasons: string[] = [];
+    const sig = await (engine as any).checkComboStrategy(
+      'COMBO_FILTERED',
+      { index: 'NIFTY' } as any,
+      'NIFTY',
+      22000,
+      choppyCandles,
+      chainRows,
+      {},
+      22500,
+      21800,
+      [],
+      failedReasons
+    );
+
+    // Should be rejected in choppy low-ADX/low-MFI sideways action
+    expect(sig).toBeNull();
+  });
 });

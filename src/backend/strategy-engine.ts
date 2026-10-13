@@ -1,6 +1,7 @@
-import { computeEMA, computeSMA, computeRSI, computeMACD, computeBollinger, computeATR, computeSuperTrend, computeADX, computeAlphaTrend, computeT3 } from './technical-indicators';
+import { computeEMA, computeSMA, computeRSI, computeMACD, computeBollinger, computeATR, computeSuperTrend, computeADX, computeAlphaTrend, computeT3, computeMFI } from './technical-indicators';
 import { computeKMeansAdaptiveSuperTrend, computeCMMACD } from './ml-adaptive-supertrend';
 import { NiftyMacdAdaptiveSupertrend } from './nifty-macd-adaptive-supertrend';
+import { computeSamSignals, DEFAULT_SAM_CONFIG } from './sam-signals';
 import {
   AppSettings,
   AppState,
@@ -1048,6 +1049,27 @@ export class StrategyEngine {
       }
     }
 
+    // 0.2 BEST SAM SIGNALS Strategy
+    // Evaluated strictly on its own rules: SMA(1) - SMA(34) vs WMA(5) crossover with 20pt Stoploss & optional ADX
+    if (this.settings.strategies?.samSignals?.enabled) {
+      const samSig = await this.checkSamSignalsStrategy(
+        valCtx,
+        index,
+        spotPrice,
+        candles,
+        rows,
+        sessState,
+        passed,
+        failed,
+      );
+      if (samSig) {
+        sessState.tradeTakenFlag = true;
+        sessState.totalTradesToday = (sessState.totalTradesToday || 0) + 1;
+        sessState.lastProcessedCandleTimestamp = candleIso;
+        return samSig;
+      }
+    }
+
     if (!precheck.passed) {
       return this.createNoTrade(
         index,
@@ -1244,7 +1266,7 @@ export class StrategyEngine {
     const atrs = computeATR(highs, lows, closes, 14);
     const atr = atrs[i] || 15;
 
-    // Filtered version enforces SOLELY its own 4 confirmation rules (PDF Strategy)
+    // Filtered version enforces SOLELY its own confirmation rules (PDF Strategy + Advanced Filters)
     if (variant === 'COMBO_FILTERED') {
       const c = candles[i];
       // 1. Upstox Volume confirmation (>= 0.85x 20-period Vol SMA)
@@ -1263,10 +1285,10 @@ export class StrategyEngine {
         failed.push('COMBO_FILTERED: Candle conviction green for Put');
         return null;
       }
-      // 3. Ribbon Spread Expansion (>= 0.12x ATR)
+      // 3. Ribbon Spread Expansion (>= 0.20x ATR)
       const ribbonSpread = Math.abs(t3.lev0[i] - t3.lev5[i]);
-      if (ribbonSpread < 0.12 * atr) {
-        failed.push('COMBO_FILTERED: Ribbon spread compressed');
+      if (ribbonSpread < 0.20 * atr) {
+        failed.push('COMBO_FILTERED: Ribbon spread compressed (< 0.20x ATR)');
         return null;
       }
       // 4. Trend Alignment (50 EMA)
@@ -1279,6 +1301,39 @@ export class StrategyEngine {
         }
         if (direction === 'PUT' && c.close > currEma50 + 0.25 * atr) {
           failed.push('COMBO_FILTERED: Price above 50 EMA trend');
+          return null;
+        }
+      }
+      // 5. ADX Trend Strength Confirmation (ADX >= 20.0 eliminates low-volatility dead range)
+      const adxData = computeADX(highs, lows, closes, 14);
+      const currAdx = adxData.adx[i];
+      if (!isNaN(currAdx) && currAdx < 20.0) {
+        failed.push(`COMBO_FILTERED: ADX too low (${currAdx.toFixed(1)} < 20.0)`);
+        return null;
+      }
+      // 6. Money Flow Index (MFI) Institutional Conviction (Call >= 65, Put <= 35)
+      const mfi14 = computeMFI(highs, lows, closes, volumes, 14);
+      const currMfi = mfi14[i];
+      if (!isNaN(currMfi)) {
+        if (direction === 'CALL' && currMfi < 65) {
+          failed.push(`COMBO_FILTERED: MFI below bullish threshold (${currMfi.toFixed(1)} < 65)`);
+          return null;
+        }
+        if (direction === 'PUT' && currMfi > 35) {
+          failed.push(`COMBO_FILTERED: MFI above bearish threshold (${currMfi.toFixed(1)} > 35)`);
+          return null;
+        }
+      }
+      // 7. Macro 200 EMA Protection (Avoid buying deep below or selling deep above 200 EMA)
+      const ema200 = computeEMA(closes, 200);
+      const currEma200 = ema200[i];
+      if (!isNaN(currEma200)) {
+        if (direction === 'CALL' && c.close < currEma200 - 25.0) {
+          failed.push(`COMBO_FILTERED: Call entered deep below 200 EMA (${(c.close - currEma200).toFixed(1)} pts)`);
+          return null;
+        }
+        if (direction === 'PUT' && c.close > currEma200 + 25.0) {
+          failed.push(`COMBO_FILTERED: Put entered deep above 200 EMA (${(c.close - currEma200).toFixed(1)} pts)`);
           return null;
         }
       }
@@ -1473,6 +1528,108 @@ export class StrategyEngine {
       failedRules: failed,
       targets,
       structuralLevel: spotSL,
+    } as any;
+  }
+
+  /**
+   * BEST SAM SIGNALS Strategy
+   * Evaluated strictly on its own rules: Fast SMA(1) - Slow SMA(34) vs WMA(5) crossover with 20pt stop loss and optional ADX filter.
+   */
+  private async checkSamSignalsStrategy(
+    valCtx: ValidationContext,
+    index: string,
+    spot: number,
+    candles: Candle[],
+    chainRows: any[],
+    sessState: LocalSessionState,
+    passed: string[],
+    failed: string[],
+  ): Promise<any | null> {
+    const variant = 'SAM_SIGNALS';
+
+    // Strictly enforce One trade at a time for THIS strategy variant
+    const hasActiveTrade = Array.from(this.activeSignals.values()).some(
+      s => s.status === 'ACTIVE' && s.strategy_family === variant
+    );
+    if (hasActiveTrade) return null;
+
+    if (candles.length < 40) return null;
+
+    // Strictly enforce NO trade before 09:15 AM IST (Pre-market session restriction)
+    const lastCandle = candles[candles.length - 1];
+    if (lastCandle && lastCandle.timestamp) {
+      try {
+        const d = new Date(lastCandle.timestamp);
+        const istMins = (d.getUTCHours() * 60 + d.getUTCMinutes() + 330) % 1440;
+        if (istMins < 9 * 60 + 15) {
+          failed.push('PRE_MARKET_RESTRICTION: No trade before 09:15 AM IST');
+          return null;
+        }
+      } catch (_) {}
+    }
+
+    const samResult = computeSamSignals(candles, {
+      ...DEFAULT_SAM_CONFIG,
+      stopLossPoints: 20
+    });
+
+    const lastIdx = candles.length - 1;
+    const isCall = samResult.callSignals[lastIdx];
+    const isPut = samResult.putSignals[lastIdx];
+
+    if (!isCall && !isPut) {
+      return null;
+    }
+
+    const direction: 'CALL' | 'PUT' = isCall ? 'CALL' : 'PUT';
+    const option = this.selectStrike(direction, spot, chainRows);
+    if (!option) return null;
+
+    // Stoploss 20 points from entry candle as requested
+    const stopLossSpot = direction === 'CALL' ? spot - 20 : spot + 20;
+    const target1Spot = direction === 'CALL' ? spot + 40 : spot - 40;
+    const target2Spot = direction === 'CALL' ? spot + 60 : spot - 60;
+    const riskDist = 20;
+
+    const targets: any = {
+      target1Spot,
+      target2Spot,
+      target1Option: option.ltp + 20,
+      target2Option: option.ltp + 30,
+      stopLossSpot,
+      stopLossOption: Math.max(1, option.ltp - 10),
+      breakEvenThresholdOption: option.ltp,
+      trailingStepOption: 5,
+      riskRewardRatio: 2.0,
+      reason: `SAM Crossover: SMA(1)-SMA(34) vs WMA(5) (${direction})`,
+    };
+
+    passed.push(variant);
+
+    return {
+      decision: {
+        signal: direction === 'CALL' ? 'BUY_CALL' : 'BUY_PUT',
+        strategy_family: variant,
+        direction,
+        entryPrice: option.ltp,
+        entrySpot: spot,
+        underlying: index,
+        instrumentKey: option.instrumentKey,
+        strike: option.strike,
+        optionType: direction === 'CALL' ? 'CE' : 'PE',
+        stopLoss: targets.stopLossOption,
+        target1: targets.target1Option,
+        target2: targets.target2Option,
+        invalidationLevel: stopLossSpot,
+        confidence: 0.90,
+        status: 'OPEN',
+        targets,
+      } as any,
+      reason: [`${variant}: SAM ${direction} Signal triggered with 20pt stop loss`],
+      passedRules: passed,
+      failedRules: failed,
+      targets,
+      structuralLevel: stopLossSpot,
     } as any;
   }
 
@@ -2628,7 +2785,34 @@ export class StrategyEngine {
         continue;
       }
       const isCall = signal.direction === 'CALL';
-      const spotInvalidation = signal.spotInvalidation;
+      let spotInvalidation = signal.spotInvalidation;
+
+      // Special SAM Signals Trailing Stop Loss Management:
+      // If market goes up for 20 points switch stoploss to entry,
+      // if goes up 40 points switch stoploss to entry plus 20 points
+      if (signal.strategy_family === 'SAM_SIGNALS') {
+        const spotMove = isCall ? (currentSpot - signal.spotEntry) : (signal.spotEntry - currentSpot);
+        if (spotMove >= 40) {
+          const newSpotSl = isCall ? (signal.spotEntry + 20) : (signal.spotEntry - 20);
+          if (isCall ? newSpotSl > signal.spotInvalidation : newSpotSl < signal.spotInvalidation) {
+            signal.spotInvalidation = newSpotSl;
+          }
+          signal.isBreakevenLocked = true;
+          signal.trailingStopActiveFlag = true;
+          // Protect option premium stoploss with +10 pt profit buffer
+          signal.optionStoploss = Math.max(signal.optionStoploss, signal.optionEntry + 10.0);
+          signal.stoploss = signal.optionStoploss;
+        } else if (spotMove >= 20) {
+          const newSpotSl = signal.spotEntry;
+          if (isCall ? newSpotSl > signal.spotInvalidation : newSpotSl < signal.spotInvalidation) {
+            signal.spotInvalidation = newSpotSl;
+          }
+          signal.isBreakevenLocked = true;
+          signal.optionStoploss = Math.max(signal.optionStoploss, signal.optionEntry);
+          signal.stoploss = signal.optionStoploss;
+        }
+        spotInvalidation = signal.spotInvalidation;
+      }
 
       // Target 1 Evaluation: Lock partial profit and strictly shift stoploss to breakeven (+ buffer)
       const spotHitT1 = isCall ? currentSpot >= signal.spotTarget1 : currentSpot <= signal.spotTarget1;

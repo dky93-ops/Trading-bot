@@ -1,0 +1,22 @@
+--- src/components/LiveChart.tsx
++++ src/components/LiveChart.tsx
+@@ Toolbar Toggle @@
++    {/* MACD + Adaptive SuperTrend Toggle */}
++    <label className="flex items-center gap-1.5 cursor-pointer text-white font-semibold" title="NIFTY MACD + Adaptive SuperTrend Strategy">
++      <input 
++        type="checkbox" 
++        checked={strategies.macdAdaptiveSupertrend} 
++        onChange={e => setStrategies(s => ({...s, macdAdaptiveSupertrend: e.target.checked}))} 
++        className="accent-purple-400 cursor-pointer" 
++      />
++      <span className="flex items-center gap-1.5 whitespace-nowrap">
++        <span className="w-2 h-2 rounded-full bg-purple-400"></span>
++        <span className="text-purple-300">MACD + ST</span>
++      </span>
++    </label>
+
+@@ Simulation Logic @@
++    if (activeStrategies.macdAdaptiveSupertrend && !isDayEnd && i >= 35) {
++      ...
++      markers.push({ time: curr.time, position: 'belowBar', color: '#A855F7', shape: 'arrowUp', text: 'MACD+ST L' });
++    }

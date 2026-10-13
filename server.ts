@@ -52,13 +52,24 @@ async function startServer() {
       const timeframe = Number(req.query.timeframe) || 1;
       const limit = Number(req.query.limit) || 100;
       
-      const { getCandles, ensureGoldCandles, ensureNiftyCandles } = await import("./src/db/market.ts");
+      const { getCandles, ensureGoldCandles, ensureNiftyCandles, ensureNifty5mCandles } = await import("./src/db/market.ts");
       
       const token = (upstoxService as any)?.settings?.accessToken || process.env.UPSTOX_ACCESS_TOKEN;
       if (isGold) {
         await ensureGoldCandles(token);
       } else {
         await ensureNiftyCandles(token);
+        if (timeframe === 5) {
+          ensureNifty5mCandles(token).catch(e => console.error("ensureNifty5mCandles error:", e));
+        }
+      }
+
+      if (timeframe === 5 && !isGold) {
+        const direct5m = await getCandles('NIFTY', 5, limit);
+        if (direct5m.length >= Math.min(20, limit)) {
+          res.json(direct5m);
+          return;
+        }
       }
 
       // Fetch excess candles to account for out-of-market hour filtering
@@ -68,11 +79,11 @@ async function startServer() {
       const nowMs = Date.now();
       const filtered = rawCandles.filter(c => {
            const d = new Date(c.timestamp);
-           if (nowMs - d.getTime() < 300000) return true; // Always include fresh real-time candles
            const istTime = new Date(d.getTime() + 19800000);
            const hh = istTime.getUTCHours();
            const mm = istTime.getUTCMinutes();
            const timeNum = hh * 100 + mm;
+           // Strictly reject pre-market session (before 09:15 IST for NSE, before 09:00 IST for MCX Gold)
            if (isGold) {
              return timeNum >= 900 && timeNum <= 2330;
            }

@@ -1,0 +1,122 @@
+[
+  {
+    "name": "Immediate Next Bar Invalidation (Bar +1 immediately broke Entry Bar High/Low)",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "Immediate Adverse Close (Bar +1 closed in opposite direction of trade)",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "Immediate Adverse Extreme (Bar +1 made new adverse wick beyond entry)",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "Weak Signal Candle Close (<60% close in direction of signal / rejection wick)",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "Against 50-EMA Macro Slope (Calling long when 50 EMA is sloping down, or short when sloping up)",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "Whipsaw Density (>= 2 crossovers within the preceding 10 bars)",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "Lagging Signal WMA Slope (WMA buffer2 slope was pointing in opposite direction at crossover)",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "Micro-Crossover Spread (< 0.25 ATR spread between buffer1 and buffer2)",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "Counter to EMA 50 Level",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "Counter to EMA 20 Level",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "Rapid Stopout <= 1 Bar",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "Rapid Stopout <= 2 Bars",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "COMPOUND: Whipsaw Density + Immediate Adverse Close",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "COMPOUND: Weak Candle Close + Counter EMA50",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  },
+  {
+    "name": "COMPOUND: Bar +1 Invalidation + Whipsaw Density",
+    "lHits": 0,
+    "wHits": 0,
+    "lPct": null,
+    "wPct": null,
+    "diff": null
+  }
+]

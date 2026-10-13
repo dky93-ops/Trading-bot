@@ -101,6 +101,7 @@ export function computeBollinger(series: number[], period = 20, stdMult = 2.0) {
   const mid = computeSMA(series, period);
   const upper = new Array(series.length).fill(NaN);
   const lower = new Array(series.length).fill(NaN);
+  const percentB = new Array(series.length).fill(NaN);
   
   for (let i = period - 1; i < series.length; i++) {
     const slice = series.slice(i - period + 1, i + 1);
@@ -112,9 +113,11 @@ export function computeBollinger(series: number[], period = 20, stdMult = 2.0) {
     const std = Math.sqrt(sumSq / period);
     upper[i] = mean + stdMult * std;
     lower[i] = mean - stdMult * std;
+    const diff = upper[i] - lower[i];
+    percentB[i] = diff > 0 ? (series[i] - lower[i]) / diff : 0.5;
   }
   
-  return { upper, mid, lower };
+  return { upper, mid, lower, percentB };
 }
 
 export function computeATR(high: number[], low: number[], close: number[], period = 14) {
@@ -520,5 +523,95 @@ export function computeADX(
   }
 
   return { adx, plusDI, minusDI };
+}
+
+export function computeWMA(series: number[], period: number): number[] {
+  const len = series.length;
+  const result: number[] = new Array(len).fill(NaN);
+  if (period <= 0 || len < period) return result;
+  if (period === 1) return [...series];
+
+  const weightSum = (period * (period + 1)) / 2;
+
+  for (let i = period - 1; i < len; i++) {
+    let sum = 0;
+    let valid = true;
+    for (let w = 1; w <= period; w++) {
+      const val = series[i - period + w];
+      if (val === undefined || isNaN(val)) {
+        valid = false;
+        break;
+      }
+      sum += val * w;
+    }
+    if (valid) {
+      result[i] = sum / weightSum;
+    }
+  }
+  return result;
+}
+
+export function computeStochastic(
+  high: number[],
+  low: number[],
+  close: number[],
+  kPeriod = 14,
+  dPeriod = 3,
+  smoothK = 3
+): { K: number[]; D: number[] } {
+  const len = close.length;
+  const rawK = new Array(len).fill(NaN);
+  for (let i = kPeriod - 1; i < len; i++) {
+    let highest = -Infinity;
+    let lowest = Infinity;
+    for (let j = 0; j < kPeriod; j++) {
+      if (high[i - j] > highest) highest = high[i - j];
+      if (low[i - j] < lowest) lowest = low[i - j];
+    }
+    const range = highest - lowest;
+    rawK[i] = range === 0 ? 50 : ((close[i] - lowest) / range) * 100;
+  }
+
+  // Smooth rawK with SMA(smoothK) to get %K
+  const K = new Array(len).fill(NaN);
+  for (let i = kPeriod - 1 + smoothK - 1; i < len; i++) {
+    let sum = 0;
+    for (let j = 0; j < smoothK; j++) sum += rawK[i - j];
+    K[i] = sum / smoothK;
+  }
+
+  // %D is SMA of %K over dPeriod
+  const D = new Array(len).fill(NaN);
+  for (let i = kPeriod - 1 + smoothK - 1 + dPeriod - 1; i < len; i++) {
+    let sum = 0;
+    for (let j = 0; j < dPeriod; j++) sum += K[i - j];
+    D[i] = sum / dPeriod;
+  }
+
+  return { K, D };
+}
+
+export type OutsideBarType = 'BULLISH' | 'BEARISH' | 'NONE';
+
+export function computeOutsideBars(
+  candles: Array<{ high: number; low: number; open: number; close: number }>
+): OutsideBarType[] {
+  const len = candles.length;
+  const result: OutsideBarType[] = new Array(len).fill('NONE');
+  for (let i = 1; i < len; i++) {
+    const curr = candles[i];
+    const prev = candles[i - 1];
+    // Outside Bar condition: High > PrevHigh && Low < PrevLow
+    if (curr.high > prev.high && curr.low < prev.low) {
+      if (curr.close > curr.open) {
+        result[i] = 'BULLISH';
+      } else if (curr.close < curr.open) {
+        result[i] = 'BEARISH';
+      } else {
+        result[i] = 'NONE';
+      }
+    }
+  }
+  return result;
 }
 

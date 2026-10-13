@@ -1,0 +1,34 @@
+--- src/backend/strategy-engine.ts
++++ src/backend/strategy-engine.ts
+@@ Strategy Check @@
++    // NIFTY MACD + Adaptive SuperTrend Strategy
++    if (this.settings.strategies?.macdAdaptiveSupertrend?.enabled) {
++      const macdStSig = await this.checkMacdAdaptiveSupertrendStrategy(
++        valCtx,
++        index,
++        spotPrice,
++        candles,
++        rows,
++        sessState,
++        passed,
++        failed,
++      );
++      if (macdStSig) {
++        sessState.tradeTakenFlag = true;
++        sessState.totalTradesToday = (sessState.totalTradesToday || 0) + 1;
++        sessState.lastProcessedCandleTimestamp = candleIso;
++        return macdStSig;
++      }
++    }
+
+@@ Reversal Exit @@
++      } else if (signal.strategy_family === 'MACD_ADAPTIVE_SUPERTREND') {
++        ...
++        // MACD + Adaptive SuperTrend Reversal Exit
++        if (signal.direction === 'CALL' && isBearishReversal) {
++          this.closeSignal(signal, blendedExit, 'OPPOSITE REVERSAL: MACD / Adaptive SuperTrend Bearish Reversal');
++        }
++        if (signal.direction === 'PUT' && isBullishReversal) {
++          this.closeSignal(signal, blendedExit, 'OPPOSITE REVERSAL: MACD / Adaptive SuperTrend Bullish Reversal');
++        }
++      }

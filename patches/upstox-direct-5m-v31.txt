@@ -1,0 +1,10 @@
+--- src/db/market.ts
++++ src/db/market.ts
+@@ ensureNifty5mCandles @@
++export async function ensureNifty5mCandles(forceToken?: string): Promise<void> {
++  ...
++  // Fetches direct 5-minute spot candles from Upstox
++  // Fetches direct 5-minute future candles for real Upstox volume
++  // Seeds into candles table with timeframe = 5
++  await seedHistoricalCandles('NIFTY', 5, mergedCandles);
++}

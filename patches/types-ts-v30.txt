@@ -1,0 +1,13 @@
+--- src/backend/types.ts
++++ src/backend/types.ts
+@@ AppSettings strategies @@
+   strategies: {
+     ...
+     comboUnfiltered?: StrategyConfig;
+     comboFiltered?: StrategyConfig;
++    macdAdaptiveSupertrend?: StrategyConfig;
+   };
+
+@@ EngineDecision strategy_family @@
+-  strategy_family: 'OPENING_TRAP' | ... | 'COMBO_FILTERED' | 'NONE';
++  strategy_family: 'OPENING_TRAP' | ... | 'COMBO_FILTERED' | 'MACD_ADAPTIVE_SUPERTREND' | 'NONE';
