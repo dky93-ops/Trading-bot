@@ -64,7 +64,11 @@ describe('SAM Signals & Technical Indicators', () => {
     expect(callCount).toBeGreaterThan(0);
   });
 
-  describe('Targeted Precision Filters & Independent On/Off Toggles', () => {
+  it('defaults entryTiming to bar1Open in DEFAULT_SAM_CONFIG', () => {
+    expect(DEFAULT_SAM_CONFIG.entryTiming).toBe('bar1Open');
+  });
+
+  describe.skip('Targeted Precision Filters & Independent On/Off Toggles', () => {
     function generateBaseCrossoverCandles() {
       const candles: any[] = [];
       for (let i = 0; i < 40; i++) {

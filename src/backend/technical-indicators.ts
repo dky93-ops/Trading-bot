@@ -208,17 +208,33 @@ export function computeSuperTrend(high: number[], low: number[], close: number[]
   return { stLine, direction };
 }
 
-export function computeVWAP(candles: {high: number, low: number, close: number, volume?: number}[]): number[] {
+export function computeVWAP(candles: Array<{high: number, low: number, close: number, volume?: number, time?: any, timestamp?: any}>): number[] {
   const vwap: number[] = new Array(candles.length).fill(NaN);
   let cumVol = 0;
   let cumVolPrice = 0;
+  let lastDay: number | string = -1;
+
   for (let i = 0; i < candles.length; i++) {
     const c = candles[i];
+    if (c.time !== undefined || c.timestamp !== undefined) {
+      let dayKey: number | string = -1;
+      if (typeof c.time === 'number') {
+        dayKey = Math.floor(c.time / 86400);
+      } else if (c.timestamp) {
+        dayKey = typeof c.timestamp === 'string' ? c.timestamp.split('T')[0] : new Date(c.timestamp).getUTCDate();
+      }
+      if (dayKey !== -1 && dayKey !== lastDay) {
+        cumVol = 0;
+        cumVolPrice = 0;
+        lastDay = dayKey;
+      }
+    }
+
     const typicalPrice = (c.high + c.low + c.close) / 3;
-    const vol = c.volume || 1;
+    const vol = c.volume && c.volume > 0 ? c.volume : 1;
     cumVol += vol;
     cumVolPrice += typicalPrice * vol;
-    vwap[i] = cumVolPrice / cumVol;
+    vwap[i] = cumVol > 0 ? cumVolPrice / cumVol : typicalPrice;
   }
   return vwap;
 }

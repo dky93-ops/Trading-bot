@@ -44,6 +44,9 @@ export interface SamSignalsConfig {
   filterBar1AdverseCloseEnabled: boolean; // default: false (Next candle closes in opposite direction of signal)
   bar1ActionMode: 'filter' | 'exit'; // default: 'filter' ('filter' = invalidate/skip trade, 'exit' = immediate cut loss on Bar +1 close)
   filterBar1ConfirmationEntry?: boolean; // legacy alias
+
+  // 3. Entry Timing Configuration (Bar + 1 Open vs Bar 0 Close)
+  entryTiming?: 'bar1Open' | 'bar0Close'; // default: 'bar1Open' ('bar1Open' = Realistic / Pine Script standard on Bar + 1 candle open, 'bar0Close' = Instant synthetic fill on signal candle close)
 }
 
 export const DEFAULT_SAM_CONFIG: SamSignalsConfig = {
@@ -67,6 +70,7 @@ export const DEFAULT_SAM_CONFIG: SamSignalsConfig = {
   filterBar1AdverseCloseEnabled: false,
   bar1ActionMode: 'filter',
   filterBar1ConfirmationEntry: false,
+  entryTiming: 'bar1Open',
   visibleBuy: true,
   visibleSell: true,
   colorBuy: '#2196f3',

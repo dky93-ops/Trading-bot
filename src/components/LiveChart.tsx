@@ -28,6 +28,7 @@ type Trade = {
   peakPrice?: number;
   trailStage?: number;
   entryBarIdx?: number;
+  signalBarIdx?: number;
 };
 
 // Formats elapsed duration from entry to exit (e.g. "14m", "1h 25m")
@@ -2224,6 +2225,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     let profitTradesFiltered = 0;
     let lossTradesFiltered = 0;
 
+    let pendingSamSignal: { type: 'LONG' | 'SHORT'; signalBarIdx: number; signalTime: number } | null = null;
+
     for (let i = 50; i < candles.length; i++) {
        const curr = candles[i];
        const nextCandle = candles[i + 1];
@@ -2235,6 +2238,85 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
        const currMin = currDate.getUTCMinutes();
        const currTotalMins = currHour * 60 + currMin;
        const isPreMarket = !isGold && currTotalMins < (9 * 60 + 15);
+       const isSamPreMarketBlocked = (activeSamConfig?.noTradeBefore915 ?? true) && isPreMarket;
+
+       // --- Process Pending Bar + 1 Open SAM Entry at open of candle i ---
+       if (
+         activeStrategies.samSignals &&
+         (activeSamConfig?.entryTiming ?? 'bar1Open') === 'bar1Open' &&
+         pendingSamSignal &&
+         !isDayEnd &&
+         !isSamPreMarketBlocked
+       ) {
+         const hasActiveTrade = (activeSamConfig?.oneTradeAtATime ?? true) && openTrades.some(
+           t => t.status === 'OPEN' && t.strategyFamily === 'SAM_SIGNALS'
+         );
+         if (!hasActiveTrade) {
+           const slPts = activeSamConfig?.stopLossPoints ?? 20;
+           const tpPts = activeSamConfig?.targetPoints ?? 60;
+           const entry = curr.open; // Real-world fill at Bar + 1 Open!
+           if (pendingSamSignal.type === 'LONG') {
+             markers.push({
+               time: curr.time,
+               position: 'belowBar',
+               color: activeSamConfig?.colorBuy || '#2196f3',
+               shape: 'arrowUp',
+               text: 'SAM CALL'
+             });
+             const stoploss = Number((entry - slPts).toFixed(2));
+             const target = Number((entry + tpPts).toFixed(2));
+             const newTrade: Trade = {
+               id: `${curr.time}-SAM-CALL`,
+               type: 'LONG',
+               signal: 'SAM CALL',
+               strategyFamily: 'SAM_SIGNALS',
+               entryTime: curr.time as number,
+               entryPrice: entry,
+               stoploss: stoploss,
+               target: target,
+               riskDist: slPts,
+               peakPrice: entry,
+               trailStage: 0,
+               status: 'OPEN',
+               isComboTrade: false,
+               entryBarIdx: i,
+               signalBarIdx: pendingSamSignal.signalBarIdx,
+             };
+             openTrades.push(newTrade);
+             allTrades.push(newTrade);
+           } else if (pendingSamSignal.type === 'SHORT') {
+             markers.push({
+               time: curr.time,
+               position: 'aboveBar',
+               color: activeSamConfig?.colorSell || '#ff5252',
+               shape: 'arrowDown',
+               text: 'SAM PUT'
+             });
+             const stoploss = Number((entry + slPts).toFixed(2));
+             const target = Number((entry - tpPts).toFixed(2));
+             const newTrade: Trade = {
+               id: `${curr.time}-SAM-PUT`,
+               type: 'SHORT',
+               signal: 'SAM PUT',
+               strategyFamily: 'SAM_SIGNALS',
+               entryTime: curr.time as number,
+               entryPrice: entry,
+               stoploss: stoploss,
+               target: target,
+               riskDist: slPts,
+               peakPrice: entry,
+               trailStage: 0,
+               status: 'OPEN',
+               isComboTrade: false,
+               entryBarIdx: i,
+               signalBarIdx: pendingSamSignal.signalBarIdx,
+             };
+             openTrades.push(newTrade);
+             allTrades.push(newTrade);
+           }
+         }
+         pendingSamSignal = null;
+       }
 
        const range = curr.high - curr.low;
        const atr = atr14[i] || Math.max(range, 1);
@@ -2350,8 +2432,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
              } else if (
                activeSamConfig?.filterBar1AdverseCloseEnabled &&
                activeSamConfig?.bar1ActionMode === 'exit' &&
-               t.entryBarIdx !== undefined &&
-               i === t.entryBarIdx + 1 &&
+               (t.signalBarIdx !== undefined ? i === t.signalBarIdx + 1 : (t.entryBarIdx !== undefined && i === t.entryBarIdx + 1)) &&
                (curr.close < curr.open || curr.close < t.entryPrice)
              ) {
                t.exitPrice = curr.close;
@@ -2490,8 +2571,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
              } else if (
                activeSamConfig?.filterBar1AdverseCloseEnabled &&
                activeSamConfig?.bar1ActionMode === 'exit' &&
-               t.entryBarIdx !== undefined &&
-               i === t.entryBarIdx + 1 &&
+               (t.signalBarIdx !== undefined ? i === t.signalBarIdx + 1 : (t.entryBarIdx !== undefined && i === t.entryBarIdx + 1)) &&
                (curr.close > curr.open || curr.close > t.entryPrice)
              ) {
                t.exitPrice = curr.close;
@@ -3390,7 +3470,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         // Calculations: SMA(Fast) - SMA(Slow) vs WMA(Signal) crossover
         // Stoploss 20 points from entry candle + optional ADX filter
         // Strictly NO trade before 09:15 AM IST (Pre-market session restriction)
-        const isSamPreMarketBlocked = (activeSamConfig?.noTradeBefore915 ?? true) && isPreMarket;
         if (activeStrategies.samSignals && !isDayEnd && !isSamPreMarketBlocked && i >= 35) {
           const hasActiveTrade = (activeSamConfig?.oneTradeAtATime ?? true) && openTrades.some(
             t => t.status === 'OPEN' && t.strategyFamily === 'SAM_SIGNALS'
@@ -3399,69 +3478,96 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
           if (!hasActiveTrade) {
             const slPts = activeSamConfig?.stopLossPoints ?? 20;
             const tpPts = activeSamConfig?.targetPoints ?? 60;
+            const entryTiming = activeSamConfig?.entryTiming ?? 'bar1Open';
 
-            if (samSignalsResult.callSignals[i]) {
-              markers.push({
-                time: curr.time,
-                position: 'belowBar',
-                color: activeSamConfig?.colorBuy || '#2196f3',
-                shape: 'arrowUp',
-                text: 'SAM CALL'
-              });
-              const entry = curr.close;
-              const stoploss = Number((entry - slPts).toFixed(2));
-              const target = Number((entry + tpPts).toFixed(2));
-              const newTrade: Trade = {
-                id: `${curr.time}-SAM-CALL`,
-                type: 'LONG',
-                signal: 'SAM CALL',
-                strategyFamily: 'SAM_SIGNALS',
-                entryTime: curr.time as number,
-                entryPrice: entry,
-                stoploss: stoploss,
-                target: target,
-                riskDist: slPts,
-                peakPrice: entry,
-                trailStage: 0,
-                status: 'OPEN',
-                isComboTrade: false,
-                entryBarIdx: i,
-              };
-              openTrades.push(newTrade);
-              allTrades.push(newTrade);
-            } else if (samSignalsResult.putSignals[i]) {
-              markers.push({
-                time: curr.time,
-                position: 'aboveBar',
-                color: activeSamConfig?.colorSell || '#ff5252',
-                shape: 'arrowDown',
-                text: 'SAM PUT'
-              });
-              const entry = curr.close;
-              const stoploss = Number((entry + slPts).toFixed(2));
-              const target = Number((entry - tpPts).toFixed(2));
-              const newTrade: Trade = {
-                id: `${curr.time}-SAM-PUT`,
-                type: 'SHORT',
-                signal: 'SAM PUT',
-                strategyFamily: 'SAM_SIGNALS',
-                entryTime: curr.time as number,
-                entryPrice: entry,
-                stoploss: stoploss,
-                target: target,
-                riskDist: slPts,
-                peakPrice: entry,
-                trailStage: 0,
-                status: 'OPEN',
-                isComboTrade: false,
-                entryBarIdx: i,
-              };
-              openTrades.push(newTrade);
-              allTrades.push(newTrade);
+            if (entryTiming === 'bar1Open') {
+              // Signal detected on candle i. Entry executes on next candle open (Bar + 1).
+              if (samSignalsResult.callSignals[i]) {
+                pendingSamSignal = { type: 'LONG', signalBarIdx: i, signalTime: curr.time as number };
+              } else if (samSignalsResult.putSignals[i]) {
+                pendingSamSignal = { type: 'SHORT', signalBarIdx: i, signalTime: curr.time as number };
+              }
+            } else {
+              // Synthetic Bar 0 Close execution (Instant fill at signal candle close)
+              if (samSignalsResult.callSignals[i]) {
+                markers.push({
+                  time: curr.time,
+                  position: 'belowBar',
+                  color: activeSamConfig?.colorBuy || '#2196f3',
+                  shape: 'arrowUp',
+                  text: 'SAM CALL'
+                });
+                const entry = curr.close;
+                const stoploss = Number((entry - slPts).toFixed(2));
+                const target = Number((entry + tpPts).toFixed(2));
+                const newTrade: Trade = {
+                  id: `${curr.time}-SAM-CALL`,
+                  type: 'LONG',
+                  signal: 'SAM CALL',
+                  strategyFamily: 'SAM_SIGNALS',
+                  entryTime: curr.time as number,
+                  entryPrice: entry,
+                  stoploss: stoploss,
+                  target: target,
+                  riskDist: slPts,
+                  peakPrice: entry,
+                  trailStage: 0,
+                  status: 'OPEN',
+                  isComboTrade: false,
+                  entryBarIdx: i,
+                  signalBarIdx: i,
+                };
+                openTrades.push(newTrade);
+                allTrades.push(newTrade);
+              } else if (samSignalsResult.putSignals[i]) {
+                markers.push({
+                  time: curr.time,
+                  position: 'aboveBar',
+                  color: activeSamConfig?.colorSell || '#ff5252',
+                  shape: 'arrowDown',
+                  text: 'SAM PUT'
+                });
+                const entry = curr.close;
+                const stoploss = Number((entry + slPts).toFixed(2));
+                const target = Number((entry - tpPts).toFixed(2));
+                const newTrade: Trade = {
+                  id: `${curr.time}-SAM-PUT`,
+                  type: 'SHORT',
+                  signal: 'SAM PUT',
+                  strategyFamily: 'SAM_SIGNALS',
+                  entryTime: curr.time as number,
+                  entryPrice: entry,
+                  stoploss: stoploss,
+                  target: target,
+                  riskDist: slPts,
+                  peakPrice: entry,
+                  trailStage: 0,
+                  status: 'OPEN',
+                  isComboTrade: false,
+                  entryBarIdx: i,
+                  signalBarIdx: i,
+                };
+                openTrades.push(newTrade);
+                allTrades.push(newTrade);
+              }
             }
           }
         }
      }
+
+    // Failsafe: If a pending signal occurred on the very last candle, show a status indicator
+    if (pendingSamSignal && activeStrategies.samSignals) {
+      const lastC = candles[candles.length - 1];
+      if (lastC) {
+        markers.push({
+          time: lastC.time,
+          position: pendingSamSignal.type === 'LONG' ? 'belowBar' : 'aboveBar',
+          color: pendingSamSignal.type === 'LONG' ? (activeSamConfig?.colorBuy || '#2196f3') : (activeSamConfig?.colorSell || '#ff5252'),
+          shape: 'circle',
+          text: `SAM ${pendingSamSignal.type === 'LONG' ? 'CALL' : 'PUT'} (Signal: Awaiting Bar+1 Open)`
+        });
+      }
+    }
 
 // Failsafe: Only square off if session actually ended, otherwise keep trade actively OPEN
     for (const t of openTrades) {
@@ -4041,6 +4147,23 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                   >
                     ≥09:15
                   </span>
+
+                  <div className="h-3 w-px bg-gray-700"></div>
+
+                  {/* Quick Entry Timing toggle */}
+                  <button
+                    type="button"
+                    onClick={() => setSamConfig(c => ({ ...c, entryTiming: (c.entryTiming ?? 'bar1Open') === 'bar1Open' ? 'bar0Close' : 'bar1Open' }))}
+                    disabled={!strategies.samSignals}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
+                      (samConfig.entryTiming ?? 'bar1Open') === 'bar1Open'
+                        ? 'bg-emerald-950/70 border-emerald-500/60 text-emerald-300 hover:bg-emerald-900/60'
+                        : 'bg-blue-950/70 border-blue-500/60 text-blue-300 hover:bg-blue-900/60'
+                    }`}
+                    title={(samConfig.entryTiming ?? 'bar1Open') === 'bar1Open' ? 'Entry Timing: Bar + 1 Open (Pine Script standard). Click to toggle to Bar 0 Close.' : 'Entry Timing: Bar 0 Close. Click to toggle to Bar + 1 Open.'}
+                  >
+                    {(samConfig.entryTiming ?? 'bar1Open') === 'bar1Open' ? 'Entry:Bar+1' : 'Entry:Bar 0'}
+                  </button>
 
                   <div className="h-3 w-px bg-gray-700"></div>
 
@@ -5699,6 +5822,71 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                           />
                           <p className="text-[9px] text-gray-500">Locks Entry + pts</p>
                         </div>
+                      </div>
+                    </div>
+
+                    {/* Entry Timing Toggle (Bar + 1 Open vs Bar 0 Close) */}
+                    <div className="p-3.5 rounded-lg bg-[#111827] border border-[#1F2937] space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm">⏱️</span>
+                          <span className="text-xs font-semibold text-white">Entry Timing</span>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            (samConfig.entryTiming ?? 'bar1Open') === 'bar1Open'
+                              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                              : 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                          }`}>
+                            {(samConfig.entryTiming ?? 'bar1Open') === 'bar1Open' ? 'Bar + 1 Open (Active)' : 'Bar 0 Close (Active)'}
+                          </span>
+                        </div>
+                      </div>
+                      <p className="text-[11px] text-gray-300">
+                        Choose whether trades execute realistically on the next candle open, or instantaneously at the signal candle close:
+                      </p>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <button
+                          type="button"
+                          onClick={() => setSamConfig(c => ({ ...c, entryTiming: 'bar1Open' }))}
+                          className={`p-3 rounded-lg text-left transition-all cursor-pointer border ${
+                            (samConfig.entryTiming ?? 'bar1Open') === 'bar1Open'
+                              ? 'bg-emerald-950/40 border-emerald-500/60 shadow-sm ring-1 ring-emerald-500/30'
+                              : 'bg-[#0A0F1C] border-[#374151] hover:border-gray-500 text-gray-400'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between mb-1">
+                            <span className={`text-xs font-bold ${(samConfig.entryTiming ?? 'bar1Open') === 'bar1Open' ? 'text-emerald-400' : 'text-gray-300'}`}>
+                              Bar + 1 Open
+                            </span>
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                              Recommended
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-gray-400 leading-relaxed">
+                            Realistic / Pine Script standard. Waits for the signal candle to confirm and close; order fills at the Open of Bar + 1. Entry markers and trade logs are positioned on Bar + 1.
+                          </p>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setSamConfig(c => ({ ...c, entryTiming: 'bar0Close' }))}
+                          className={`p-3 rounded-lg text-left transition-all cursor-pointer border ${
+                            samConfig.entryTiming === 'bar0Close'
+                              ? 'bg-blue-950/40 border-blue-500/60 shadow-sm ring-1 ring-blue-500/30'
+                              : 'bg-[#0A0F1C] border-[#374151] hover:border-gray-500 text-gray-400'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between mb-1">
+                            <span className={`text-xs font-bold ${samConfig.entryTiming === 'bar0Close' ? 'text-blue-400' : 'text-gray-300'}`}>
+                              Bar 0 Close
+                            </span>
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-gray-800 text-gray-400 border border-gray-700">
+                              Instant Synthetic
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-gray-400 leading-relaxed">
+                            Enters immediately at signal candle closing price. Assumes instantaneous zero-latency fill with markers on the signal candle.
+                          </p>
+                        </button>
                       </div>
                     </div>
 
