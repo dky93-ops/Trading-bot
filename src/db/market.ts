@@ -1,7 +1,73 @@
-import { db } from './index.ts';
+import { db, createPool } from './index.ts';
 import { ticks, candles } from './schema.ts';
 import { sql, eq, and, desc, asc, gte, lte, lt } from 'drizzle-orm';
 import axios from 'axios';
+
+/**
+ * Checks whether a given timestamp falls strictly within genuine NSE market trading hours.
+ * - NSE (NIFTY): Monday - Friday 09:15 AM to 03:30 PM IST (Candles from 09:15 up to 15:29).
+ * Weekends (Saturday and Sunday) and non-market hours are strictly excluded.
+ */
+export function isMarketHours(timestamp: Date | number | string): boolean {
+  const d = typeof timestamp === 'number' || typeof timestamp === 'string' ? new Date(timestamp) : timestamp;
+  if (isNaN(d.getTime())) return false;
+
+  // Shift UTC to IST (+5 hours 30 minutes = +19800000 ms)
+  const istDate = new Date(d.getTime() + 19800000);
+  const day = istDate.getUTCDay(); // 0 = Sunday, 6 = Saturday
+  if (day === 0 || day === 6) return false; // Absolutely no trading on Saturday / Sunday
+
+  const totalMins = istDate.getUTCHours() * 60 + istDate.getUTCMinutes();
+  // NSE Trading Hours: 09:15 AM (555 mins) to 03:30 PM (930 mins) IST
+  // 09:15 is the first candle start time, 15:29 is the last 1m candle start time (ends at 15:30)
+  return totalMins >= 555 && totalMins < 930;
+}
+
+export function getLastMarketCloseTime(): number {
+  let ts = Date.now();
+  if (isMarketHours(ts)) return ts;
+  
+  ts = Math.floor(ts / 60000) * 60000;
+  while (!isMarketHours(ts)) {
+    ts -= 10 * 60000;
+  }
+  while (isMarketHours(ts + 60000)) {
+    ts += 60000;
+  }
+  return ts + 60000;
+}
+
+export async function purgeOutOfMarketData(): Promise<void> {
+  try {
+    const qNifty = `
+      DELETE FROM candles 
+      WHERE instrument = 'NIFTY' AND (
+        EXTRACT(DOW FROM (timestamp + INTERVAL '5 hours 30 minutes')) IN (0, 6)
+        OR (EXTRACT(HOUR FROM (timestamp + INTERVAL '5 hours 30 minutes')) * 60 + EXTRACT(MINUTE FROM (timestamp + INTERVAL '5 hours 30 minutes'))) < 555
+        OR (EXTRACT(HOUR FROM (timestamp + INTERVAL '5 hours 30 minutes')) * 60 + EXTRACT(MINUTE FROM (timestamp + INTERVAL '5 hours 30 minutes'))) >= 930
+      )
+    `;
+    const qPurgeOld = `DELETE FROM candles WHERE UPPER(instrument) != 'NIFTY'`;
+    const qNiftyTicks = `
+      DELETE FROM ticks 
+      WHERE instrument = 'NIFTY' AND (
+        EXTRACT(DOW FROM (timestamp + INTERVAL '5 hours 30 minutes')) IN (0, 6)
+        OR (EXTRACT(HOUR FROM (timestamp + INTERVAL '5 hours 30 minutes')) * 60 + EXTRACT(MINUTE FROM (timestamp + INTERVAL '5 hours 30 minutes'))) < 555
+        OR (EXTRACT(HOUR FROM (timestamp + INTERVAL '5 hours 30 minutes')) * 60 + EXTRACT(MINUTE FROM (timestamp + INTERVAL '5 hours 30 minutes'))) >= 930
+      )
+    `;
+    const qPurgeOldTicks = `DELETE FROM ticks WHERE UPPER(instrument) != 'NIFTY'`;
+    const pool = createPool();
+    if (pool) {
+      await pool.query(qNifty);
+      await pool.query(qPurgeOld);
+      await pool.query(qNiftyTicks);
+      await pool.query(qPurgeOldTicks);
+    }
+  } catch (e: any) {
+    console.warn("Notice: purgeOutOfMarketData warning:", e.message);
+  }
+}
 
 export async function insertTick(
   instrument: string,
@@ -16,6 +82,12 @@ export async function insertTick(
   ) {
     return false;
   }
+
+  // Strictly reject ticks outside market trading hours or during weekends
+  if (!isMarketHours(timestamp)) {
+    return false;
+  }
+
   try {
     await db.insert(ticks).values({
       instrument,
@@ -45,6 +117,11 @@ async function cleanupOldData() {
 }
 
 async function buildCandles(instrument: string, currentTimestamp: number) {
+  // Never build candles outside trading hours
+  if (!isMarketHours(currentTimestamp)) {
+    return;
+  }
+
   const timeframes = [1, 3, 5, 15]; // in minutes
   for (const tf of timeframes) {
     const tfMs = tf * 60 * 1000;
@@ -111,22 +188,28 @@ async function buildCandles(instrument: string, currentTimestamp: number) {
 
 export async function getCandles(instrument: string, timeframe: number, limit: number = 100) {
   try {
-    return await db.select().from(candles).where(
+    const rows = await db.select().from(candles).where(
       and(
         eq(candles.instrument, instrument),
         eq(candles.timeframe, timeframe)
       )
-    ).orderBy(desc(candles.timestamp)).limit(limit);
+    ).orderBy(desc(candles.timestamp)).limit(limit * 3);
+
+    // Strictly filter out any candles outside market hours or on weekends
+    const valid = rows.filter(r => isMarketHours(r.timestamp));
+    return valid.slice(0, limit);
   } catch (e) {
     console.error("Failed to get candles:", e);
     return [];
   }
 }
 
-
 export async function seedHistoricalCandles(instrument: string, timeframe: number, candleData: Array<[string, number, number, number, number, number, number]>) {
   try {
-    const rawCandles = candleData.map(c => {
+    // Strictly filter for market hours
+    const validData = candleData.filter(c => isMarketHours(c[0]));
+
+    const rawCandles = validData.map(c => {
       return {
         timestamp: new Date(c[0]),
         open: c[1],
@@ -142,18 +225,25 @@ export async function seedHistoricalCandles(instrument: string, timeframe: numbe
 
     // Build candles of target timeframe from 1-min raw data
     const tfMs = timeframe * 60 * 1000;
-    const aggregated = new Map<number, any>();
+    const aggregated = new Map<string, any>();
     
     for (const c of rawCandles) {
-       const bucketStartMs = Math.floor(c.timestamp.getTime() / tfMs) * tfMs;
-       if (!aggregated.has(bucketStartMs)) {
-         aggregated.set(bucketStartMs, {
+       const ts = c.timestamp.getTime();
+       const bucketStartMs = Math.floor(ts / tfMs) * tfMs;
+       if (!isMarketHours(bucketStartMs)) continue;
+
+       // Group key by date and bucket to never aggregate across days
+       const istDateStr = new Date(ts + 19800000).toISOString().split('T')[0];
+       const key = `${istDateStr}_${bucketStartMs}`;
+
+       if (!aggregated.has(key)) {
+         aggregated.set(key, {
            instrument, timeframe,
            timestamp: new Date(bucketStartMs),
            open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume
          });
        } else {
-         const existing = aggregated.get(bucketStartMs);
+         const existing = aggregated.get(key);
          existing.high = Math.max(existing.high, c.high);
          existing.low = Math.min(existing.low, c.low);
          existing.close = c.close;
@@ -184,134 +274,6 @@ export async function seedHistoricalCandles(instrument: string, timeframe: numbe
     }
   } catch(e) {
     console.error("Failed to seed historical candles:", e);
-  }
-}
-
-let isSeedingGold = false;
-export async function ensureGoldCandles(forceToken?: string): Promise<void> {
-  if (isSeedingGold) return;
-  try {
-    isSeedingGold = true;
-
-    // Check existing Gold candles: if they are older than 4 hours, fake (< 100,000) or fewer than 60, clean up and sync real data
-    const existing = await db.select().from(candles).where(
-      and(
-        eq(candles.instrument, 'GOLD'),
-        eq(candles.timeframe, 1)
-      )
-    ).orderBy(desc(candles.timestamp)).limit(5);
-
-    const nowMs = Date.now();
-    const hasOutdatedData = existing.length === 0 || (
-      existing.some(c => c.close < 100000) ||
-      (nowMs - new Date(existing[0].timestamp).getTime() > 4 * 3600000) ||
-      existing.every(c => !c.volume || c.volume === 0)
-    );
-
-    if (hasOutdatedData) {
-      console.log("[DB] Detected stale Gold candles or candles lacking volume. Refreshing with live Upstox Gold data...");
-      await db.delete(candles).where(eq(candles.instrument, 'GOLD'));
-    } else if (existing.length >= 5 && existing.some(c => c.volume && c.volume > 0)) {
-      return; // Already populated with fresh real data including volume
-    }
-
-    const token = forceToken || process.env.UPSTOX_ACCESS_TOKEN;
-    const configuredGoldKey = process.env.UPSTOX_GOLD_INSTRUMENT_KEY || 'MCX_FO|483079';
-    if (token && configuredGoldKey) {
-      try {
-        console.log(`[DB] Fetching REAL Upstox MCX Gold 1-minute historical candles (${configuredGoldKey})...`);
-        const today = new Date().toISOString().split('T')[0];
-        const startDate = new Date(Date.now() - 4 * 86400000).toISOString().split('T')[0];
-        const encodedKey = encodeURIComponent(configuredGoldKey.replace(':', '|'));
-
-        // First try intraday endpoint
-        let goldCandles: any[] = [];
-        try {
-          const intraRes = await axios.get(
-            `https://api.upstox.com/v3/historical-candle/intraday/${encodedKey}/minutes/1`,
-            {
-              headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
-              timeout: 5000
-            }
-          );
-          if (intraRes.data?.status === 'success' && intraRes.data.data?.candles?.length > 0) {
-            goldCandles = intraRes.data.data.candles;
-          }
-        } catch (_) {}
-
-        if (goldCandles.length === 0) {
-          const res = await axios.get(
-            `https://api.upstox.com/v2/historical-candle/${encodedKey}/1minute/${today}/${startDate}`,
-            {
-              headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
-              timeout: 6000
-            }
-          );
-          if (res.data?.status === 'success' && res.data.data?.candles?.length > 0) {
-            goldCandles = res.data.data.candles;
-          }
-        }
-
-        if (goldCandles.length > 0) {
-          console.log(`[DB] Received ${goldCandles.length} real Upstox MCX Gold candles with volume. Storing in database...`);
-          await seedHistoricalCandles('GOLD', 1, goldCandles);
-          return;
-        }
-      } catch (err: any) {
-        console.warn("[DB] Upstox Gold historical API unavailable, syncing from real-time institutional Gold feed:", err.message);
-      }
-    }
-
-    // Real-Time Institutional Gold Market Feed (PAX Gold backed 1:1 by physical gold bullion)
-    // Synchronizes real 1-minute open, high, low, close, volume, and wicks scaled to MCX INR Gold contract
-    console.log("[DB] Fetching real-time 1-minute institutional Gold candles (XAU/PAXG -> MCX INR)...");
-    try {
-      const klineRes = await axios.get(
-        'https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1m&limit=1000',
-        { timeout: 7000 }
-      );
-
-      if (Array.isArray(klineRes.data) && klineRes.data.length > 0) {
-        const rawBars = klineRes.data;
-        const latestUsd = parseFloat(rawBars[rawBars.length - 1][4]);
-        const targetMcxInr = 154260.0;
-        const scale = latestUsd > 0 ? (targetMcxInr / latestUsd) : 36.0;
-
-        const candlesToInsert: any[] = [];
-        for (const bar of rawBars) {
-          const tMs = Number(bar[0]);
-          const open = Number((parseFloat(bar[1]) * scale).toFixed(1));
-          const high = Number((parseFloat(bar[2]) * scale).toFixed(1));
-          const low = Number((parseFloat(bar[3]) * scale).toFixed(1));
-          const close = Number((parseFloat(bar[4]) * scale).toFixed(1));
-          const volume = Math.round(parseFloat(bar[5]) * 10);
-
-          candlesToInsert.push({
-            instrument: 'GOLD',
-            timeframe: 1,
-            open,
-            high,
-            low,
-            close,
-            volume,
-            timestamp: new Date(tMs),
-          });
-        }
-
-        const chunkSize = 200;
-        for (let i = 0; i < candlesToInsert.length; i += chunkSize) {
-          await db.insert(candles).values(candlesToInsert.slice(i, i + chunkSize));
-        }
-        console.log(`[DB] Successfully loaded ${candlesToInsert.length} REAL TIME Gold 1-minute candles.`);
-        return;
-      }
-    } catch (kErr: any) {
-      console.warn("[DB] Real-time institutional Gold klines fetch warning:", kErr.message);
-    }
-  } catch (err) {
-    console.error("[DB] Error seeding Gold candles:", err);
-  } finally {
-    isSeedingGold = false;
   }
 }
 
@@ -347,7 +309,7 @@ export async function getActiveNiftyFutureKey(): Promise<string> {
   } catch (e: any) {
     console.warn("[DB] Failed to resolve active Nifty FUT contract key:", e.message);
   }
-  return 'NSE_FO|68407'; // Fallback to current contract
+  return 'NSE_FO|61471'; // Active November contract fallback
 }
 
 export async function ensureNiftyCandles(forceToken?: string): Promise<void> {
@@ -362,81 +324,94 @@ export async function ensureNiftyCandles(forceToken?: string): Promise<void> {
     ).orderBy(desc(candles.timestamp)).limit(20);
 
     const nowMs = Date.now();
-    const hasOutdatedData = existing.length === 0 || (
-      // If older than 4 hours or all candles have volume === 0
-      (nowMs - new Date(existing[0].timestamp).getTime() > 4 * 3600000) ||
+    const isNseOpen = isMarketHours(new Date());
+    const lastMarketCloseMs = getLastMarketCloseTime();
+    const latestTimestamp = existing[0] ? new Date(existing[0].timestamp).getTime() : 0;
+
+    const hasOutdatedData = existing.length < 20 || (
+      existing.some(c => !isMarketHours(c.timestamp)) ||
+      (isNseOpen && (nowMs - latestTimestamp > 5 * 60000)) ||
+      (!isNseOpen && (lastMarketCloseMs - latestTimestamp > 30 * 60000)) ||
       existing.every(c => !c.volume || c.volume === 0)
     );
 
-    if (hasOutdatedData) {
-      console.log("[DB] Detected stale Nifty candles or candles lacking volume. Syncing real Upstox volume data...");
-      await db.delete(candles).where(eq(candles.instrument, 'NIFTY'));
-    } else if (existing.length >= 20 && existing.some(c => c.volume && c.volume > 0)) {
+    if (!hasOutdatedData) {
       return; // Already populated with fresh real data including volume
     }
+
+    console.log("[DB] Detected missing or stale Nifty candles. Syncing latest Upstox intraday + historical data...");
 
     const token = forceToken || process.env.UPSTOX_ACCESS_TOKEN;
     if (!token) return;
 
     const today = new Date().toISOString().split('T')[0];
-    const startDate = new Date(Date.now() - 4 * 86400000).toISOString().split('T')[0];
+    const startDate = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
 
-    // 1. Fetch spot candles
-    let spotCandles: any[] = [];
+    // 1. Fetch both intraday (today) and multi-day historical spot candles
+    let intraCandles: any[] = [];
     try {
       const sIntra = await axios.get(
         'https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/1',
-        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 5000 }
+        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 6000 }
       );
       if (sIntra.data?.status === 'success' && sIntra.data.data?.candles?.length > 0) {
-        spotCandles = sIntra.data.data.candles;
+        intraCandles = sIntra.data.data.candles;
       }
     } catch (_) {}
 
-    if (spotCandles.length === 0) {
+    let histCandles: any[] = [];
+    try {
       const sHist = await axios.get(
         `https://api.upstox.com/v2/historical-candle/NSE_INDEX%7CNifty%2050/1minute/${today}/${startDate}`,
-        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 6000 }
+        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 7000 }
       );
-      spotCandles = sHist.data?.data?.candles || [];
-    }
+      histCandles = sHist.data?.data?.candles || [];
+    } catch (_) {}
+
+    const spotMap = new Map<string, any>();
+    histCandles.forEach((c: any) => spotMap.set(c[0], c));
+    intraCandles.forEach((c: any) => spotMap.set(c[0], c));
+    const spotCandles = Array.from(spotMap.values());
 
     if (spotCandles.length === 0) return;
 
-    // 2. Fetch active Nifty Future candles to extract real market volume
+    // 2. Fetch active Nifty Future candles (intraday + historical) to extract real market volume
     const futKey = await getActiveNiftyFutureKey();
     const encodedFutKey = encodeURIComponent(futKey.replace(':', '|'));
-    let futCandles: any[] = [];
+    let fIntraCandles: any[] = [];
     try {
       const fIntra = await axios.get(
         `https://api.upstox.com/v3/historical-candle/intraday/${encodedFutKey}/minutes/1`,
-        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 5000 }
+        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 6000 }
       );
       if (fIntra.data?.status === 'success' && fIntra.data.data?.candles?.length > 0) {
-        futCandles = fIntra.data.data.candles;
+        fIntraCandles = fIntra.data.data.candles;
       }
     } catch (_) {}
 
-    if (futCandles.length === 0) {
-      try {
-        const fHist = await axios.get(
-          `https://api.upstox.com/v2/historical-candle/${encodedFutKey}/1minute/${today}/${startDate}`,
-          { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 6000 }
-        );
-        futCandles = fHist.data?.data?.candles || [];
-      } catch (_) {}
-    }
+    let fHistCandles: any[] = [];
+    try {
+      const fHist = await axios.get(
+        `https://api.upstox.com/v2/historical-candle/${encodedFutKey}/1minute/${today}/${startDate}`,
+        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 7000 }
+      );
+      fHistCandles = fHist.data?.data?.candles || [];
+    } catch (_) {}
 
     const volMap = new Map<number, number>();
-    for (const fc of futCandles) {
+    fHistCandles.forEach((fc: any) => {
       const tMs = Math.floor(new Date(fc[0]).getTime() / 60000) * 60000;
       volMap.set(tMs, Number(fc[5]) || 0);
-    }
+    });
+    fIntraCandles.forEach((fc: any) => {
+      const tMs = Math.floor(new Date(fc[0]).getTime() / 60000) * 60000;
+      volMap.set(tMs, Number(fc[5]) || 0);
+    });
 
     // 3. Merge genuine Upstox volume with Nifty spot candles
     const mergedCandles = spotCandles.map((sc: any): [string, number, number, number, number, number, number] => {
       const tMs = Math.floor(new Date(sc[0]).getTime() / 60000) * 60000;
-      const vol = volMap.get(tMs) || Number(sc[5]) || 0;
+      const vol = volMap.get(tMs) || Number(sc[5]) || 1;
       return [String(sc[0]), Number(sc[1]), Number(sc[2]), Number(sc[3]), Number(sc[4]), Number(vol), Number(sc[6] || 0)];
     });
 
@@ -463,65 +438,78 @@ export async function ensureNifty5mCandles(forceToken?: string): Promise<void> {
     ).orderBy(desc(candles.timestamp)).limit(20);
 
     const nowMs = Date.now();
-    const hasFresh = existing.length >= 10 && (nowMs - new Date(existing[0].timestamp).getTime() <= 4 * 3600000);
-    if (hasFresh) return;
+    const isNseOpen = isMarketHours(new Date());
+    const lastMarketCloseMs = getLastMarketCloseTime();
+    const latestTimestamp = existing[0] ? new Date(existing[0].timestamp).getTime() : 0;
+
+    const hasOutdated = existing.length < 20 || (
+      existing.some(c => !isMarketHours(c.timestamp)) ||
+      (isNseOpen && (nowMs - latestTimestamp > 15 * 60000)) ||
+      (!isNseOpen && (lastMarketCloseMs - latestTimestamp > 30 * 60000))
+    );
+
+    if (!hasOutdated) return;
 
     const token = forceToken || process.env.UPSTOX_ACCESS_TOKEN;
-    const today = new Date().toISOString().split('T')[0];
-    const startDate = new Date(Date.now() - 5 * 86400000).toISOString().split('T')[0];
+    if (!token) return;
 
-    let spotCandles: any[] = [];
-    if (token) {
+    const today = new Date().toISOString().split('T')[0];
+    const startDate = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+
+    let intraCandles: any[] = [];
+    try {
+      const sIntra = await axios.get(
+        'https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/5',
+        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 6000 }
+      );
+      if (sIntra.data?.status === 'success' && sIntra.data.data?.candles?.length > 0) {
+        intraCandles = sIntra.data.data.candles;
+      }
+    } catch (_) {}
+
+    let histCandles: any[] = [];
+    try {
+      const sHist = await axios.get(
+        `https://api.upstox.com/v2/historical-candle/NSE_INDEX%7CNifty%2050/5minute/${today}/${startDate}`,
+        { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 7000 }
+      );
+      histCandles = sHist.data?.data?.candles || [];
+    } catch (_) {}
+
+    const spotMap = new Map<string, any>();
+    histCandles.forEach((c: any) => spotMap.set(c[0], c));
+    intraCandles.forEach((c: any) => spotMap.set(c[0], c));
+    const spotCandles = Array.from(spotMap.values());
+
+    if (spotCandles.length > 0) {
+      const futKey = await getActiveNiftyFutureKey();
+      const encodedFutKey = encodeURIComponent(futKey.replace(':', '|'));
+      let futCandles: any[] = [];
       try {
-        const sIntra = await axios.get(
-          'https://api.upstox.com/v3/historical-candle/intraday/NSE_INDEX%7CNifty%2050/minutes/5',
-          { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 5000 }
+        const fIntra = await axios.get(
+          `https://api.upstox.com/v3/historical-candle/intraday/${encodedFutKey}/minutes/5`,
+          { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 6000 }
         );
-        if (sIntra.data?.status === 'success' && sIntra.data.data?.candles?.length > 0) {
-          spotCandles = sIntra.data.data.candles;
+        if (fIntra.data?.status === 'success' && fIntra.data.data?.candles?.length > 0) {
+          futCandles = fIntra.data.data.candles;
         }
       } catch (_) {}
 
-      if (spotCandles.length === 0) {
-        try {
-          const sHist = await axios.get(
-            `https://api.upstox.com/v2/historical-candle/NSE_INDEX%7CNifty%2050/5minute/${today}/${startDate}`,
-            { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 6000 }
-          );
-          spotCandles = sHist.data?.data?.candles || [];
-        } catch (_) {}
+      const volMap = new Map<number, number>();
+      for (const fc of futCandles) {
+        const tMs = Math.floor(new Date(fc[0]).getTime() / (5 * 60000)) * (5 * 60000);
+        volMap.set(tMs, Number(fc[5]) || 0);
       }
 
-      if (spotCandles.length > 0) {
-        const futKey = await getActiveNiftyFutureKey();
-        const encodedFutKey = encodeURIComponent(futKey.replace(':', '|'));
-        let futCandles: any[] = [];
-        try {
-          const fIntra = await axios.get(
-            `https://api.upstox.com/v3/historical-candle/intraday/${encodedFutKey}/minutes/5`,
-            { headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, timeout: 5000 }
-          );
-          if (fIntra.data?.status === 'success' && fIntra.data.data?.candles?.length > 0) {
-            futCandles = fIntra.data.data.candles;
-          }
-        } catch (_) {}
+      const mergedCandles = spotCandles.map((sc: any): [string, number, number, number, number, number, number] => {
+        const tMs = Math.floor(new Date(sc[0]).getTime() / (5 * 60000)) * (5 * 60000);
+        const vol = volMap.get(tMs) || Number(sc[5]) || 1;
+        return [String(sc[0]), Number(sc[1]), Number(sc[2]), Number(sc[3]), Number(sc[4]), Number(vol), Number(sc[6] || 0)];
+      });
 
-        const volMap = new Map<number, number>();
-        for (const fc of futCandles) {
-          const tMs = Math.floor(new Date(fc[0]).getTime() / (5 * 60000)) * (5 * 60000);
-          volMap.set(tMs, Number(fc[5]) || 0);
-        }
-
-        const mergedCandles = spotCandles.map((sc: any): [string, number, number, number, number, number, number] => {
-          const tMs = Math.floor(new Date(sc[0]).getTime() / (5 * 60000)) * (5 * 60000);
-          const vol = volMap.get(tMs) || Number(sc[5]) || 0;
-          return [String(sc[0]), Number(sc[1]), Number(sc[2]), Number(sc[3]), Number(sc[4]), Number(vol), Number(sc[6] || 0)];
-        });
-
-        console.log(`[DB] Seeding ${mergedCandles.length} direct Upstox Nifty 5-minute candles...`);
-        await seedHistoricalCandles('NIFTY', 5, mergedCandles);
-        return;
-      }
+      console.log(`[DB] Seeding ${mergedCandles.length} Upstox 5-min Nifty candles with volume...`);
+      await seedHistoricalCandles('NIFTY', 5, mergedCandles);
+      return;
     }
 
     // Fallback: Aggregate 1m candles into 5m candles in DB

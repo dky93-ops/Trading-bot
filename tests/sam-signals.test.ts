@@ -64,8 +64,58 @@ describe('SAM Signals & Technical Indicators', () => {
     expect(callCount).toBeGreaterThan(0);
   });
 
-  it('defaults entryTiming to bar1Open in DEFAULT_SAM_CONFIG', () => {
-    expect(DEFAULT_SAM_CONFIG.entryTiming).toBe('bar1Open');
+  it('defaults entryTiming to bar1Close (Zero Repaint) in DEFAULT_SAM_CONFIG', () => {
+    expect(DEFAULT_SAM_CONFIG.entryTiming).toBe('bar1Close');
+  });
+
+  it('generates pending candidate on Bar 0 and confirmed entry at Bar + 1 close if favorable', () => {
+    const candles: any[] = [];
+    for (let i = 0; i < 40; i++) {
+      candles.push({ open: 100, high: 101, low: 99, close: 100, time: 1000 + i * 60 });
+    }
+    // Bar 40: crossover candle (setup / Bar 0)
+    candles.push({ open: 100, high: 108, low: 99, close: 106, time: 1000 + 40 * 60 });
+    // Bar 41: Bar + 1 candle (closes favorable green above signal close)
+    candles.push({ open: 106, high: 112, low: 105, close: 110, time: 1000 + 41 * 60 });
+
+    const res = computeSamSignals(candles, {
+      ...DEFAULT_SAM_CONFIG,
+      entryTiming: 'bar1Close',
+      filterBar1AdverseCloseEnabled: true,
+      noTradeBefore915: false
+    });
+
+    // Bar 40 is a candidate setup, NOT yet an entered trade
+    expect(res.candidateCallSignals?.[40]).toBe(true);
+    expect(res.callSignals[40]).toBe(false);
+
+    // Bar 41 passed adverse filter and triggers confirmed entry at Bar + 1 close
+    expect(res.callSignals[41]).toBe(true);
+  });
+
+  it('invalidates and skips trade at Bar + 1 close if Bar + 1 closes adverse (zero repaint)', () => {
+    const candles: any[] = [];
+    for (let i = 0; i < 40; i++) {
+      candles.push({ open: 100, high: 101, low: 99, close: 100, time: 1000 + i * 60 });
+    }
+    // Bar 40: crossover candle (setup / Bar 0)
+    candles.push({ open: 100, high: 108, low: 99, close: 106, time: 1000 + 40 * 60 });
+    // Bar 41: Bar + 1 candle closes adverse (red, below signal close)
+    candles.push({ open: 106, high: 107, low: 98, close: 99, time: 1000 + 41 * 60 });
+
+    const res = computeSamSignals(candles, {
+      ...DEFAULT_SAM_CONFIG,
+      entryTiming: 'bar1Close',
+      filterBar1AdverseCloseEnabled: true,
+      noTradeBefore915: false
+    });
+
+    // Bar 40 was candidate setup
+    expect(res.candidateCallSignals?.[40]).toBe(true);
+    // Neither Bar 40 nor Bar 41 fired a confirmed trade!
+    expect(res.callSignals[40]).toBe(false);
+    expect(res.callSignals[41]).toBe(false);
+    expect(res.bar1FilteredCount).toBeGreaterThan(0);
   });
 
   describe.skip('Targeted Precision Filters & Independent On/Off Toggles', () => {

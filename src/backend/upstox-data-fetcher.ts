@@ -148,12 +148,17 @@ export class UpstoxDataFetcher {
         );
       }
     } catch (error: any) {
+      const status = error.response?.status;
       const errCode = error.response?.data?.errors?.[0]?.errorCode || error.response?.data?.errors?.[0]?.error_code;
       if (errCode === 'UDAPI1087') {
         console.warn(`Upstox API: Invalid instrument key (${instrumentKey}) - skipping option chain`);
         return [];
       }
-      console.error('Failed to fetch option chain:', error.message);
+      if (status === 429) {
+        console.warn(`Upstox API: 429 rate limit reached for option chain (${instrumentKey})`);
+        return [];
+      }
+      console.warn('Failed to fetch option chain:', error.message);
     }
 
     return [];

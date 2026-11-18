@@ -219,9 +219,17 @@ export function computeVWAP(candles: Array<{high: number, low: number, close: nu
     if (c.time !== undefined || c.timestamp !== undefined) {
       let dayKey: number | string = -1;
       if (typeof c.time === 'number') {
+        // c.time in lightweight-charts is epoch seconds (which includes +19800 for IST)
         dayKey = Math.floor(c.time / 86400);
       } else if (c.timestamp) {
-        dayKey = typeof c.timestamp === 'string' ? c.timestamp.split('T')[0] : new Date(c.timestamp).getUTCDate();
+        try {
+          const d = new Date(c.timestamp);
+          // Convert UTC timestamp to IST (+5:30) epoch ms for rock-solid session day boundary
+          const istEpochMs = d.getTime() + 19800000;
+          dayKey = Math.floor(istEpochMs / 86400000);
+        } catch (_) {
+          dayKey = typeof c.timestamp === 'string' ? c.timestamp.split('T')[0] : new Date(c.timestamp).getUTCDate();
+        }
       }
       if (dayKey !== -1 && dayKey !== lastDay) {
         cumVol = 0;
@@ -234,7 +242,7 @@ export function computeVWAP(candles: Array<{high: number, low: number, close: nu
     const vol = c.volume && c.volume > 0 ? c.volume : 1;
     cumVol += vol;
     cumVolPrice += typicalPrice * vol;
-    vwap[i] = cumVol > 0 ? cumVolPrice / cumVol : typicalPrice;
+    vwap[i] = cumVol > 0 ? Number((cumVolPrice / cumVol).toFixed(2)) : typicalPrice;
   }
   return vwap;
 }
@@ -630,4 +638,94 @@ export function computeOutsideBars(
   }
   return result;
 }
+
+export interface MtfEmaResult {
+  ema: number[];
+  slope: number[];
+}
+
+/**
+ * Computes 5-Minute Multi-Timeframe (MTF) EMA on 1-minute candle data.
+ * Aggregates 1-minute bars into 5-minute sessions, calculates EMA, and maps back.
+ */
+export function compute5MinEMA(
+  candles: Array<{ high: number; low: number; open: number; close: number; time?: any; timestamp?: any }>,
+  period: number = 20
+): MtfEmaResult {
+  const len = candles.length;
+  const ema = new Array(len).fill(NaN);
+  const slope = new Array(len).fill(0);
+  if (len === 0) return { ema, slope };
+
+  interface FiveMinBar {
+    bucketKey: number | string;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    startIndex: number;
+    endIndex: number;
+  }
+
+  const fiveMinBars: FiveMinBar[] = [];
+  let curBar: FiveMinBar | null = null;
+
+  for (let i = 0; i < len; i++) {
+    const c = candles[i];
+    let bucketKey: number | string = Math.floor(i / 5);
+    if (typeof c.time === 'number') {
+      bucketKey = Math.floor(c.time / 300) * 300;
+    } else if (c.timestamp) {
+      try {
+        const d = new Date(c.timestamp);
+        const ms = d.getTime() + 19800000;
+        bucketKey = Math.floor(ms / 300000) * 300000;
+      } catch (_) {}
+    }
+
+    if (!curBar || curBar.bucketKey !== bucketKey) {
+      curBar = {
+        bucketKey,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        startIndex: i,
+        endIndex: i,
+      };
+      fiveMinBars.push(curBar);
+    } else {
+      curBar.high = Math.max(curBar.high, c.high);
+      curBar.low = Math.min(curBar.low, c.low);
+      curBar.close = c.close;
+      curBar.endIndex = i;
+    }
+  }
+
+  // Calculate Progressive EMA on 5-min bars so even opening bars get continuous trend guidance
+  const k = 2 / (period + 1);
+  let runningEma = fiveMinBars[0]?.close || 0;
+  let prevEma = runningEma;
+
+  for (let bIdx = 0; bIdx < fiveMinBars.length; bIdx++) {
+    const cClose = fiveMinBars[bIdx].close;
+    if (bIdx === 0) {
+      runningEma = cClose;
+      prevEma = cClose;
+    } else {
+      prevEma = runningEma;
+      runningEma = (cClose - runningEma) * k + runningEma;
+    }
+    const roundedEma = Number(runningEma.toFixed(2));
+    const roundedSlope = Number((runningEma - prevEma).toFixed(2));
+    const bar = fiveMinBars[bIdx];
+    for (let i = bar.startIndex; i <= bar.endIndex; i++) {
+      ema[i] = roundedEma;
+      slope[i] = roundedSlope;
+    }
+  }
+
+  return { ema, slope };
+}
+
 

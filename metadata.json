@@ -1,6 +1,6 @@
 {
   "name": "Remix GammaStrike Algo Trader",
-  "description": "Real-time algorithmic trading and technical analysis platform for Nifty 50 and MCX Gold commodity featuring T3 Striped, AlphaTrend, ADX Chop Filter, and live candlestick charting.",
+  "description": "Real-time algorithmic trading and technical analysis platform for Nifty 50 featuring T3 Striped, AlphaTrend, ADX Chop Filter, and live candlestick charting.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

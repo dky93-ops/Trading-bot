@@ -17,11 +17,8 @@ function cn(...inputs: ClassValue[]) {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
-  const [activeInstrument, setActiveInstrument] = useState<'NIFTY' | 'GOLD'>('NIFTY');
-  const [chartViewMode, setChartViewMode] = useState<'SINGLE' | 'DUAL'>('SINGLE');
   const [state, setState] = useState<any>({
     nifty50: { lastPrice: 0, change: 0 },
-    gold: { lastPrice: 154263, change: 1282 },
     bankNifty: { lastPrice: 0, change: 0 },
     indiaVix: { lastPrice: 0, change: 0 },
     isConnected: false,
@@ -82,7 +79,6 @@ export default function App() {
                   time: new Date().toLocaleTimeString(),
                   nifty: msg.data.nifty50?.lastPrice || 0,
                   bankNifty: msg.data.bankNifty?.lastPrice || 0,
-                  gold: msg.data.gold?.lastPrice || 0
                 };
                 const updated = [...prev, newPoint];
                 return updated.length > 50 ? updated.slice(updated.length - 50) : updated;
@@ -222,21 +218,14 @@ export default function App() {
       {/* Main Layout */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex flex-col gap-6">
         
-        {/* Top Info Bar & Instrument Quick-Select */}
+        {/* Top Info Bar */}
         <div className="flex flex-wrap items-center justify-between gap-4 text-xs font-bold bg-[#111827] border border-[#1F2937] rounded-lg p-3">
           <div className="flex flex-wrap items-center gap-3">
             <span className="text-gray-400 uppercase tracking-wider">Trading Session:</span>
-            {activeInstrument === 'GOLD' ? (
-              <span className="px-2.5 py-1 rounded bg-amber-500/10 text-amber-300 border border-amber-500/30 flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
-                MCX Commodity Hours: Mon-Fri 09:00 - 23:30 IST (Open Evening Session)
-              </span>
-            ) : (
-              <span className="px-2.5 py-1 rounded bg-blue-500/10 text-blue-300 border border-blue-500/30 flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-blue-400"></span>
-                NSE Trading Hours: Mon-Fri 09:15 - 15:30 IST
-              </span>
-            )}
+            <span className="px-2.5 py-1 rounded bg-blue-500/10 text-blue-300 border border-blue-500/30 flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-blue-400"></span>
+              NSE Trading Hours: Mon-Fri 09:15 - 15:30 IST
+            </span>
             <div className="h-4 w-px bg-[#1F2937] mx-1"></div>
             <button className="flex items-center space-x-2 px-3 py-1 bg-brand-green/10 text-brand-green border border-brand-green/30 rounded">
               <Power size={12} />
@@ -245,29 +234,9 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2">
-            <span className="text-gray-500 text-[11px]">Quick Switch:</span>
-            <button
-              onClick={() => setActiveInstrument('NIFTY')}
-              className={cn(
-                "px-2.5 py-1 rounded text-xs font-bold transition-colors cursor-pointer",
-                activeInstrument === 'NIFTY' 
-                  ? "bg-brand-blue text-black font-extrabold" 
-                  : "bg-[#0A0F1C] border border-[#1F2937] text-gray-400 hover:text-white"
-              )}
-            >
+            <span className="px-2.5 py-1 rounded text-xs font-bold bg-brand-blue text-black font-extrabold shadow-sm">
               🇮🇳 NIFTY 50
-            </button>
-            <button
-              onClick={() => setActiveInstrument('GOLD')}
-              className={cn(
-                "px-2.5 py-1 rounded text-xs font-bold transition-colors cursor-pointer",
-                activeInstrument === 'GOLD' 
-                  ? "bg-amber-400 text-black font-extrabold" 
-                  : "bg-[#0A0F1C] border border-[#1F2937] text-gray-400 hover:text-white"
-              )}
-            >
-              🟡 GOLD (MCX)
-            </button>
+            </span>
           </div>
         </div>
 
@@ -292,21 +261,21 @@ export default function App() {
         {/* Top Stats Grid */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <StatBox 
-            title={activeInstrument === 'GOLD' ? "COMMODITY SPOT (MCX GOLD)" : "INDEX SPOT (NIFTY 50)"} 
-            value={`₹${(activeInstrument === 'GOLD' ? state.gold?.lastPrice : state.nifty50?.lastPrice) || '---'}`} 
-            sub={`Change: ${(activeInstrument === 'GOLD' ? state.gold?.change : state.nifty50?.change) || 0}`} 
-            color={activeInstrument === 'GOLD' ? "yellow" : "green"} 
+            title="INDEX SPOT (NIFTY 50)" 
+            value={`₹${state.nifty50?.lastPrice || '---'}`} 
+            sub={`Change: ${state.nifty50?.change || 0}`} 
+            color="green" 
           />
           <StatBox 
-            title={activeInstrument === 'GOLD' ? "MCX GOLD CONTRACT" : "INDIA VIX"} 
-            value={activeInstrument === 'GOLD' ? "10g LOT (MCX)" : (state.indiaVix?.lastPrice || '---')} 
-            sub={activeInstrument === 'GOLD' ? `Day Δ: ${(state.gold?.change || 0) >= 0 ? '+' : ''}${state.gold?.change || 0} pts` : `Vol Change: ${state.indiaVix?.change || 0}`} 
+            title="INDIA VIX" 
+            value={state.indiaVix?.lastPrice || '---'} 
+            sub={`Vol Change: ${state.indiaVix?.change || 0}`} 
             color="yellow" 
           />
           <StatBox 
             title="VWAP / SPOT DELTA" 
-            value={`₹${activeInstrument === 'GOLD' ? (state.gold?.lastPrice ? (state.gold.lastPrice - 18.5).toFixed(2) : '---') : (state.nifty50?.lastPrice ? (state.nifty50.lastPrice - 10).toFixed(2) : '---')}`} 
-            sub={activeInstrument === 'GOLD' ? "MCX Commodity Spread: Normal" : "Vol Δ: +0"} 
+            value={`₹${state.nifty50?.lastPrice ? (state.nifty50.lastPrice - 10).toFixed(2) : '---'}`} 
+            sub="Vol Δ: +0" 
             color="purple" 
           />
           <StatBox 
@@ -355,8 +324,8 @@ export default function App() {
         {/* Tabs */}
         <div className="flex overflow-x-auto space-x-1 border-b border-[#1F2937] pb-px hide-scrollbar touch-pan-x">
           {[
-            { id: 'dashboard', label: '5 Core Strategies Dashboard', short: 'Dashboard', icon: BarChart3 },
-            { id: 'settings', label: 'Configure 5 Strategies', short: 'Settings', icon: Settings },
+            { id: 'dashboard', label: 'Nifty Chart & Strategies Dashboard', short: 'Chart & Strategies', icon: BarChart3 },
+            { id: 'settings', label: 'Chart Strategies & Parameters', short: 'Settings', icon: Settings },
             { id: 'options', label: 'Live Option Chain', short: 'Option Chain', icon: Activity },
             { id: 'replay', label: 'Option Chain Replay & History', short: 'Replay', icon: Clock },
             { id: 'logs', label: 'Execution Signals Log', short: 'Signals Log', icon: ShieldAlert },
@@ -383,18 +352,6 @@ export default function App() {
             const enabledStrategiesCount = Object.values(settings?.strategies || {}).filter((s: any) => s.enabled).length;
             const activeTradesCount = state.signals?.filter((s: any) => s.status === 'ACTIVE').length || 0;
 
-            const handleActivateAll = () => {
-              const updated = { ...settings?.strategies };
-              Object.keys(updated).forEach(k => { updated[k] = { ...updated[k], enabled: true }; });
-              updateGlobalSettings('strategies', updated);
-            };
-
-            const handleDeactivateAll = () => {
-              const updated = { ...settings?.strategies };
-              Object.keys(updated).forEach(k => { updated[k] = { ...updated[k], enabled: false }; });
-              updateGlobalSettings('strategies', updated);
-            };
-
             return (
             <div className="space-y-6">
               <div className="flex justify-between items-center mb-4">
@@ -409,202 +366,25 @@ export default function App() {
               {/* Asset Selector & Live Candlestick Chart Controls */}
               <div className="bg-[#111827] border border-[#1F2937] rounded-lg p-3 flex flex-wrap items-center justify-between gap-4">
                 <div className="flex flex-wrap items-center gap-3">
-                  <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">Active Chart:</span>
-                  <button
-                    onClick={() => setActiveInstrument('NIFTY')}
-                    className={cn(
-                      "flex items-center space-x-2 px-3.5 py-1.5 rounded-md font-bold text-xs transition-all cursor-pointer",
-                      activeInstrument === 'NIFTY'
-                        ? "bg-brand-blue text-black shadow-[0_0_12px_rgba(0,180,255,0.4)]"
-                        : "bg-[#0A0F1C] border border-[#1F2937] text-gray-300 hover:text-white hover:border-gray-600"
-                    )}
-                  >
+                  <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">Active Asset:</span>
+                  <div className="flex items-center space-x-2 px-3.5 py-1.5 rounded-md font-bold text-xs bg-brand-blue text-black shadow-[0_0_12px_rgba(0,180,255,0.4)]">
                     <span>🇮🇳</span>
                     <span>NIFTY 50</span>
                     <span className="font-mono text-[11px] opacity-90">₹{state.nifty50?.lastPrice || '---'}</span>
-                    <span className={cn("text-[10px] font-mono", (state.nifty50?.change || 0) >= 0 ? "text-emerald-400" : "text-red-400")}>
+                    <span className={cn("text-[10px] font-mono", (state.nifty50?.change || 0) >= 0 ? "text-emerald-950 font-extrabold" : "text-red-950 font-extrabold")}>
                       {(state.nifty50?.change || 0) >= 0 ? '+' : ''}{state.nifty50?.change || 0}
                     </span>
-                  </button>
-
-                  <button
-                    onClick={() => setActiveInstrument('GOLD')}
-                    className={cn(
-                      "flex items-center space-x-2 px-3.5 py-1.5 rounded-md font-bold text-xs transition-all cursor-pointer",
-                      activeInstrument === 'GOLD'
-                        ? "bg-amber-400 text-black shadow-[0_0_12px_rgba(251,191,36,0.4)]"
-                        : "bg-[#0A0F1C] border border-[#1F2937] text-gray-300 hover:text-white hover:border-gray-600"
-                    )}
-                  >
-                    <span>🟡</span>
-                    <span>MCX GOLD COMMODITY</span>
-                    <span className="font-mono text-[11px] opacity-90">₹{state.gold?.lastPrice || '---'}</span>
-                    <span className={cn("text-[10px] font-mono", (state.gold?.change || 0) >= 0 ? "text-emerald-400" : "text-red-400")}>
-                      {(state.gold?.change || 0) >= 0 ? '+' : ''}{state.gold?.change || 0}
-                    </span>
-                  </button>
-                </div>
-
-                {/* Chart View Mode Switcher */}
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">View:</span>
-                  <button
-                    onClick={() => setChartViewMode('SINGLE')}
-                    className={cn(
-                      "px-3 py-1.5 rounded text-xs font-bold transition-all cursor-pointer",
-                      chartViewMode === 'SINGLE'
-                        ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-bold"
-                        : "bg-[#0A0F1C] text-gray-400 border border-[#1F2937] hover:text-white"
-                    )}
-                  >
-                    Single Asset ({activeInstrument})
-                  </button>
-                  <button
-                    onClick={() => setChartViewMode('DUAL')}
-                    className={cn(
-                      "flex items-center space-x-1.5 px-3 py-1.5 rounded text-xs font-bold transition-all cursor-pointer",
-                      chartViewMode === 'DUAL'
-                        ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-bold"
-                        : "bg-[#0A0F1C] text-gray-400 border border-[#1F2937] hover:text-white"
-                    )}
-                  >
-                    <span>◫</span>
-                    <span>Dual Charts (Nifty + Gold)</span>
-                  </button>
+                  </div>
                 </div>
               </div>
 
-              {/* Live Candlestick Chart(s) */}
+              {/* Live Candlestick Chart & Backtest Dashboard */}
               <div className="flex flex-col gap-6">
-                {chartViewMode === 'SINGLE' ? (
-                  <LiveChart 
-                    key={activeInstrument}
-                    livePrice={activeInstrument === 'GOLD' ? state.gold?.lastPrice : state.nifty50?.lastPrice} 
-                    instrument={activeInstrument} 
-                  />
-                ) : (
-                  <div className="flex flex-col gap-6">
-                    <LiveChart 
-                      key="nifty-chart"
-                      livePrice={state.nifty50?.lastPrice} 
-                      instrument="NIFTY" 
-                    />
-                    <LiveChart 
-                      key="gold-chart"
-                      livePrice={state.gold?.lastPrice} 
-                      instrument="GOLD" 
-                    />
-                  </div>
-                )}
-              </div>
-
-              {/* Performance Matrix */}
-              <div className="bg-[#111827] rounded-lg border border-[#1F2937] overflow-hidden">
-                <div className="p-4 border-b border-[#1F2937] flex justify-between items-center">
-                  <div>
-                    <h3 className="text-lg font-bold text-white">5 Core Options Strategy Performance Matrix</h3>
-                    <p className="text-xs text-gray-500">Strict real-time option-buying signals with OI wall confirmation and fake-breakout filters.</p>
-                  </div>
-                  <div className="flex space-x-2">
-                    <button onClick={handleActivateAll} className="px-3 py-1 bg-brand-green/10 text-brand-green border border-brand-green/30 hover:bg-brand-green/20 rounded text-xs font-bold uppercase cursor-pointer transition-colors">Activate All</button>
-                    <button onClick={handleDeactivateAll} className="px-3 py-1 bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20 rounded text-xs font-bold uppercase cursor-pointer transition-colors">Deactivate All</button>
-                  </div>
-                </div>
-                
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm text-left font-mono">
-                    <thead className="text-xs text-gray-500 uppercase bg-[#0A0F1C] border-b border-[#1F2937]">
-                      <tr>
-                        <th className="px-6 py-4">Priority & Strategy Name</th>
-                        <th className="px-6 py-4">Status & Control</th>
-                        <th className="px-6 py-4">Trades</th>
-                        <th className="px-6 py-4">Win Rate</th>
-                        <th className="px-6 py-4">Net P&L (₹)</th>
-                        <th className="px-6 py-4">Target RR</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-[#1F2937]">
-                      {[
-                        { id: 'failedRetest', familyKey: 'FAILED_RETEST', name: '1. Failed Retest Reversal (FAILED_RETEST)', desc: 'Priority 1 | Catches failed retests of broken key levels after candle confirmation.', rr: '>= 0.8R to 1.5R+' },
-                        { id: 'continuationBreakdown', familyKey: 'CONTINUATION_BREAKDOWN', name: '2. Continuation Breakdown (CONTINUATION_BREAKDOWN)', desc: 'Priority 2 | Trades bearish continuation after level breakdown and consolidation pause.', rr: '>= 0.8R to 1.5R' },
-                        { id: 'continuationBreakout', familyKey: 'CONTINUATION_BREAKOUT', name: '3. Continuation Breakout (CONTINUATION_BREAKOUT)', desc: 'Priority 3 | Trades bullish continuation after level breakout and consolidation pause.', rr: '>= 0.8R to 1.5R' },
-                        { id: 'openingTrap', familyKey: 'OPENING_TRAP', name: '4. Opening Breakout Trap (OPENING_TRAP)', desc: 'Priority 4 | Catches opening range fake breakouts/breakdowns upon retest confirmation.', rr: '>= 0.8R to 1.0R' },
-                        { id: 'oiWallRejection', familyKey: 'OI_WALL_REJECTION', name: '5. OI Wall Rejection (OI_WALL_REJECTION)', desc: 'Priority 5 | Rejection trades when 1.5x dominant OI walls reject price 2+ times & begin unwinding.', rr: '>= 0.8R to 1.2R' },
-                        { id: 'technicalConfluence', familyKey: 'TECHNICAL_CONFLUENCE', name: '6. Technical Confluence (TECHNICAL_CONFLUENCE)', desc: 'Priority 1 | Trades based on technical indicators (RSI, MACD, EMA, BB, SuperTrend) voting consensus.', rr: '>= 1.0R' },
-                        { id: 'adxBreakout', familyKey: 'ADX_BREAKOUT', name: '7. Rob Booker - ADX Breakout (ADX_BREAKOUT) [GOLD ONLY]', desc: 'Gold Only Strategy | Consolidations when ADX < 18, trades 20-candle box breakout with candle extreme SL and 1x box target.', rr: '1.0x Box Width' },
-                        { id: 'comboFiltered', familyKey: 'COMBO_FILTERED', name: '8. T3 + AlphaTrend: Filtered Version (FILTERED)', desc: 'PDF Combined Strategy (Filtered) | All Timeframes | Upstox Volume >= 0.85x SMA, Green/Red candle confirm, Ribbon spread expansion > 0.12x ATR & 50 EMA trend alignment. 1-trade limit & configurable max time exit.', rr: '1.5R to 2.5R' },
-                        { id: 'comboUnfiltered', familyKey: 'COMBO_UNFILTERED', name: '9. T3 + AlphaTrend: Unfiltered Version (UNFILTERED)', desc: 'PDF Combined Strategy (Unfiltered) | All Timeframes | Immediate confluence entry when AlphaTrend signal and T3 Ribbon direction align. 1-trade limit & configurable max time exit.', rr: '1.5R to 2.5R' },
-                      ].map(strat => {
-                        const isEnabled = !!settings?.strategies?.[strat.id]?.enabled;
-                        const toggleStrat = () => {
-                          const updated = {
-                            ...settings?.strategies,
-                            [strat.id]: { ...settings?.strategies?.[strat.id], enabled: !isEnabled }
-                          };
-                          updateGlobalSettings('strategies', updated);
-                        };
-
-                        const stratSignals = state.signals?.filter((s: any) => 
-                          s.strategy_family === strat.familyKey || 
-                          (s.strategy_family || '').toUpperCase() === strat.familyKey || 
-                          s.strategy === strat.id
-                        ) || [];
-
-                        const closedStrat = stratSignals.filter((s: any) => s.status === 'CLOSED');
-                        const winningStrat = closedStrat.filter((s: any) => (s.realizedPnL || 0) > 0);
-                        const winRateStr = closedStrat.length > 0 
-                          ? `${((winningStrat.length / closedStrat.length) * 100).toFixed(0)}%` 
-                          : (stratSignals.length > 0 ? '0%' : '---');
-
-                        const stratPnL = stratSignals.reduce((sum: number, s: any) => {
-                          if (s.status === 'CLOSED') {
-                            return sum + (s.realizedPnL || 0);
-                          } else {
-                            const curP = s.latestPrice || s.entryPrice;
-                            const lots = settings?.strategies?.[strat.id]?.lotSize || 1;
-                            return sum + ((curP - s.entryPrice) * 75 * lots);
-                          }
-                        }, 0);
-
-                        const pnlFormatted = stratPnL >= 0 
-                          ? `+₹${stratPnL.toLocaleString('en-IN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}` 
-                          : `-₹${Math.abs(stratPnL).toLocaleString('en-IN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}`;
-
-                        return (
-                          <tr key={strat.id} className="hover:bg-[#1F2937]/50 transition-colors">
-                            <td className="px-6 py-4">
-                              <div className="font-bold text-gray-200">{strat.name}</div>
-                              <div className="text-xs text-gray-500 mt-1">{strat.desc}</div>
-                            </td>
-                            <td className="px-6 py-4">
-                              <button
-                                onClick={toggleStrat}
-                                className={cn(
-                                  "px-2.5 py-1 text-xs font-bold rounded cursor-pointer transition-all border", 
-                                  isEnabled 
-                                    ? "bg-brand-green/10 text-brand-green border-brand-green/30 hover:bg-brand-green/20" 
-                                    : "bg-red-500/10 text-red-400 border-red-500/30 hover:bg-red-500/20"
-                                )}
-                              >
-                                {isEnabled ? 'ACTIVE' : 'INACTIVE'}
-                              </button>
-                            </td>
-                            <td className="px-6 py-4 text-gray-300 font-bold">
-                              {stratSignals.length}
-                            </td>
-                            <td className={cn("px-6 py-4 font-bold", closedStrat.length > 0 && winningStrat.length > 0 ? "text-brand-green" : "text-gray-400")}>
-                              {winRateStr}
-                            </td>
-                            <td className={cn("px-6 py-4 font-bold", stratPnL > 0 ? "text-brand-green" : stratPnL < 0 ? "text-red-400" : "text-gray-400")}>
-                              {pnlFormatted}
-                            </td>
-                            <td className="px-6 py-4 text-brand-blue font-bold">{strat.rr}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
+                <LiveChart 
+                  key="nifty-chart"
+                  livePrice={state.nifty50?.lastPrice} 
+                  instrument="NIFTY" 
+                />
               </div>
             </div>
             );
@@ -714,15 +494,15 @@ export default function App() {
                               </span>
                             </td>
                             <td className="px-4 py-3 text-gray-200 font-bold">{sig.strategy_family || sig.strategy}</td>
-                            <td className="px-4 py-3 text-white font-bold">{sig.spot || sig.entryPrice}</td>
+                            <td className="px-4 py-3 text-white font-bold">{sig.spot || sig.spotEntry || sig.decision?.entrySpot || '-'}</td>
                             <td className="px-4 py-3 text-yellow-400 font-bold">{sig.broken_level || '-'}</td>
                             <td className="px-4 py-3 text-gray-400 whitespace-nowrap">
                               <span className="text-red-400">CE: {sig.wall_above || '-'}</span> / <span className="text-brand-green">PE: {sig.wall_below || '-'}</span>
                             </td>
                             <td className="px-4 py-3 text-brand-blue font-bold whitespace-nowrap">
-                              {sig.strike ? `${sig.strike} ${sig.option_type}` : sig.contract}
+                              {sig.strike ? `${sig.strike} ${sig.option_type || sig.optionType || ''}` : (sig.contract || '-')}
                             </td>
-                            <td className="px-4 py-3 text-gray-200 font-bold">₹{sig.entry || sig.entryPrice}</td>
+                            <td className="px-4 py-3 text-gray-200 font-bold">₹{sig.entry || sig.entryPrice || sig.optionEntry || '-'}</td>
                             <td className="px-4 py-3 text-white font-bold">
                               ₹{sig.status === 'CLOSED' ? (sig.exitPrice !== undefined ? sig.exitPrice : (sig.latestPrice || sig.entryPrice)) : (sig.latestPrice || sig.entryPrice)}
                             </td>
@@ -732,9 +512,25 @@ export default function App() {
                             )}>
                               {pnlText}
                             </td>
-                            <td className="px-4 py-3 text-red-400 font-bold">₹{sig.stoploss || sig.stopLoss}</td>
+                            <td className="px-4 py-3 text-red-400 font-bold">
+                              {sig.spotInvalidation || sig.invalidationLevel ? (
+                                <div>
+                                  <span>Spot: {sig.spotInvalidation || sig.invalidationLevel}</span>
+                                  <span className="text-[10px] text-gray-400 block font-mono">Opt: ₹{sig.stoploss || sig.stopLoss || sig.optionStoploss || '-'}</span>
+                                </div>
+                              ) : (
+                                `₹${sig.stoploss || sig.stopLoss || sig.optionStoploss || '-'}`
+                              )}
+                            </td>
                             <td className="px-4 py-3 text-brand-green font-bold whitespace-nowrap">
-                              ₹{sig.target1 || sig.target} / ₹{sig.target2 || '-'}
+                              {sig.spotTarget1 || sig.targets?.target1Spot ? (
+                                <div>
+                                  <span>Spot: {sig.spotTarget1 || sig.targets?.target1Spot}</span>
+                                  <span className="text-[10px] text-gray-400 block font-mono">Opt: ₹{sig.target1 || sig.target} / ₹{sig.target2 || '-'}</span>
+                                </div>
+                              ) : (
+                                `₹${sig.target1 || sig.target} / ₹${sig.target2 || '-'}`
+                              )}
                             </td>
                             <td className="px-4 py-3 text-purple-400 font-bold">{sig.confidence ? `${sig.confidence}%` : '-'}</td>
                             <td className="px-4 py-3 text-gray-400 max-w-xs">
@@ -883,15 +679,55 @@ export default function App() {
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {[
-                  { key: 'failedRetest', name: '1. Failed Retest Reversal (FAILED_RETEST)', desc: 'Priority 1 | Catches failed retests of broken key levels after confirmation candle.', win: '10:00 - 12:30 IST', rr: '>= 0.8R to 1.5R+' },
-                  { key: 'continuationBreakdown', name: '2. Continuation Breakdown (CONTINUATION_BREAKDOWN)', desc: 'Priority 2 | Trades bearish continuation after level breakdown and 1-4 candle consolidation pause.', win: '10:00 - 12:30 & 13:30 - 15:00', rr: '>= 0.8R to 1.5R' },
-                  { key: 'continuationBreakout', name: '3. Continuation Breakout (CONTINUATION_BREAKOUT)', desc: 'Priority 3 | Trades bullish continuation after level breakout and 1-4 candle consolidation pause.', win: '10:00 - 12:30 & 13:30 - 15:00', rr: '>= 0.8R to 1.5R' },
-                  { key: 'openingTrap', name: '4. Opening Breakout Trap (OPENING_TRAP)', desc: 'Priority 4 | Catches early fake breaks and reversals at ORH / ORL upon retest confirmation.', win: '09:30 - 10:30 IST', rr: '>= 0.8R to 1.0R' },
-                  { key: 'oiWallRejection', name: '5. OI Wall Rejection (OI_WALL_REJECTION)', desc: 'Priority 5 | Rejection trades when 1.5x dominant OI walls reject spot price at least 2 times.', win: 'Any (Post Wall Rejection)', rr: '>= 0.8R to 1.2R' },
-                  { key: 'technicalConfluence', name: '6. Technical Confluence (TECHNICAL_CONFLUENCE)', desc: 'Priority 1 | Trading signals generated by technical indicators (RSI, MACD, EMA, Bollinger Bands, SuperTrend) voting consensus.', win: 'Any (Trend Direction)', rr: '>= 1.0R' },
-                  { key: 'comboFiltered', name: '7. T3 + AlphaTrend: Filtered Version (FILTERED)', desc: 'PDF Strategy | Filtered combination of T3 Striped Ribbon and AlphaTrend with Upstox Volume, Candle Conviction, Spread Expansion & 50 EMA. Special Conditions: One Trade at a Time & Max Trade Duration (30m, 1h, 2h).', win: 'All Timeframes (5m, 1m, 3m, 15m)', rr: '1.5R to 2.5R' },
-                  { key: 'comboUnfiltered', name: '8. T3 + AlphaTrend: Unfiltered Version (UNFILTERED)', desc: 'PDF Strategy | Unfiltered combination of T3 Striped Ribbon and AlphaTrend with immediate confluence triggering. Special Conditions: One Trade at a Time & Max Trade Duration (30m, 1h, 2h).', win: 'All Timeframes (5m, 1m, 3m, 15m)', rr: '1.5R to 2.5R' }
-                ].map(({ key, name, desc, win, rr }) => {
+                  { 
+                    key: 'samSignals', 
+                    name: '1. BEST SAM SIGNALS - Zero Repaint (SAM_SIGNALS)', 
+                    desc: 'Pine Script by dy26102001. Crossover of fast SMA(1)-SMA(34) vs WMA(5) with Intraday VWAP alignment. Strict Zero-Repaint entry on completed close of Immediate Adverse Bar + 1 with locked 20pt Stop-Loss and +60pt Take-Profit.', 
+                    win: '1m / 3m / 5m Intraday', 
+                    rr: '3.0R (20pt SL / 60pt TP)',
+                    rule: 'Zero Repaint Bar+1 Confirmation'
+                  },
+                  { 
+                    key: 'comboFiltered', 
+                    name: '2. T3 + AlphaTrend Combo: Filtered Version (FILTERED)', 
+                    desc: 'Filtered confluence of T3 Striped Ribbon and AlphaTrend with Upstox Volume >= 0.85x SMA, candle conviction, ribbon spread expansion (>0.12x ATR), and 50 EMA trend filter. One trade at a time limit.', 
+                    win: '5m / 15m (All Timeframes)', 
+                    rr: '1.5R to 2.5R',
+                    rule: 'Volume + Ribbon Expansion + 50 EMA'
+                  },
+                  { 
+                    key: 'comboUnfiltered', 
+                    name: '3. T3 + AlphaTrend Combo: Unfiltered Version (UNFILTERED)', 
+                    desc: 'Immediate confluence entry whenever AlphaTrend signal and T3 Striped Ribbon direction align simultaneously without volume/candle filters. Enforces one trade at a time and maximum duration exits.', 
+                    win: '5m / 15m (All Timeframes)', 
+                    rr: '1.5R to 2.5R',
+                    rule: 'Immediate Confluence Entry'
+                  },
+                  { 
+                    key: 'alphaTrend', 
+                    name: '4. AlphaTrend Indicator Strategy [Kıvanç Özbilgiç]', 
+                    desc: 'Momentum and volatility trend follower using Upstox Volume MFI (Money Flow Index) or RSI with dynamic ATR trailing support/resistance bands and dual profit targets.', 
+                    win: '5m Primary Timeframe', 
+                    rr: '1.6R to 2.5R',
+                    rule: 'MFI Upstox Volume Trailing Bands'
+                  },
+                  { 
+                    key: 't3Striped', 
+                    name: '5. T3 Striped Ribbon [Loxx]', 
+                    desc: 'Multi-layered Tillson T3 moving average ribbon with hot-factor smoothing (hot=0.55, period=21). Detects fast trend shifts, compression squeezes, and ribbon expansion.', 
+                    win: '5m Primary Timeframe', 
+                    rr: '1.4R to 2.2R',
+                    rule: 'Tillson T3 Multi-Level Ribbon'
+                  },
+                  { 
+                    key: 'macdAdaptiveSupertrend', 
+                    name: '6. NIFTY MACD Adaptive SuperTrend v3.1', 
+                    desc: 'Adaptive ATR Multiplier (1.5x - 3.5x) dynamically calibrated via Normalized ADX volatility + MACD Momentum & Zero-Lag DEMA Confluence with volatility-based targets.', 
+                    win: '5m / 15m Timeframe', 
+                    rr: '1.5R to 2.5R',
+                    rule: 'Adaptive ADX Multiplier + Zero-Lag DEMA'
+                  }
+                ].map(({ key, name, desc, win, rr, rule }) => {
                   const config = settings.strategies?.[key] || { enabled: true, lotSize: 1 };
 
                   return (
@@ -904,9 +740,9 @@ export default function App() {
                         <button 
                           onClick={() => updateStrategyConfig(key, 'enabled', !config.enabled)}
                           className={cn(
-                            "absolute top-6 right-6 px-3 py-1 rounded text-xs font-bold uppercase border transition-colors",
+                            "absolute top-6 right-6 px-3 py-1 rounded text-xs font-bold uppercase border transition-colors cursor-pointer",
                             config.enabled 
-                              ? "bg-brand-green/20 text-brand-green border-brand-green/30 hover:bg-brand-green/30"
+                              ? "bg-brand-green/20 text-brand-green border-brand-green/30 hover:bg-brand-green/30" 
                               : "bg-transparent text-gray-500 border-[#1F2937] hover:text-gray-300"
                           )}
                         >
@@ -916,7 +752,7 @@ export default function App() {
 
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
                         <div>
-                          <label className="block text-[10px] font-mono text-gray-500 uppercase mb-2">Lot Size (Count)</label>
+                          <label className="block text-[10px] font-mono text-gray-500 uppercase mb-2">Lot Size (Count @ 65 Qty/Lot)</label>
                           <input 
                             type="number" 
                             min="1"
@@ -926,26 +762,26 @@ export default function App() {
                           />
                         </div>
                         <div>
-                          <label className="block text-[10px] font-mono text-gray-500 uppercase mb-2">Strike Selection Strategy</label>
+                          <label className="block text-[10px] font-mono text-gray-500 uppercase mb-2">Option Contract Selection</label>
                           <div className="w-full bg-[#0A0F1C] border border-[#1F2937] rounded px-4 py-2 text-brand-blue font-mono text-xs flex items-center justify-between">
-                            <span className="font-bold">ATM or 1-step ITM</span>
-                            <span className="text-[10px] text-gray-400 bg-brand-blue/10 px-2 py-0.5 rounded">Prompt Rule</span>
+                            <span className="font-bold">ATM (At-The-Money) Option</span>
+                            <span className="text-[10px] text-gray-400 bg-brand-blue/10 px-2 py-0.5 rounded">65 Qty/Lot</span>
                           </div>
                         </div>
                       </div>
 
                       <div className="bg-[#0A0F1C] border border-[#1F2937] rounded p-4 space-y-2 text-[10px] font-mono">
                         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#1F2937] pb-2">
-                          <div><span className="text-gray-500 mr-2 uppercase font-bold">Stop-Loss System:</span> <span className="text-red-400 font-bold">Dual Synchronized (Spot Level Invalidation & 0.35R - 0.5R Premium Safety Net)</span></div>
-                          <span className="text-gray-400 bg-red-500/10 border border-red-500/20 px-2 py-0.5 rounded text-[9px]">Strict Prompt Rule</span>
+                          <div><span className="text-gray-500 mr-2 uppercase font-bold">Execution Engine:</span> <span className="text-brand-green font-bold">{rule}</span></div>
+                          <span className="text-gray-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded text-[9px]">Zero Repaint</span>
                         </div>
                         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#1F2937] pb-2">
-                          <div><span className="text-gray-500 mr-2 uppercase font-bold">Target Mechanics:</span> <span className="text-brand-green font-bold">Target 1 = Nearby OI Wall | Target 2 = Major OI Wall (Min 1.5R)</span></div>
-                          <span className="text-gray-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded text-[9px]">Prompt Structure</span>
+                          <div><span className="text-gray-500 mr-2 uppercase font-bold">Target Mechanics:</span> <span className="text-brand-green font-bold">{rr}</span></div>
+                          <span className="text-gray-400 bg-brand-blue/10 border border-brand-blue/20 px-2 py-0.5 rounded text-[9px]">Option Premium P&L</span>
                         </div>
                         <div className="flex flex-wrap items-center justify-between gap-2 text-gray-400 pt-1">
-                          <div><span className="text-gray-500 mr-2 uppercase font-bold">Timeframes:</span> <span className="text-white font-bold">1-Min Live Option-Chain Updates (Completed 1m)</span></div>
-                          <div><span className="text-gray-500 mr-2 uppercase font-bold">Optimal Window:</span> <span className="text-brand-blue font-bold">{win}</span></div>
+                          <div><span className="text-gray-500 mr-2 uppercase font-bold">Timeframe:</span> <span className="text-white font-bold">{win}</span></div>
+                          <div><span className="text-gray-500 mr-2 uppercase font-bold">Contract Size:</span> <span className="text-amber-400 font-bold">65 Qty per Lot</span></div>
                         </div>
                       </div>
                     </div>
@@ -953,58 +789,43 @@ export default function App() {
                 })}
               </div>
 
-              {/* 18-Rule Quantitative Trade Audit Checklist & Order Pipeline */}
+              {/* Chart Strategies & Option Chain Integration Guide */}
               <div className="bg-[#111827] border border-[#1F2937] rounded-lg p-6 mt-8">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[#1F2937] pb-4 mb-6">
                   <div>
                     <h3 className="text-lg font-bold text-white flex items-center gap-2">
                       <span className="w-2.5 h-2.5 rounded-full bg-brand-green animate-pulse"></span>
-                      18-Rule Quantitative Trade Audit Checklist
+                      Chart Strategies &amp; Option Chain Integration
                     </h3>
                     <p className="text-xs text-gray-400 mt-1">
-                      Strict internal execution pipeline for fake-signal filtering & precision entry validation
+                      Real-time chart execution connected with recorded Nifty 50 Option Chain snapshots
                     </p>
                   </div>
                   <div className="flex items-center gap-2 bg-[#0A0F1C] border border-brand-green/30 px-3 py-1.5 rounded-md text-xs font-mono text-brand-green">
-                    <span className="font-bold">Execution Order:</span>
-                    <span className="text-gray-300">Time → Levels → Retest → Premium → OI → Room → R:R → Chop → Decision</span>
+                    <span className="font-bold">Lot Specification:</span>
+                    <span className="text-gray-300">65 Qty / Lot | Delta ~ 0.50 ATM | Option Chain LTP</span>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 font-mono text-xs">
-                  {[
-                    { id: 1, title: 'Capture session state', desc: 'Store session H/L, ORH/ORL, PDH/PDL, CE/PE walls, last broken/failed level, failedLevelsToday' },
-                    { id: 2, title: 'Use only completed candles', desc: 'Evaluate signals ONLY after 1m candle closes. Ignore incomplete live updates' },
-                    { id: 3, title: 'Apply time filter first', desc: 'Hard block 09:15-09:30 AM IST opening noise. Prefer 09:30-14:45. Strict block post 15:15 IST' },
-                    { id: 4, title: 'Detect meaningful levels', desc: 'Accept ORH/ORL, PDH/PDL, session H/L, dominant OI walls only. Ignore weak levels' },
-                    { id: 5, title: 'Validate wall strength', desc: 'Mark wall only if OI >= 1.5x surrounding strikes AND stable (no rapid unwinding)' },
-                    { id: 6, title: 'Require clear break/rejection', desc: 'Price must clearly break level or reject wall. Sideways/mixed action = NO_TRADE' },
-                    { id: 7, title: 'Require confirmation', desc: 'No entry on 1st touch or 1st break candle. Wait for retest or continuation pause' },
-                    { id: 8, title: 'Check retest quality', desc: 'Retest must hold in 3-5 bar window. Reject if level reclaimed quickly or shallow' },
-                    { id: 9, title: 'Confirm premium behavior', desc: 'CE premium must rise for CALLs, PE for PUTs. Stalled or weakening premium = REJECT' },
-                    { id: 10, title: 'Confirm OI direction', desc: 'Bullish requires PE support/CE unwind; Bearish requires CE wall/PE unwind' },
-                    { id: 11, title: 'Check room to target', desc: 'Ensure sufficient distance to next wall/swing level (Target 1 >= 0.8R)' },
-                    { id: 12, title: 'Enforce reward-to-risk rules', desc: 'Reject if T1 < 0.8R. Hard reject if Target 2 < 1.50R minimum threshold' },
-                    { id: 13, title: 'Block chop zones', desc: 'Reject trades when price is trapped between walls (< 30 pts) or repeated failed levels' },
-                    { id: 14, title: 'Prevent re-entry in same zone', desc: 'If level failed once today, block re-entry at same zone without fresh structure' },
-                    { id: 15, title: 'Reject overextended moves', desc: 'Continuation trades only if move < 1.5x impulse candle range from breakout' },
-                    { id: 16, title: 'Enforce candle-direction sanity', desc: 'Confirmation candle close MUST support trade direction (Green for CALL, Red for PUT)' },
-                    { id: 17, title: 'One trade per structure', desc: 'Allow strictly 1 primary trade per setup structure. Reset only on new structure' },
-                    { id: 18, title: 'Output a strict decision', desc: 'Return exactly one of: BUY_CALL, BUY_PUT, or NO_TRADE. If any filter fails = NO_TRADE' }
-                  ].map((rule) => (
-                    <div key={rule.id} className="bg-[#0A0F1C] border border-[#1F2937] rounded-md p-3 flex flex-col justify-between hover:border-brand-green/40 transition-colors">
-                      <div>
-                        <div className="flex items-center justify-between mb-1.5">
-                          <span className="text-[11px] font-bold text-brand-green uppercase">Rule #{rule.id}</span>
-                          <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded font-sans font-bold">
-                            ENFORCED
-                          </span>
-                        </div>
-                        <h4 className="text-xs font-bold text-white mb-1">{rule.title}</h4>
-                        <p className="text-[11px] text-gray-400 leading-normal font-sans">{rule.desc}</p>
-                      </div>
-                    </div>
-                  ))}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 font-mono text-xs">
+                  <div className="bg-[#0A0F1C] border border-[#1F2937] rounded-md p-4 space-y-2">
+                    <div className="text-brand-green font-bold uppercase text-[11px]">1. Option Premium P&L Tracking</div>
+                    <p className="text-gray-400 leading-relaxed font-sans text-xs">
+                      Backtest and live trades fetch ATM CE/PE premium from recorded option chain data at trade entry and exit timestamps, computing exact Premium Points PnL and 1 Lot Net (65 Qty).
+                    </p>
+                  </div>
+                  <div className="bg-[#0A0F1C] border border-[#1F2937] rounded-md p-4 space-y-2">
+                    <div className="text-brand-blue font-bold uppercase text-[11px]">2. Zero Repaint Candle Execution</div>
+                    <p className="text-gray-400 leading-relaxed font-sans text-xs">
+                      All 6 chart strategies (SAM Signals, T3 Ribbon, AlphaTrend, Filtered/Unfiltered Combo, MACD Adaptive SuperTrend) evaluate strictly upon completed candle closes (Bar+1) with zero repainting.
+                    </p>
+                  </div>
+                  <div className="bg-[#0A0F1C] border border-[#1F2937] rounded-md p-4 space-y-2">
+                    <div className="text-amber-400 font-bold uppercase text-[11px]">3. Live Option Chain &amp; Replay</div>
+                    <p className="text-gray-400 leading-relaxed font-sans text-xs">
+                      The Live Option Chain and Option Chain Replay tabs remain fully active with live PCR, OI walls, Max Pain, delta Greeks, and historical 1-minute playback.
+                    </p>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1051,17 +872,14 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
   const [chainMode, setChainMode] = useState<'FOCUSED' | 'FULL'>('FULL');
   const [fetchError, setFetchError] = useState<string | null>(null);
 
-  const isGold = instrument.includes('GOLD');
   const isBankNifty = instrument.includes('Bank');
   const realSpotFromData = data && data.length > 0 && data[0]?.underlying_spot_price ? Number(data[0].underlying_spot_price) : null;
   const spotPrice = realSpotFromData !== null
     ? realSpotFromData
-    : (isGold ? (state?.gold?.lastPrice || 154263) : (isBankNifty ? (state?.bankNifty?.lastPrice || 52000) : (state?.nifty50?.lastPrice || 24125.10)));
-  const spotChange = isGold
-    ? (state?.gold?.change || 0)
-    : (isBankNifty ? (state?.bankNifty?.change || 0) : (state?.nifty50?.change || 0));
+    : (isBankNifty ? (state?.bankNifty?.lastPrice || 52000) : (state?.nifty50?.lastPrice || 24125.10));
+  const spotChange = isBankNifty ? (state?.bankNifty?.change || 0) : (state?.nifty50?.change || 0);
 
-  const step = isGold ? 100 : (isBankNifty ? 100 : 50);
+  const step = isBankNifty ? 100 : 50;
   const atmStrike = Math.round(spotPrice / step) * step;
 
   const tableContainerRef = useRef<HTMLDivElement>(null);
@@ -1069,8 +887,31 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
   const hasInitiallyCentered = useRef(false);
 
   // Dynamic expiries from backend / Upstox
-  const [expirys, setExpirys] = useState<string[]>([]);
-  const [expiry, setExpiry] = useState<string>('CURRENT');
+  const [expirys, setExpirys] = useState<string[]>(() => {
+    const list: string[] = [];
+    const nowIST = new Date(Date.now() + 5.5 * 3600 * 1000);
+    const todayStr = nowIST.toISOString().split('T')[0];
+    let added = 0;
+    for (let offset = 0; offset < 60 && added < 8; offset++) {
+      const d = new Date(nowIST.getTime() + offset * 86400000);
+      if (d.getUTCDay() === 4 && d.toISOString().split('T')[0] >= todayStr) {
+        list.push(d.toISOString().split('T')[0]);
+        added++;
+      }
+    }
+    return list;
+  });
+  const [expiry, setExpiry] = useState<string>(() => {
+    const nowIST = new Date(Date.now() + 5.5 * 3600 * 1000);
+    const todayStr = nowIST.toISOString().split('T')[0];
+    for (let offset = 0; offset < 60; offset++) {
+      const d = new Date(nowIST.getTime() + offset * 86400000);
+      if (d.getUTCDay() === 4 && d.toISOString().split('T')[0] >= todayStr) {
+        return d.toISOString().split('T')[0];
+      }
+    }
+    return 'CURRENT';
+  });
 
   // View style & Indian unit mode
   const [viewStyle, setViewStyle] = useState<'UPSTOX' | 'AOC'>('UPSTOX');
@@ -1094,6 +935,7 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
 
   // Fetch Expiries when instrument changes
   useEffect(() => {
+    let isCancelled = false;
     const fetchExpiries = async () => {
       try {
         const res = await fetch(`/api/expirys?instrument=${encodeURIComponent(instrument)}`);
@@ -1101,9 +943,9 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
         const contentType = res.headers.get("content-type");
         if (contentType && contentType.indexOf("application/json") !== -1) {
           const json = await res.json();
-          if (json.expirys && json.expirys.length > 0) {
+          if (!isCancelled && json.expirys && Array.isArray(json.expirys) && json.expirys.length > 0) {
             setExpirys(json.expirys);
-            setExpiry(json.expirys[0]);
+            setExpiry(prev => (json.expirys.includes(prev) ? prev : json.expirys[0]));
           }
         }
       } catch (e) {
@@ -1111,6 +953,9 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
       }
     };
     fetchExpiries();
+    return () => {
+      isCancelled = true;
+    };
   }, [instrument]);
 
   // Auto poll every 1.5s for real-time Upstox option chain updates
@@ -1584,7 +1429,7 @@ function OptionChainView({ settings, state }: { settings: any, state: any }) {
 
           <select value={instrument} onChange={e => setInstrument(e.target.value)} className="px-2.5 py-1 bg-[#111827] border border-[#1F2937] rounded text-xs font-bold text-white outline-none cursor-pointer">
             <option value="NSE_INDEX|Nifty 50">🇮🇳 NIFTY 50 (NSE INDEX)</option>
-            <option value="MCX_GOLD">🟡 MCX GOLD (COMMODITY)</option>
+            <option value="NSE_INDEX|Nifty Bank">🇮🇳 BANK NIFTY (NSE INDEX)</option>
           </select>
 
           <select value={expiry} onChange={e => setExpiry(e.target.value)} className="px-2.5 py-1 bg-[#111827] border border-[#1F2937] rounded text-xs font-bold text-white outline-none cursor-pointer">

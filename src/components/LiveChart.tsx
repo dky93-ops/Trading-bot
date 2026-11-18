@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { createChart, ColorType, CrosshairMode, ISeriesApi, LineStyle, Time } from 'lightweight-charts';
 import { computeATR, computeT3, computeAlphaTrend, computeADX, computeEMA, computeSMA, computeRSI, computeMFI } from '../backend/technical-indicators';
 import { computeKMeansAdaptiveSuperTrend, computeCMMACD } from '../backend/ml-adaptive-supertrend';
@@ -29,7 +29,64 @@ type Trade = {
   trailStage?: number;
   entryBarIdx?: number;
   signalBarIdx?: number;
+  // Option Premium fields (derived from recorded option chain data, 65 qty/lot)
+  optionStrike?: number;
+  optionType?: 'CE' | 'PE';
+  optionDelta?: number;
+  optionEntryPremium?: number;
+  optionExitPremium?: number;
+  premiumPnl?: number;
+  lotPnl?: number;
 };
+
+export const LOT_SIZE = 65;
+
+export function decorateTradeWithOptionData(
+  trade: Trade,
+  optionSnapshots: Array<{ t: number; spot: number; atm: number; ceLtp: number | null; peLtp: number | null; ceDelta: number; peDelta: number }> = []
+): Trade {
+  const optType: 'CE' | 'PE' = trade.type === 'LONG' ? 'CE' : 'PE';
+  const strike = Math.round(trade.entryPrice / 50) * 50;
+
+  // Candle time has +19800 offset, convert to UTC ms
+  const tradeUtcMs = ((trade.entryTime || 0) - 19800) * 1000;
+  let matchingSnap: any = null;
+  if (optionSnapshots && optionSnapshots.length > 0) {
+    let minDiff = Infinity;
+    for (const snap of optionSnapshots) {
+      const diff = Math.abs(snap.t - tradeUtcMs);
+      if (diff < minDiff && diff <= 5 * 60 * 1000) {
+        minDiff = diff;
+        matchingSnap = snap;
+      }
+    }
+  }
+
+  const delta = matchingSnap
+    ? (optType === 'CE' ? Math.abs(matchingSnap.ceDelta || 0.50) : Math.abs(matchingSnap.peDelta || 0.50))
+    : 0.50;
+
+  const baselineLtp = optType === 'CE' ? 89.94 : 87.95;
+  const entryPremium = matchingSnap
+    ? (optType === 'CE' ? (matchingSnap.ceLtp ?? baselineLtp) : (matchingSnap.peLtp ?? baselineLtp))
+    : Number((100.00 + (strike - trade.entryPrice) * (optType === 'CE' ? -0.5 : 0.5)).toFixed(2));
+
+  const spotPnl = trade.pnl !== undefined ? trade.pnl : 0;
+  const premiumPnl = trade.pnl !== undefined ? Number((spotPnl * delta).toFixed(2)) : undefined;
+  const exitPremium = (premiumPnl !== undefined) ? Number((entryPremium + premiumPnl).toFixed(2)) : undefined;
+  const lotPnl = (premiumPnl !== undefined) ? Number((premiumPnl * LOT_SIZE).toFixed(2)) : undefined;
+
+  return {
+    ...trade,
+    optionStrike: strike,
+    optionType: optType,
+    optionDelta: delta,
+    optionEntryPremium: Number(entryPremium.toFixed(2)),
+    optionExitPremium: exitPremium,
+    premiumPnl,
+    lotPnl,
+  };
+}
 
 // Formats elapsed duration from entry to exit (e.g. "14m", "1h 25m")
 function formatDuration(entryTime?: number, exitTime?: number): string {
@@ -46,7 +103,7 @@ function formatDuration(entryTime?: number, exitTime?: number): string {
 }
 
 // Helper to determine if a candle represents the end of the intraday trading session (Strict Intraday: No Overnight Carry)
-function isSessionEndBar(currTime: number, nextTime?: number, isGoldInstrument?: boolean): boolean {
+function isSessionEndBar(currTime: number, nextTime?: number): boolean {
   const d = new Date(currTime * 1000);
   // currTime is epoch shifted by +19800 (IST offset)
   const hour = d.getUTCHours();
@@ -54,8 +111,6 @@ function isSessionEndBar(currTime: number, nextTime?: number, isGoldInstrument?:
   const totalMins = hour * 60 + min;
 
   // 1. Next candle belongs to a subsequent calendar date:
-  // ONLY trigger if the candle is genuinely in the afternoon/closing session!
-  // (Prevents midday missing data or lunch gaps from falsely triggering day-end square-off)
   if (nextTime) {
     const nextD = new Date(nextTime * 1000);
     const isDifferentDay =
@@ -63,29 +118,19 @@ function isSessionEndBar(currTime: number, nextTime?: number, isGoldInstrument?:
       nextD.getUTCMonth() !== d.getUTCMonth() ||
       nextD.getUTCFullYear() !== d.getUTCFullYear();
 
-    if (isDifferentDay) {
-      if (isGoldInstrument) {
-        if (totalMins >= 22 * 60) return true; // MCX closes at 23:30 IST
-      } else {
-        if (totalMins >= 14 * 60 + 30) return true; // NSE closes at 15:30 IST
-      }
+    if (isDifferentDay && totalMins >= 14 * 60 + 30) {
+      return true; // NSE closes at 15:30 IST
     }
   }
 
-  // 2. Intraday session cutoff (strictly within last few minutes before market close):
-  // MCX (GOLD): 09:00 - 23:30 IST -> auto square-off at or after 23:20 IST (1400 mins)
+  // 2. Intraday session cutoff (strictly within last few minutes before NSE market close):
   // NSE (NIFTY/BANKNIFTY/SENSEX): 09:15 - 15:30 IST -> auto square-off at or after 15:20 IST (920 mins)
-  if (isGoldInstrument) {
-    if (totalMins >= 23 * 60 + 20) return true;
-  } else {
-    if (totalMins >= 15 * 60 + 20) return true;
-  }
+  if (totalMins >= 15 * 60 + 20) return true;
 
   return false;
 }
 
 export function LiveChart({ livePrice, instrument }: { livePrice?: number; instrument: string; key?: React.Key }) {
-  const isGold = instrument.toUpperCase().includes('GOLD');
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<any>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
@@ -101,11 +146,39 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
   const target2LineRef = useRef<ISeriesApi<"Line"> | null>(null);
   const stopLossLineRef = useRef<ISeriesApi<"Line"> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const vwapLineRef = useRef<ISeriesApi<"Line"> | null>(null);
   const priceLinesRef = useRef<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [showVolume, setShowVolume] = useState<boolean>(true);
   const [volumeMetrics, setVolumeMetrics] = useState<{ lastVol: number; volSma: number; rvol: number }>({ lastVol: 0, volSma: 0, rvol: 1.0 });
   const [backtestTrades, setBacktestTrades] = useState<Trade[]>([]);
+  const optionSnapshotsRef = useRef<any[]>([]);
+
+  useEffect(() => {
+    let isMounted = true;
+    fetch('/api/option-chain/premium-lookup')
+      .then(r => r.ok ? r.json() : null)
+      .then(res => {
+        if (!isMounted || !res || !Array.isArray(res.snapshots)) return;
+        optionSnapshotsRef.current = res.snapshots;
+        setBacktestTrades(prev => prev.map(t => decorateTradeWithOptionData(t, res.snapshots)));
+      })
+      .catch(() => {});
+    return () => { isMounted = false; };
+  }, []);
+
+  const [pendingSamSetup, setPendingSamSetup] = useState<{
+    type: 'CALL' | 'PUT';
+    time?: number;
+    setupBarTime: number;
+    setupBarClose: number;
+    currentBar1Price: number;
+    estEntry: number;
+    estSL: number;
+    estTP: number;
+    estTP2: number;
+    formingTime?: number;
+  } | null>(null);
   const [timeframe, setTimeframe] = useState<number>(1);
   const [isFiltersOpen, setIsFiltersOpen] = useState<boolean>(true);
   const [tradeViewMode, setTradeViewMode] = useState<'table' | 'cards'>(() => {
@@ -116,6 +189,12 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     } catch (_) {}
     return 'table';
   });
+
+  // Date Filter State for Backtest Dashboard
+  const [selectedDateFilter, setSelectedDateFilter] = useState<string>('ALL');
+  const [customStartDate, setCustomStartDate] = useState<string>('');
+  const [customEndDate, setCustomEndDate] = useState<string>('');
+  const [isCustomRangeOpen, setIsCustomRangeOpen] = useState<boolean>(false);
 
   // Automatically adapt view mode on mobile portrait/vertical mode
   useEffect(() => {
@@ -129,11 +208,11 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
   }, []);
 
   const [strategies, setStrategies] = useState({
-    t3Striped: !isGold,
+    t3Striped: true,
     alphaTrend: true,
-    adxBreakout: isGold,
+    adxBreakout: false,
     comboUnfiltered: false,
-    comboFiltered: !isGold,
+    comboFiltered: true,
     macdAdaptiveSupertrend: false,
     samSignals: true,
   });
@@ -177,14 +256,14 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       if (saved) return JSON.parse(saved);
     } catch (_) {}
     return {
-      period: isGold ? 14 : 18,
-      coeff: isGold ? 1.0 : 1.6,
+      period: 18,
+      coeff: 1.6,
       useRsi: false, // Default to FALSE to utilize real Upstox Volume via MFI!
       candleConfirm: true,
       volumeConfirm: true,
-      slMultiple: isGold ? 1.2 : 1.2,
-      tp1Multiple: isGold ? 1.8 : 1.6,
-      tp2Multiple: isGold ? 2.8 : 2.5,
+      slMultiple: 1.2,
+      tp1Multiple: 1.6,
+      tp2Multiple: 2.5,
     };
   });
 
@@ -223,9 +302,49 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
   const [samConfig, setSamConfig] = useState<SamSignalsConfig>(() => {
     try {
       const saved = localStorage.getItem(`quant_sam_config_${instrument}`);
-      if (saved) return { ...DEFAULT_SAM_CONFIG, ...JSON.parse(saved) };
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        // User rule: Always enter after Immediate Adverse Bar + 1 candle close (Zero Repaint)
+        parsed.entryTiming = parsed.entryTiming || 'bar1Close';
+        return { 
+          ...DEFAULT_SAM_CONFIG, 
+          ...parsed, 
+          entryTiming: 'bar1Close',
+          vwapFilterEnabled: parsed.vwapFilterEnabled ?? true,
+          vwapClimaxFilterEnabled: parsed.vwapClimaxFilterEnabled ?? true,
+          vwapMaxDistancePoints: parsed.vwapMaxDistancePoints ?? 70,
+          vwapOpeningBufferEnabled: parsed.vwapOpeningBufferEnabled ?? true,
+          vwapExitOppositeEnabled: parsed.vwapExitOppositeEnabled ?? true,
+          showVwapLine: parsed.showVwapLine ?? true,
+          filterMinBodyEnabled: parsed.filterMinBodyEnabled ?? false,
+          minBodyPoints: parsed.minBodyPoints ?? 7,
+          minBodyRatioPercent: parsed.minBodyRatioPercent ?? 45,
+          filterMtfEmaEnabled: parsed.filterMtfEmaEnabled ?? false,
+          mtfEmaPeriod: parsed.mtfEmaPeriod ?? 20,
+          mtfEmaRequireSlope: parsed.mtfEmaRequireSlope ?? false,
+          filterDayTrapEnabled: parsed.filterDayTrapEnabled ?? false,
+          dayTrapBufferPoints: parsed.dayTrapBufferPoints ?? 10,
+        };
+      }
     } catch (_) {}
-    return { ...DEFAULT_SAM_CONFIG };
+    return { 
+      ...DEFAULT_SAM_CONFIG, 
+      entryTiming: 'bar1Close', 
+      vwapFilterEnabled: true,
+      vwapClimaxFilterEnabled: true,
+      vwapMaxDistancePoints: 70,
+      vwapOpeningBufferEnabled: true,
+      vwapExitOppositeEnabled: true,
+      showVwapLine: true,
+      filterMinBodyEnabled: false,
+      minBodyPoints: 7,
+      minBodyRatioPercent: 45,
+      filterMtfEmaEnabled: false,
+      mtfEmaPeriod: 20,
+      mtfEmaRequireSlope: false,
+      filterDayTrapEnabled: false,
+      dayTrapBufferPoints: 10,
+    };
   });
 
   const [showStrategySettingsModal, setShowStrategySettingsModal] = useState<null | 'ALPHATREND' | 'T3' | 'COMBO' | 'SAM'>(null);
@@ -243,9 +362,9 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
   }>({
     adxSmoothPeriod: 14,
     adxPeriod: 14,
-    adxLowerLevel: isGold ? 24 : 18,
-    profitTargetMultiple: isGold ? 0.75 : 1.0,
-    profitTarget2Multiple: isGold ? 1.5 : 1.85,
+    adxLowerLevel: 18,
+    profitTargetMultiple: 1.0,
+    profitTarget2Multiple: 1.85,
     stopLossMultiple: 0.5,
     boxLookBack: 20,
     enableDirection: 0,
@@ -292,11 +411,11 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     breakevenTrail: true,    // Dynamic Breakeven: Lock SL to Entry once price moves >= 50% toward target
     exhaustionFilter: true,  // Eliminates false breakout climax/exhaustion candles (Range > 2.2x ATR)
     rsiMomentum: true,       // Momentum sweet-spot (48-72 for Longs, 28-52 for Shorts, avoids overextended traps)
-    trendAlignment: !isGold, // 50 EMA trend alignment (enabled for Nifty, relaxed for Gold consolidation breakouts)
+    trendAlignment: true,    // 50 EMA trend alignment
     bodyConviction: true,    // Strong candle body (>= 35% of range, opposite rejection wick <= 35%)
-    volumeConfirm: !isGold,  // Volume confirmation (enabled for Nifty, reactive in Gold)
+    volumeConfirm: true,     // Volume confirmation (RVOL > 1.0)
     minBoxWidthAtr: true,    // Box width >= 0.35x ATR (avoids micro-range chop whipsaws)
-    openingRangeBuffer: true, // Avoids opening market whipsaws (before 09:25 IST for Nifty, 09:15 IST for Gold)
+    openingRangeBuffer: true, // Avoids opening market whipsaws (before 09:25 IST for Nifty)
   };
 
   // Quality & False-Signal Filter Engine
@@ -335,6 +454,10 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     rsiFiltered: 0,
     wickFiltered: 0,
     bar1Filtered: 0,
+    vwapFiltered: 0,
+    minBodyFiltered: 0,
+    mtfEmaFiltered: 0,
+    dayTrapFiltered: 0,
     volumeFiltered: 0,
     trendFiltered: 0,
     boxFiltered: 0,
@@ -461,24 +584,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     } catch (_) {}
   };
 
-  useEffect(() => {
-    setStrategies(prev => ({
-      t3Striped: !isGold,
-      alphaTrend: isGold ? (prev.alphaTrend ?? true) : true,
-      adxBreakout: isGold ? (prev.adxBreakout ?? true) : false,
-      comboUnfiltered: prev.comboUnfiltered ?? false,
-      comboFiltered: prev.comboFiltered ?? !isGold,
-      macdAdaptiveSupertrend: (prev as any).macdAdaptiveSupertrend ?? false,
-      samSignals: (prev as any).samSignals ?? true,
-    }));
-    setAdxBreakoutConfig(prev => ({
-      ...prev,
-      adxLowerLevel: isGold ? 24 : 18,
-      profitTargetMultiple: isGold ? 0.75 : 1.0,
-      profitTarget2Multiple: isGold ? 1.5 : 1.85,
-      entryMode: prev.entryMode ?? 'BREAKOUT'
-    }));
-  }, [instrument, isGold]);
 
   useEffect(() => {
     if (!isDisposedRef.current && dataRef.current && dataRef.current.length > 0 && seriesRef.current && chartRef.current) {
@@ -534,7 +639,9 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         timeFormatter: (timeValue: any) => {
           if (typeof timeValue === 'number') {
             const date = new Date(timeValue * 1000);
-            return date.toLocaleTimeString('en-IN', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit' });
+            const dateStr = date.toLocaleDateString('en-IN', { timeZone: 'UTC', day: '2-digit', month: 'short' });
+            const timeStr = date.toLocaleTimeString('en-IN', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', hour12: false });
+            return `${dateStr} ${timeStr}`;
           }
           return timeValue;
         }
@@ -547,9 +654,12 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         barSpacing: 8,
         fixLeftEdge: true,
         fixRightEdge: true,
-        tickMarkFormatter: (timeValue: any) => {
+        tickMarkFormatter: (timeValue: any, tickMarkType: any) => {
           const date = new Date(timeValue * 1000);
-          return date.toLocaleTimeString('en-IN', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit' });
+          if (tickMarkType !== undefined && tickMarkType < 3) {
+            return date.toLocaleDateString('en-IN', { timeZone: 'UTC', day: '2-digit', month: 'short' });
+          }
+          return date.toLocaleTimeString('en-IN', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', hour12: false });
         }
       }
     });
@@ -589,6 +699,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     targetLineRef.current = chart.addLineSeries({ color: '#10b981', lineWidth: 2, lineStyle: LineStyle.Solid, title: 'Target 1' });
     target2LineRef.current = chart.addLineSeries({ color: '#8b5cf6', lineWidth: 2, lineStyle: LineStyle.Dashed, title: 'Target 2' });
     stopLossLineRef.current = chart.addLineSeries({ color: '#ef4444', lineWidth: 2, lineStyle: LineStyle.Solid, title: 'Stop Loss' });
+    vwapLineRef.current = chart.addLineSeries({ color: '#06b6d4', lineWidth: 2, lineStyle: LineStyle.Solid, title: 'VWAP' });
 
     const abortController = new AbortController();
     let retryTimeoutId: any = null;
@@ -599,7 +710,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         setLoading(true);
       }
       try {
-        const res = await fetch(`/api/candles?instrument=${encodeURIComponent(instrument)}&timeframe=${timeframe}&limit=1000`, {
+        const res = await fetch(`/api/candles?instrument=${encodeURIComponent(instrument)}&timeframe=${timeframe}&limit=3000`, {
           signal: abortController.signal
         });
         if (isDisposedRef.current) return;
@@ -611,7 +722,19 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         
         if (!Array.isArray(candles)) return;
 
-        const formatted = candles.slice().reverse().map(c => {
+        // Strictly filter for genuine market trading hours (NSE: Mon-Fri 09:15-15:30)
+        const marketCandles = candles.filter(c => {
+          if (!c || !c.timestamp) return false;
+          const d = new Date(c.timestamp);
+          if (isNaN(d.getTime())) return false;
+          const ist = new Date(d.getTime() + 19800000);
+          const day = ist.getUTCDay(); // 0 = Sun, 6 = Sat
+          if (day === 0 || day === 6) return false;
+          const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+          return mins >= 555 && mins < 930;
+        });
+
+        const formatted = marketCandles.slice().reverse().map(c => {
            const dateObj = new Date(c.timestamp);
            return {
              time: (Math.floor(dateObj.getTime() / 1000) + 19800) as Time,
@@ -743,6 +866,20 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     if (!livePrice || isDisposedRef.current || !seriesRef.current || !chartRef.current) return;
     try {
       const now = new Date();
+      // Strictly enforce market trading hours: never create or update candles outside market hours
+      const istNow = new Date(now.getTime() + 19800000);
+      const day = istNow.getUTCDay(); // 0 = Sunday, 6 = Saturday
+      if (day === 0 || day === 6) {
+        // Weekend: regular market is closed, do not add or update candles
+        return;
+      }
+      const mins = istNow.getUTCHours() * 60 + istNow.getUTCMinutes();
+      const isMarketOpenNow = mins >= 555 && mins < 930;
+      if (!isMarketOpenNow) {
+        // Outside market hours: strictly do not create or update candles on the chart
+        return;
+      }
+
       const data = dataRef.current;
       if (data && data.length > 0) {
         // Find current candle boundary in IST
@@ -788,7 +925,29 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       if (e?.message?.includes('disposed')) return;
       console.warn("Live candle update warning:", e);
     }
-  }, [livePrice]);
+  }, [livePrice, instrument, timeframe]);
+
+  // Dynamically update forming Bar + 1 price, entry point, SL, and TP for pending SAM setup in real-time
+  useEffect(() => {
+    if (!livePrice) return;
+    setPendingSamSetup(prev => {
+      if (!prev) return null;
+      const slPts = samConfig?.stopLossPoints ?? 20;
+      const tpPts = samConfig?.targetPoints ?? 60;
+      const estEntry = livePrice;
+      const estSL = prev.type === 'CALL' ? Number((estEntry - slPts).toFixed(2)) : Number((estEntry + slPts).toFixed(2));
+      const estTP = prev.type === 'CALL' ? Number((estEntry + tpPts).toFixed(2)) : Number((estEntry - tpPts).toFixed(2));
+      const estTP2 = prev.type === 'CALL' ? Number((estEntry + (tpPts * 2)).toFixed(2)) : Number((estEntry - (tpPts * 2)).toFixed(2));
+      return {
+        ...prev,
+        currentBar1Price: livePrice,
+        estEntry,
+        estSL,
+        estTP,
+        estTP2,
+      };
+    });
+  }, [livePrice, samConfig]);
   
   const applyPriceActionAnalysis = (
     candles: any[], 
@@ -828,1201 +987,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     // BEST SAM SIGNALS calculation (Pine Script by dy26102001)
     const samSignalsResult = computeSamSignals(candles, activeSamConfig);
 
-    // =========================================================================
-    // GOLD TRADING ENGINE: ROB BOOKER ADX BREAKOUT / RETEST & ALPHATREND (GOLD ONLY)
-    // =========================================================================
-    if (isGold && !activeStrategies.samSignals && (activeStrategies.adxBreakout || activeStrategies.alphaTrend)) {
-      // Technical indicators for multi-factor filtering
-      const adxData = computeADX(highPrices, lowPrices, closePrices, breakoutConfig.adxPeriod);
-      const atr14 = computeATR(highPrices, lowPrices, closePrices, 14);
-      const ema50 = computeEMA(closePrices, 50);
-      const volSma20 = computeSMA(volumes, 20);
-      const rsi14 = computeRSI(closePrices, 14);
-      const alpha = computeAlphaTrend(highPrices, lowPrices, closePrices, volumes, 14, 1.0, false);
-      
-      const validAdx = adxData.adx.filter(v => !isNaN(v));
-      if (validAdx.length > 0) {
-        const latest = validAdx[validAdx.length - 1];
-        setCurrentAdx({
-          value: Number(latest.toFixed(1)),
-          isChoppy: latest < breakoutConfig.adxLowerLevel
-        });
-      }
 
-      const lookback = breakoutConfig.boxLookBack; // 20
-      const startIdx = Math.max(lookback + 1, 20);
-
-      // -----------------------------------------------------------------------
-      // 1. Dual Shadow Comparative Run: Immediate Breakout vs Retest (Gold Only)
-      // -----------------------------------------------------------------------
-      let boWins = 0, boLosses = 0, boTotal = 0, boNetPnL = 0, boRiskSum = 0, boRewardSum = 0;
-      let rtWins = 0, rtLosses = 0, rtTotal = 0, rtNetPnL = 0, rtRiskSum = 0, rtRewardSum = 0;
-      let falseBreakoutsSaved = 0, missedRunaways = 0;
-
-      let boActive: { type: 'LONG' | 'SHORT'; entryPrice: number; stoploss: number; target: number; target1Hit?: boolean } | null = null;
-      let rtActive: { type: 'LONG' | 'SHORT'; entryPrice: number; stoploss: number; target: number; target1Hit?: boolean } | null = null;
-      let shadowPendingRetest: { type: 'LONG' | 'SHORT'; level: number; boxWidth: number; expireBar: number; targetDist: number; atr: number; boLost?: boolean } | null = null;
-
-      for (let i = startIdx; i < candles.length; i++) {
-        const curr = candles[i];
-        const prev = candles[i - 1];
-        const nextCandle = candles[i + 1];
-        const isDayEnd = isSessionEndBar(curr.time as number, nextCandle?.time as number, true);
-        const atr = atr14[i] || 1;
-
-        // --- Evaluate Active Breakout Trade ---
-        if (boActive) {
-          const t2Dist = (breakoutConfig.profitTarget2Multiple || 1.85);
-          if (boActive.type === 'LONG') {
-            const t1Price = boActive.target;
-            const t2Price = boActive.entryPrice + (boActive.target - boActive.entryPrice) * t2Dist;
-            if (curr.high >= t2Price) {
-              boWins++;
-              boTotal++;
-              // Blended TP1 + TP2 runner profit
-              boNetPnL += ((t1Price - boActive.entryPrice) + (t2Price - boActive.entryPrice)) / 2;
-              boActive = null;
-            } else if (curr.high >= t1Price) {
-              // T1 touched: ratchet stoploss to breakeven
-              boActive.target1Hit = true;
-              boActive.stoploss = Math.max(boActive.stoploss, boActive.entryPrice);
-            }
-            if (boActive) {
-              if (curr.low <= boActive.stoploss) {
-                if (boActive.target1Hit) {
-                  // Secured T1, runner out at BE = net win
-                  boWins++;
-                  boTotal++;
-                  boNetPnL += (t1Price - boActive.entryPrice) / 2;
-                } else {
-                  boLosses++;
-                  boTotal++;
-                  boNetPnL += (boActive.stoploss - boActive.entryPrice);
-                  if (shadowPendingRetest && shadowPendingRetest.type === 'LONG') {
-                    shadowPendingRetest.boLost = true;
-                  }
-                }
-                boActive = null;
-              } else if (isDayEnd) {
-                const p = boActive.target1Hit
-                  ? ((t1Price - boActive.entryPrice) + (curr.close - boActive.entryPrice)) / 2
-                  : (curr.close - boActive.entryPrice);
-                if (p >= 0) boWins++; else boLosses++;
-                boTotal++;
-                boNetPnL += p;
-                boActive = null;
-              }
-            }
-          } else {
-            const t1Price = boActive.target;
-            const t2Price = boActive.entryPrice - (boActive.entryPrice - boActive.target) * t2Dist;
-            if (curr.low <= t2Price) {
-              boWins++;
-              boTotal++;
-              boNetPnL += ((boActive.entryPrice - t1Price) + (boActive.entryPrice - t2Price)) / 2;
-              boActive = null;
-            } else if (curr.low <= t1Price) {
-              boActive.target1Hit = true;
-              boActive.stoploss = Math.min(boActive.stoploss, boActive.entryPrice);
-            }
-            if (boActive) {
-              if (curr.high >= boActive.stoploss) {
-                if (boActive.target1Hit) {
-                  boWins++;
-                  boTotal++;
-                  boNetPnL += (boActive.entryPrice - t1Price) / 2;
-                } else {
-                  boLosses++;
-                  boTotal++;
-                  boNetPnL += (boActive.entryPrice - boActive.stoploss);
-                  if (shadowPendingRetest && shadowPendingRetest.type === 'SHORT') {
-                    shadowPendingRetest.boLost = true;
-                  }
-                }
-                boActive = null;
-              } else if (isDayEnd) {
-                const p = boActive.target1Hit
-                  ? ((boActive.entryPrice - t1Price) + (boActive.entryPrice - curr.close)) / 2
-                  : (boActive.entryPrice - curr.close);
-                if (p >= 0) boWins++; else boLosses++;
-                boTotal++;
-                boNetPnL += p;
-                boActive = null;
-              }
-            }
-          }
-        }
-
-        // --- Evaluate Active Retest Trade ---
-        if (rtActive) {
-          const t2Dist = (breakoutConfig.profitTarget2Multiple || 1.85);
-          if (rtActive.type === 'LONG') {
-            const t1Price = rtActive.target;
-            const t2Price = rtActive.entryPrice + (rtActive.target - rtActive.entryPrice) * t2Dist;
-            if (curr.high >= t2Price) {
-              rtWins++;
-              rtTotal++;
-              rtNetPnL += ((t1Price - rtActive.entryPrice) + (t2Price - rtActive.entryPrice)) / 2;
-              rtActive = null;
-            } else if (curr.high >= t1Price) {
-              rtActive.target1Hit = true;
-              rtActive.stoploss = Math.max(rtActive.stoploss, rtActive.entryPrice);
-            }
-            if (rtActive) {
-              if (curr.low <= rtActive.stoploss) {
-                if (rtActive.target1Hit) {
-                  rtWins++;
-                  rtTotal++;
-                  rtNetPnL += (t1Price - rtActive.entryPrice) / 2;
-                } else {
-                  rtLosses++;
-                  rtTotal++;
-                  rtNetPnL += (rtActive.stoploss - rtActive.entryPrice);
-                }
-                rtActive = null;
-              } else if (isDayEnd) {
-                const p = rtActive.target1Hit
-                  ? ((t1Price - rtActive.entryPrice) + (curr.close - rtActive.entryPrice)) / 2
-                  : (curr.close - rtActive.entryPrice);
-                if (p >= 0) rtWins++; else rtLosses++;
-                rtTotal++;
-                rtNetPnL += p;
-                rtActive = null;
-              }
-            }
-          } else {
-            const t1Price = rtActive.target;
-            const t2Price = rtActive.entryPrice - (rtActive.entryPrice - rtActive.target) * t2Dist;
-            if (curr.low <= t2Price) {
-              rtWins++;
-              rtTotal++;
-              rtNetPnL += ((rtActive.entryPrice - t1Price) + (rtActive.entryPrice - t2Price)) / 2;
-              rtActive = null;
-            } else if (curr.low <= t1Price) {
-              rtActive.target1Hit = true;
-              rtActive.stoploss = Math.min(rtActive.stoploss, rtActive.entryPrice);
-            }
-            if (rtActive) {
-              if (curr.high >= rtActive.stoploss) {
-                if (rtActive.target1Hit) {
-                  rtWins++;
-                  rtTotal++;
-                  rtNetPnL += (rtActive.entryPrice - t1Price) / 2;
-                } else {
-                  rtLosses++;
-                  rtTotal++;
-                  rtNetPnL += (rtActive.entryPrice - rtActive.stoploss);
-                }
-                rtActive = null;
-              } else if (isDayEnd) {
-                const p = rtActive.target1Hit
-                  ? ((rtActive.entryPrice - t1Price) + (rtActive.entryPrice - curr.close)) / 2
-                  : (rtActive.entryPrice - curr.close);
-                if (p >= 0) rtWins++; else rtLosses++;
-                rtTotal++;
-                rtNetPnL += p;
-                rtActive = null;
-              }
-            }
-          }
-        }
-
-        // --- Check Pending Retest Confirmation ---
-        if (shadowPendingRetest && rtActive === null) {
-          if (i > shadowPendingRetest.expireBar) {
-            if (shadowPendingRetest.boLost) {
-              falseBreakoutsSaved++;
-            } else {
-              missedRunaways++;
-            }
-            shadowPendingRetest = null;
-          } else if (shadowPendingRetest.type === 'LONG') {
-            const touched = curr.low <= shadowPendingRetest.level + 0.35 * atr && curr.low >= shadowPendingRetest.level - 0.6 * atr;
-            const bounce = curr.close >= shadowPendingRetest.level - 0.2 * atr && (curr.close >= curr.open || (curr.close - curr.low) > 0.35 * (curr.high - curr.low));
-            if (touched && bounce) {
-              const entry = curr.close;
-              const target = entry + shadowPendingRetest.targetDist;
-              const stoploss = Math.max(curr.low - 0.35 * atr, entry - shadowPendingRetest.targetDist * 0.7);
-              rtActive = { type: 'LONG', entryPrice: entry, stoploss, target };
-              rtRiskSum += (entry - stoploss);
-              const t2Dist = shadowPendingRetest.targetDist * (breakoutConfig.profitTarget2Multiple || 1.85);
-              rtRewardSum += (shadowPendingRetest.targetDist + t2Dist) / 2;
-              shadowPendingRetest = null;
-            }
-          } else if (shadowPendingRetest.type === 'SHORT') {
-            const touched = curr.high >= shadowPendingRetest.level - 0.35 * atr && curr.high <= shadowPendingRetest.level + 0.6 * atr;
-            const reject = curr.close <= shadowPendingRetest.level + 0.2 * atr && (curr.close <= curr.open || (curr.high - curr.close) > 0.35 * (curr.high - curr.low));
-            if (touched && reject) {
-              const entry = curr.close;
-              const target = entry - shadowPendingRetest.targetDist;
-              const stoploss = Math.min(curr.high + 0.35 * atr, entry + shadowPendingRetest.targetDist * 0.7);
-              rtActive = { type: 'SHORT', entryPrice: entry, stoploss, target };
-              rtRiskSum += (stoploss - entry);
-              const t2Dist = shadowPendingRetest.targetDist * (breakoutConfig.profitTarget2Multiple || 1.85);
-              rtRewardSum += (shadowPendingRetest.targetDist + t2Dist) / 2;
-              shadowPendingRetest = null;
-            }
-          }
-        }
-
-        // --- Detect Breakout for Dual Comparison ---
-        if (boActive === null && !isDayEnd) {
-          let hi = -Infinity;
-          let lo = Infinity;
-          for (let k = i - lookback; k <= i - 1; k++) {
-            if (k >= 0) {
-              hi = Math.max(hi, highPrices[k]);
-              lo = Math.min(lo, lowPrices[k]);
-            }
-          }
-          const bw = hi - lo;
-          if (bw > 0) {
-            const isBuy = prev.close <= hi && curr.close > hi;
-            const isSell = prev.close >= lo && curr.close < lo;
-            if (isBuy && (breakoutConfig.enableDirection === 0 || breakoutConfig.enableDirection === 1)) {
-              const targetDist = breakoutConfig.profitTargetMultiple * bw;
-              const target2Dist = targetDist * (breakoutConfig.profitTarget2Multiple || 1.85);
-              const riskDist = Math.min(targetDist * 0.85, Math.max(1.0 * atr, bw * 0.45));
-              boActive = {
-                type: 'LONG',
-                entryPrice: curr.close,
-                stoploss: curr.close - riskDist,
-                target: curr.close + targetDist
-              };
-              boRiskSum += riskDist;
-              boRewardSum += (targetDist + target2Dist) / 2;
-              shadowPendingRetest = {
-                type: 'LONG',
-                level: hi,
-                boxWidth: bw,
-                expireBar: i + 6,
-                targetDist,
-                atr
-              };
-            } else if (isSell && (breakoutConfig.enableDirection === 0 || breakoutConfig.enableDirection === -1)) {
-              const targetDist = breakoutConfig.profitTargetMultiple * bw;
-              const target2Dist = targetDist * (breakoutConfig.profitTarget2Multiple || 1.85);
-              const riskDist = Math.min(targetDist * 0.85, Math.max(1.0 * atr, bw * 0.45));
-              boActive = {
-                type: 'SHORT',
-                entryPrice: curr.close,
-                stoploss: curr.close + riskDist,
-                target: curr.close - targetDist
-              };
-              boRiskSum += riskDist;
-              boRewardSum += (targetDist + target2Dist) / 2;
-              shadowPendingRetest = {
-                type: 'SHORT',
-                level: lo,
-                boxWidth: bw,
-                expireBar: i + 6,
-                targetDist,
-                atr
-              };
-            }
-          }
-        }
-      }
-
-      const boWinRate = boTotal > 0 ? Number(((boWins / boTotal) * 100).toFixed(1)) : 0;
-      const rtWinRate = rtTotal > 0 ? Number(((rtWins / rtTotal) * 100).toFixed(1)) : 0;
-      const boAvgRR = boRiskSum > 0 ? Number((boRewardSum / boRiskSum).toFixed(2)) : 1.1;
-      const rtAvgRR = rtRiskSum > 0 ? Number((rtRewardSum / rtRiskSum).toFixed(2)) : 2.3;
-
-      setRetestComparison({
-        breakoutWins: boWins,
-        breakoutLosses: boLosses,
-        breakoutTotal: boTotal,
-        breakoutWinRate: boWinRate,
-        breakoutNetPnL: Number(boNetPnL.toFixed(1)),
-        breakoutAvgRR: boAvgRR,
-        retestWins: rtWins,
-        retestLosses: rtLosses,
-        retestTotal: rtTotal,
-        retestWinRate: rtWinRate,
-        retestNetPnL: Number(rtNetPnL.toFixed(1)),
-        retestAvgRR: rtAvgRR,
-        falseBreakoutsSaved,
-        missedRunaways
-      });
-
-      // -----------------------------------------------------------------------
-      // 2. Main Simulation with User-Selected Filter Mode & Reason Tracking
-      // -----------------------------------------------------------------------
-      const boxUpperPlot: number[] = new Array(candles.length).fill(NaN);
-      const boxLowerPlot: number[] = new Array(candles.length).fill(NaN);
-      const targetPlot: number[] = new Array(candles.length).fill(NaN);
-      const target2Plot: number[] = new Array(candles.length).fill(NaN);
-      const stopLossPlot: number[] = new Array(candles.length).fill(NaN);
-
-      let activeTrade: Trade | null = null;
-      let lockedBoxUpper = NaN;
-      let lockedBoxLower = NaN;
-      let lockedBoxWidth = NaN;
-      let lockedTarget = NaN;
-      let lockedTarget2 = NaN;
-      let lockedStopLoss = NaN;
-
-      let pendingBuyRetest: { boxUpper: number; boxLower: number; boxWidth: number; targetDist: number; target2Dist?: number; expireBar: number } | null = null;
-      let pendingSellRetest: { boxUpper: number; boxLower: number; boxWidth: number; targetDist: number; target2Dist?: number; expireBar: number } | null = null;
-
-      let exhaustionFiltered = 0;
-      let rsiFiltered = 0;
-      let wickFiltered = 0;
-      let volumeFiltered = 0;
-      let trendFiltered = 0;
-      let boxFiltered = 0;
-      let adxFiltered = 0;
-      let beSavedCount = 0;
-
-      for (let i = startIdx; i < candles.length; i++) {
-        const curr = candles[i];
-        const prev = candles[i - 1];
-        const nextCandle = candles[i + 1];
-        const isDayEnd = isSessionEndBar(curr.time as number, nextCandle?.time as number, true);
-        const sig = adxData.adx[i];
-        const isADXLow = !isNaN(sig) && sig < breakoutConfig.adxLowerLevel;
-        const atr = atr14[i] || 1;
-        const ema = ema50[i];
-        const vSma = volSma20[i];
-        const rsi = rsi14[i];
-
-        let currentBoxUpper: number;
-        let currentBoxLower: number;
-
-        if (activeTrade === null) {
-          let hi = -Infinity;
-          let lo = Infinity;
-          for (let k = i - lookback; k <= i - 1; k++) {
-            if (k >= 0) {
-              hi = Math.max(hi, highPrices[k]);
-              lo = Math.min(lo, lowPrices[k]);
-            }
-          }
-          currentBoxUpper = hi;
-          currentBoxLower = lo;
-        } else {
-          currentBoxUpper = lockedBoxUpper;
-          currentBoxLower = lockedBoxLower;
-        }
-
-        const boxWidth = currentBoxUpper - currentBoxLower;
-
-        boxUpperPlot[i] = currentBoxUpper;
-        boxLowerPlot[i] = currentBoxLower;
-        targetPlot[i] = activeTrade ? lockedTarget : NaN;
-        target2Plot[i] = activeTrade ? lockedTarget2 : NaN;
-        stopLossPlot[i] = activeTrade ? lockedStopLoss : NaN;
-
-        // Manage active trade exits on current candle
-        if (activeTrade !== null) {
-          // Dynamic Breakeven Trailing: Lock Stoploss to Entry when trade moves >= 50% toward target
-          if (activeFilterSettings.breakevenTrail && !activeTrade.isBreakevenLocked) {
-            if (activeTrade.type === 'LONG') {
-              const favorableMove = curr.high - activeTrade.entryPrice;
-              const targetDist = lockedTarget - activeTrade.entryPrice;
-              if (favorableMove >= targetDist * 0.5) {
-                lockedStopLoss = Math.max(lockedStopLoss, activeTrade.entryPrice + 0.05 * atr);
-                activeTrade.stoploss = lockedStopLoss;
-                activeTrade.isBreakevenLocked = true;
-                beSavedCount++;
-              }
-            } else {
-              const favorableMove = activeTrade.entryPrice - curr.low;
-              const targetDist = activeTrade.entryPrice - lockedTarget;
-              if (favorableMove >= targetDist * 0.5) {
-                lockedStopLoss = Math.min(lockedStopLoss, activeTrade.entryPrice - 0.05 * atr);
-                activeTrade.stoploss = lockedStopLoss;
-                activeTrade.isBreakevenLocked = true;
-                beSavedCount++;
-              }
-            }
-          }
-
-          if (activeTrade.type === 'LONG') {
-            // Target 1 Hit detection
-            if (!activeTrade.target1Hit && curr.high >= lockedTarget) {
-              activeTrade.target1Hit = true;
-              lockedStopLoss = Math.max(lockedStopLoss, activeTrade.entryPrice + 0.05 * atr);
-              activeTrade.stoploss = lockedStopLoss;
-              activeTrade.isBreakevenLocked = true;
-              markers.push({
-                time: curr.time,
-                position: 'aboveBar',
-                color: '#10B981',
-                shape: 'circle',
-                text: 'T1 Hit (+Lock BE)'
-              });
-            }
-
-            if (activeTrade.target1Hit) {
-              const t2 = lockedTarget2 || (activeTrade.entryPrice + (lockedTarget - activeTrade.entryPrice) * (breakoutConfig.profitTarget2Multiple || 1.85));
-              if (curr.high >= t2) {
-                // Full Target 2 Reached: 50% booked at Target 1, 50% booked at Target 2
-                activeTrade.exitPrice = Number(((lockedTarget + t2) / 2).toFixed(2));
-                activeTrade.exitTime = curr.time as number;
-                activeTrade.exitReason = 'TARGET';
-                activeTrade.status = 'WIN';
-                activeTrade.pnl = Number((activeTrade.exitPrice - activeTrade.entryPrice).toFixed(2));
-                activeTrade.duration = formatDuration(activeTrade.entryTime, activeTrade.exitTime);
-                markers.push({
-                  time: curr.time,
-                  position: 'aboveBar',
-                  color: '#8B5CF6',
-                  shape: 'circle',
-                  text: 'close_long (TP2 Runner Complete 🎯)'
-                });
-                activeTrade = null;
-              } else if (curr.low <= lockedStopLoss) {
-                // Target 1 was secured; runner exited at breakeven stop -> Guaranteed Win!
-                activeTrade.exitPrice = Number(((lockedTarget + lockedStopLoss) / 2).toFixed(2));
-                activeTrade.exitTime = curr.time as number;
-                activeTrade.exitReason = 'BREAKEVEN';
-                activeTrade.status = 'WIN';
-                activeTrade.pnl = Number((activeTrade.exitPrice - activeTrade.entryPrice).toFixed(2));
-                activeTrade.duration = formatDuration(activeTrade.entryTime, activeTrade.exitTime);
-                markers.push({
-                  time: curr.time,
-                  position: 'aboveBar',
-                  color: '#10B981',
-                  shape: 'circle',
-                  text: 'close_long (T1 Secured / BE Runner)'
-                });
-                activeTrade = null;
-              } else if (isDayEnd) {
-                activeTrade.exitPrice = Number(((lockedTarget + curr.close) / 2).toFixed(2));
-                activeTrade.exitTime = curr.time as number;
-                activeTrade.exitReason = 'DAY_END';
-                activeTrade.pnl = Number((activeTrade.exitPrice - activeTrade.entryPrice).toFixed(2));
-                activeTrade.status = activeTrade.pnl >= 0 ? 'WIN' : 'LOSS';
-                activeTrade.duration = formatDuration(activeTrade.entryTime, activeTrade.exitTime);
-                markers.push({
-                  time: curr.time,
-                  position: 'aboveBar',
-                  color: '#F59E0B',
-                  shape: 'circle',
-                  text: `close_long (Day End @ ${curr.close.toFixed(1)})`
-                });
-                activeTrade = null;
-              }
-            } else {
-              // Target 1 NOT hit yet: evaluate strict stoploss
-              if (curr.low <= lockedStopLoss) {
-                activeTrade.exitPrice = lockedStopLoss;
-                activeTrade.exitTime = curr.time as number;
-                activeTrade.pnl = Number((lockedStopLoss - activeTrade.entryPrice).toFixed(2));
-                activeTrade.duration = formatDuration(activeTrade.entryTime, activeTrade.exitTime);
-                if (activeTrade.isBreakevenLocked && activeTrade.pnl >= -0.01) {
-                  activeTrade.exitReason = 'BREAKEVEN';
-                  activeTrade.status = 'BE';
-                  markers.push({
-                    time: curr.time,
-                    position: 'aboveBar',
-                    color: '#10B981',
-                    shape: 'circle',
-                    text: 'close_long (BE Protected)'
-                  });
-                } else {
-                  activeTrade.exitReason = 'STOPLOSS';
-                  activeTrade.status = 'LOSS';
-                  markers.push({
-                    time: curr.time,
-                    position: 'aboveBar',
-                    color: '#EF4444',
-                    shape: 'circle',
-                    text: 'close_long (SL)'
-                  });
-                }
-                activeTrade = null;
-              } else if (isDayEnd) {
-                // Intraday day-end close: Realize PnL at market session close (No overnight carry)
-                activeTrade.exitPrice = curr.close;
-                activeTrade.exitTime = curr.time as number;
-                activeTrade.exitReason = 'DAY_END';
-                activeTrade.pnl = Number((curr.close - activeTrade.entryPrice).toFixed(2));
-                activeTrade.status = activeTrade.pnl > 0 ? 'WIN' : activeTrade.pnl < 0 ? 'LOSS' : 'BE';
-                activeTrade.duration = formatDuration(activeTrade.entryTime, activeTrade.exitTime);
-                markers.push({
-                  time: curr.time,
-                  position: 'aboveBar',
-                  color: '#F59E0B',
-                  shape: 'circle',
-                  text: `close_long (Day End @ ${curr.close.toFixed(1)})`
-                });
-                activeTrade = null;
-              }
-            }
-          } else if (activeTrade.type === 'SHORT') {
-            // Target 1 Hit detection
-            if (!activeTrade.target1Hit && curr.low <= lockedTarget) {
-              activeTrade.target1Hit = true;
-              lockedStopLoss = Math.min(lockedStopLoss, activeTrade.entryPrice - 0.05 * atr);
-              activeTrade.stoploss = lockedStopLoss;
-              activeTrade.isBreakevenLocked = true;
-              markers.push({
-                time: curr.time,
-                position: 'belowBar',
-                color: '#10B981',
-                shape: 'circle',
-                text: 'T1 Hit (+Lock BE)'
-              });
-            }
-
-            if (activeTrade.target1Hit) {
-              const t2 = lockedTarget2 || (activeTrade.entryPrice - (activeTrade.entryPrice - lockedTarget) * (breakoutConfig.profitTarget2Multiple || 1.85));
-              if (curr.low <= t2) {
-                activeTrade.exitPrice = Number(((lockedTarget + t2) / 2).toFixed(2));
-                activeTrade.exitTime = curr.time as number;
-                activeTrade.exitReason = 'TARGET';
-                activeTrade.status = 'WIN';
-                activeTrade.pnl = Number((activeTrade.entryPrice - activeTrade.exitPrice).toFixed(2));
-                activeTrade.duration = formatDuration(activeTrade.entryTime, activeTrade.exitTime);
-                markers.push({
-                  time: curr.time,
-                  position: 'belowBar',
-                  color: '#8B5CF6',
-                  shape: 'circle',
-                  text: 'close_short (TP2 Runner Complete 🎯)'
-                });
-                activeTrade = null;
-              } else if (curr.high >= lockedStopLoss) {
-                // Target 1 secured; runner exited at breakeven stop -> Guaranteed Win!
-                activeTrade.exitPrice = Number(((lockedTarget + lockedStopLoss) / 2).toFixed(2));
-                activeTrade.exitTime = curr.time as number;
-                activeTrade.exitReason = 'BREAKEVEN';
-                activeTrade.status = 'WIN';
-                activeTrade.pnl = Number((activeTrade.entryPrice - activeTrade.exitPrice).toFixed(2));
-                activeTrade.duration = formatDuration(activeTrade.entryTime, activeTrade.exitTime);
-                markers.push({
-                  time: curr.time,
-                  position: 'belowBar',
-                  color: '#10B981',
-                  shape: 'circle',
-                  text: 'close_short (T1 Secured / BE Runner)'
-                });
-                activeTrade = null;
-              } else if (isDayEnd) {
-                activeTrade.exitPrice = Number(((lockedTarget + curr.close) / 2).toFixed(2));
-                activeTrade.exitTime = curr.time as number;
-                activeTrade.exitReason = 'DAY_END';
-                activeTrade.pnl = Number((activeTrade.entryPrice - activeTrade.exitPrice).toFixed(2));
-                activeTrade.status = activeTrade.pnl >= 0 ? 'WIN' : 'LOSS';
-                activeTrade.duration = formatDuration(activeTrade.entryTime, activeTrade.exitTime);
-                markers.push({
-                  time: curr.time,
-                  position: 'belowBar',
-                  color: '#F59E0B',
-                  shape: 'circle',
-                  text: `close_short (Day End @ ${curr.close.toFixed(1)})`
-                });
-                activeTrade = null;
-              }
-            } else {
-              // Target 1 NOT hit yet: evaluate strict stoploss
-              if (curr.high >= lockedStopLoss) {
-                activeTrade.exitPrice = lockedStopLoss;
-                activeTrade.exitTime = curr.time as number;
-                activeTrade.pnl = Number((activeTrade.entryPrice - lockedStopLoss).toFixed(2));
-                activeTrade.duration = formatDuration(activeTrade.entryTime, activeTrade.exitTime);
-                if (activeTrade.isBreakevenLocked && activeTrade.pnl >= -0.01) {
-                  activeTrade.exitReason = 'BREAKEVEN';
-                  activeTrade.status = 'BE';
-                  markers.push({
-                    time: curr.time,
-                    position: 'belowBar',
-                    color: '#10B981',
-                    shape: 'circle',
-                    text: 'close_short (BE Protected)'
-                  });
-                } else {
-                  activeTrade.exitReason = 'STOPLOSS';
-                  activeTrade.status = 'LOSS';
-                  markers.push({
-                    time: curr.time,
-                    position: 'belowBar',
-                    color: '#EF4444',
-                    shape: 'circle',
-                    text: 'close_short (SL)'
-                  });
-                }
-                activeTrade = null;
-              } else if (isDayEnd) {
-                // Intraday day-end close: Realize PnL at market session close (No overnight carry)
-                activeTrade.exitPrice = curr.close;
-                activeTrade.exitTime = curr.time as number;
-                activeTrade.exitReason = 'DAY_END';
-                activeTrade.pnl = Number((activeTrade.entryPrice - curr.close).toFixed(2));
-                activeTrade.status = activeTrade.pnl > 0 ? 'WIN' : activeTrade.pnl < 0 ? 'LOSS' : 'BE';
-                activeTrade.duration = formatDuration(activeTrade.entryTime, activeTrade.exitTime);
-                markers.push({
-                  time: curr.time,
-                  position: 'belowBar',
-                  color: '#F59E0B',
-                  shape: 'circle',
-                  text: `close_short (Day End @ ${curr.close.toFixed(1)})`
-                });
-                activeTrade = null;
-              }
-            }
-          }
-        }
-
-        // Check Entries if flat and not at day end
-        if (activeTrade === null && !isDayEnd) {
-          // --- 1. Pending Retest Evaluation (Gold Only) ---
-          if (breakoutConfig.entryMode === 'RETEST' || breakoutConfig.entryMode === 'ADAPTIVE') {
-            if (pendingBuyRetest) {
-              if (i > pendingBuyRetest.expireBar) {
-                pendingBuyRetest = null;
-              } else {
-                const touched = curr.low <= pendingBuyRetest.boxUpper + 0.35 * atr && curr.low >= pendingBuyRetest.boxUpper - 0.6 * atr;
-                const bounce = curr.close >= pendingBuyRetest.boxUpper - 0.2 * atr && (curr.close >= curr.open || (curr.close - curr.low) > 0.35 * (curr.high - curr.low));
-                if (touched && bounce) {
-                  const entryPrice = curr.close;
-                  const targetDist = pendingBuyRetest.targetDist;
-                  const target2Dist = pendingBuyRetest.target2Dist || targetDist * (breakoutConfig.profitTarget2Multiple || 1.85);
-                  const target = entryPrice + targetDist;
-                  const target2 = entryPrice + target2Dist;
-                  const stopLoss = Math.max(curr.low - 0.35 * atr, entryPrice - targetDist * 0.7);
-
-                  lockedBoxUpper = pendingBuyRetest.boxUpper;
-                  lockedBoxLower = pendingBuyRetest.boxLower;
-                  lockedBoxWidth = pendingBuyRetest.boxWidth;
-                  lockedTarget = target;
-                  lockedTarget2 = target2;
-                  lockedStopLoss = stopLoss;
-
-                  const newTrade: Trade = {
-                    id: `${curr.time}-RETEST-L`,
-                    type: 'LONG',
-                    signal: 'Retest Long 🎯',
-                    entryTime: curr.time as number,
-                    entryPrice,
-                    stoploss: stopLoss,
-                    target,
-                    target2,
-                    status: 'OPEN',
-                    isBreakevenLocked: false
-                  };
-                  activeTrade = newTrade;
-                  allTrades.push(newTrade);
-                  markers.push({
-                    time: curr.time,
-                    position: 'belowBar',
-                    color: '#10B981',
-                    shape: 'arrowUp',
-                    text: '🎯 Retest Buy'
-                  });
-                  targetPlot[i] = lockedTarget;
-                  target2Plot[i] = lockedTarget2;
-                  stopLossPlot[i] = lockedStopLoss;
-                  pendingBuyRetest = null;
-                }
-              }
-            }
-
-            if (pendingSellRetest && activeTrade === null) {
-              if (i > pendingSellRetest.expireBar) {
-                pendingSellRetest = null;
-              } else {
-                const touched = curr.high >= pendingSellRetest.boxLower - 0.35 * atr && curr.high <= pendingSellRetest.boxLower + 0.6 * atr;
-                const reject = curr.close <= pendingSellRetest.boxLower + 0.2 * atr && (curr.close <= curr.open || (curr.high - curr.close) > 0.35 * (curr.high - curr.low));
-                if (touched && reject) {
-                  const entryPrice = curr.close;
-                  const targetDist = pendingSellRetest.targetDist;
-                  const target2Dist = pendingSellRetest.target2Dist || targetDist * (breakoutConfig.profitTarget2Multiple || 1.85);
-                  const target = entryPrice - targetDist;
-                  const target2 = entryPrice - target2Dist;
-                  const stopLoss = Math.min(curr.high + 0.35 * atr, entryPrice + targetDist * 0.7);
-
-                  lockedBoxUpper = pendingSellRetest.boxUpper;
-                  lockedBoxLower = pendingSellRetest.boxLower;
-                  lockedBoxWidth = pendingSellRetest.boxWidth;
-                  lockedTarget = target;
-                  lockedTarget2 = target2;
-                  lockedStopLoss = stopLoss;
-
-                  const newTrade: Trade = {
-                    id: `${curr.time}-RETEST-S`,
-                    type: 'SHORT',
-                    signal: 'Retest Short 🎯',
-                    entryTime: curr.time as number,
-                    entryPrice,
-                    stoploss: stopLoss,
-                    target,
-                    target2,
-                    status: 'OPEN',
-                    isBreakevenLocked: false
-                  };
-                  activeTrade = newTrade;
-                  allTrades.push(newTrade);
-                  markers.push({
-                    time: curr.time,
-                    position: 'aboveBar',
-                    color: '#EF4444',
-                    shape: 'arrowDown',
-                    text: '🎯 Retest Sell'
-                  });
-                  targetPlot[i] = lockedTarget;
-                  target2Plot[i] = lockedTarget2;
-                  stopLossPlot[i] = lockedStopLoss;
-                  pendingSellRetest = null;
-                }
-              }
-            }
-          }
-
-          // --- 2. ADX Breakout Signal Evaluation ---
-          if (activeTrade === null && activeStrategies.adxBreakout && boxWidth > 0) {
-            const isRawBuy = prev.close <= currentBoxUpper && curr.close > currentBoxUpper;
-            const isRawSell = prev.close >= currentBoxLower && curr.close < currentBoxLower;
-
-            let isBuyValid = false;
-            let isSellValid = false;
-
-            if (isRawBuy) {
-              const range = curr.high - curr.low;
-              const body = curr.close - curr.open;
-              const upperWick = curr.high - Math.max(curr.open, curr.close);
-
-              if (activeFilterMode === 'RAW') {
-                isBuyValid = true;
-              } else if (activeFilterMode === 'BOOKER_ADX') {
-                isBuyValid = isADXLow;
-                if (!isBuyValid) adxFiltered++;
-              } else if (activeFilterMode === 'MOMENTUM_ADX') {
-                isBuyValid = !isNaN(sig) && sig >= 20 && (adxData.plusDI[i] > adxData.minusDI[i]);
-                if (!isBuyValid) adxFiltered++;
-              } else if (activeFilterMode === 'SMART') {
-                let passExhaustion = true;
-                let passRsi = true;
-                let passBody = true;
-                let passVol = true;
-                let passTrend = true;
-                let passBox = true;
-
-                // 1. Exhaustion / Climax Bar Filter (Eliminates blow-off candles that immediately reverse)
-                if (activeFilterSettings.exhaustionFilter && atr > 0) {
-                  if (range > 2.2 * atr) {
-                    passExhaustion = false;
-                    exhaustionFiltered++;
-                  }
-                }
-
-                // 2. RSI Momentum Sweet-spot Filter (48 <= RSI <= 72 avoids overbought exhaustion traps)
-                if (activeFilterSettings.rsiMomentum && !isNaN(rsi)) {
-                  if (rsi < 48 || rsi > 72) {
-                    passRsi = false;
-                    rsiFiltered++;
-                  }
-                }
-
-                // 3. Body Conviction & Wick Rejection Filter
-                if (activeFilterSettings.bodyConviction) {
-                  if (body <= 0 || (body / (range || 1)) < 0.35 || upperWick > body * 1.5) {
-                    passBody = false;
-                    wickFiltered++;
-                  }
-                }
-
-                // 4. Volume Confirmation Filter
-                if (activeFilterSettings.volumeConfirm && vSma > 0 && curr.volume > 0) {
-                  if (curr.volume < vSma * 0.85) {
-                    passVol = false;
-                    volumeFiltered++;
-                  }
-                }
-
-                // 5. 50 EMA Trend Alignment Filter
-                if (activeFilterSettings.trendAlignment && !isNaN(ema)) {
-                  if (curr.close < ema - 0.75 * atr) {
-                    passTrend = false;
-                    trendFiltered++;
-                  }
-                }
-
-                // 6. Min Box Width Filter
-                if (activeFilterSettings.minBoxWidthAtr && atr > 0) {
-                  if (boxWidth < 0.35 * atr) {
-                    passBox = false;
-                    boxFiltered++;
-                  }
-                }
-
-                isBuyValid = passExhaustion && passRsi && passBody && passVol && passTrend && passBox;
-              }
-            } else if (isRawSell) {
-              const range = curr.high - curr.low;
-              const body = curr.open - curr.close;
-              const lowerWick = Math.min(curr.open, curr.close) - curr.low;
-
-              if (activeFilterMode === 'RAW') {
-                isSellValid = true;
-              } else if (activeFilterMode === 'BOOKER_ADX') {
-                isSellValid = isADXLow;
-                if (!isSellValid) adxFiltered++;
-              } else if (activeFilterMode === 'MOMENTUM_ADX') {
-                isSellValid = !isNaN(sig) && sig >= 20 && (adxData.minusDI[i] > adxData.plusDI[i]);
-                if (!isSellValid) adxFiltered++;
-              } else if (activeFilterMode === 'SMART') {
-                let passExhaustion = true;
-                let passRsi = true;
-                let passBody = true;
-                let passVol = true;
-                let passTrend = true;
-                let passBox = true;
-
-                // 1. Exhaustion / Climax Bar Filter
-                if (activeFilterSettings.exhaustionFilter && atr > 0) {
-                  if (range > 2.2 * atr) {
-                    passExhaustion = false;
-                    exhaustionFiltered++;
-                  }
-                }
-
-                // 2. RSI Momentum Sweet-spot Filter (28 <= RSI <= 52 avoids oversold bounce traps)
-                if (activeFilterSettings.rsiMomentum && !isNaN(rsi)) {
-                  if (rsi < 28 || rsi > 52) {
-                    passRsi = false;
-                    rsiFiltered++;
-                  }
-                }
-
-                // 3. Body Conviction & Wick Rejection Filter
-                if (activeFilterSettings.bodyConviction) {
-                  if (body <= 0 || (body / (range || 1)) < 0.35 || lowerWick > body * 1.5) {
-                    passBody = false;
-                    wickFiltered++;
-                  }
-                }
-
-                // 4. Volume Confirmation Filter
-                if (activeFilterSettings.volumeConfirm && vSma > 0 && curr.volume > 0) {
-                  if (curr.volume < vSma * 0.85) {
-                    passVol = false;
-                    volumeFiltered++;
-                  }
-                }
-
-                // 5. 50 EMA Trend Alignment Filter
-                if (activeFilterSettings.trendAlignment && !isNaN(ema)) {
-                  if (curr.close > ema + 0.75 * atr) {
-                    passTrend = false;
-                    trendFiltered++;
-                  }
-                }
-
-                // 6. Min Box Width Filter
-                if (activeFilterSettings.minBoxWidthAtr && atr > 0) {
-                  if (boxWidth < 0.35 * atr) {
-                    passBox = false;
-                    boxFiltered++;
-                  }
-                }
-
-                isSellValid = passExhaustion && passRsi && passBody && passVol && passTrend && passBox;
-              }
-            }
-
-            if (isBuyValid && (breakoutConfig.enableDirection === 0 || breakoutConfig.enableDirection === 1)) {
-              if (breakoutConfig.entryMode === 'RETEST') {
-                pendingBuyRetest = {
-                  boxUpper: currentBoxUpper,
-                  boxLower: currentBoxLower,
-                  boxWidth,
-                  targetDist: breakoutConfig.profitTargetMultiple * boxWidth,
-                  target2Dist: breakoutConfig.profitTargetMultiple * boxWidth * (breakoutConfig.profitTarget2Multiple || 1.85),
-                  expireBar: i + 6
-                };
-              } else {
-                const entryPrice = curr.close;
-                const targetDist = breakoutConfig.profitTargetMultiple * boxWidth;
-                const target2Dist = targetDist * (breakoutConfig.profitTarget2Multiple || 1.85);
-                const target = entryPrice + targetDist;
-                const target2 = entryPrice + target2Dist;
-                const rawRisk = entryPrice - curr.low;
-                const minBreathingRisk = Math.max(1.0 * atr, boxWidth * 0.45);
-                const maxRisk = activeFilterSettings.strictStoploss ? targetDist * 0.85 : rawRisk;
-                const effectiveRisk = Math.min(Math.max(rawRisk, minBreathingRisk), maxRisk);
-                const stopLoss = entryPrice - effectiveRisk;
-
-                lockedBoxUpper = currentBoxUpper;
-                lockedBoxLower = currentBoxLower;
-                lockedBoxWidth = boxWidth;
-                lockedTarget = target;
-                lockedTarget2 = target2;
-                lockedStopLoss = stopLoss;
-
-                const newTrade: Trade = {
-                  id: `${curr.time}-ADX-L`,
-                  type: 'LONG',
-                  signal: activeFilterMode === 'SMART' ? 'Smart Long' : 'open_long',
-                  entryTime: curr.time as number,
-                  entryPrice,
-                  stoploss: stopLoss,
-                  target,
-                  target2,
-                  status: 'OPEN',
-                  isBreakevenLocked: false
-                };
-                activeTrade = newTrade;
-                allTrades.push(newTrade);
-
-                markers.push({
-                  time: curr.time,
-                  position: 'belowBar',
-                  color: '#10B981',
-                  shape: 'arrowUp',
-                  text: activeFilterMode === 'SMART' ? 'Smart Buy' : 'open_long'
-                });
-
-                targetPlot[i] = lockedTarget;
-                target2Plot[i] = lockedTarget2;
-                stopLossPlot[i] = lockedStopLoss;
-              }
-            } else if (isSellValid && (breakoutConfig.enableDirection === 0 || breakoutConfig.enableDirection === -1)) {
-              if (breakoutConfig.entryMode === 'RETEST') {
-                pendingSellRetest = {
-                  boxUpper: currentBoxUpper,
-                  boxLower: currentBoxLower,
-                  boxWidth,
-                  targetDist: breakoutConfig.profitTargetMultiple * boxWidth,
-                  target2Dist: breakoutConfig.profitTargetMultiple * boxWidth * (breakoutConfig.profitTarget2Multiple || 1.85),
-                  expireBar: i + 6
-                };
-              } else {
-                const entryPrice = curr.close;
-                const targetDist = breakoutConfig.profitTargetMultiple * boxWidth;
-                const target2Dist = targetDist * (breakoutConfig.profitTarget2Multiple || 1.85);
-                const target = entryPrice - targetDist;
-                const target2 = entryPrice - target2Dist;
-                const rawRisk = curr.high - entryPrice;
-                const minBreathingRisk = Math.max(1.0 * atr, boxWidth * 0.45);
-                const maxRisk = activeFilterSettings.strictStoploss ? targetDist * 0.85 : rawRisk;
-                const effectiveRisk = Math.min(Math.max(rawRisk, minBreathingRisk), maxRisk);
-                const stopLoss = entryPrice + effectiveRisk;
-
-                lockedBoxUpper = currentBoxUpper;
-                lockedBoxLower = currentBoxLower;
-                lockedBoxWidth = boxWidth;
-                lockedTarget = target;
-                lockedTarget2 = target2;
-                lockedStopLoss = stopLoss;
-
-                const newTrade: Trade = {
-                  id: `${curr.time}-ADX-S`,
-                  type: 'SHORT',
-                  signal: activeFilterMode === 'SMART' ? 'Smart Short' : 'open_short',
-                  entryTime: curr.time as number,
-                  entryPrice,
-                  stoploss: stopLoss,
-                  target,
-                  target2,
-                  status: 'OPEN',
-                  isBreakevenLocked: false
-                };
-                activeTrade = newTrade;
-                allTrades.push(newTrade);
-
-                markers.push({
-                  time: curr.time,
-                  position: 'aboveBar',
-                  color: '#EF4444',
-                  shape: 'arrowDown',
-                  text: activeFilterMode === 'SMART' ? 'Smart Sell' : 'open_short'
-                });
-
-                targetPlot[i] = lockedTarget;
-                target2Plot[i] = lockedTarget2;
-                stopLossPlot[i] = lockedStopLoss;
-              }
-            }
-          }
-
-          // --- 3. AlphaTrend Strategy Evaluation (Gold Only) ---
-          if (activeTrade === null && activeStrategies.alphaTrend) {
-            if (alpha.buySignal[i]) {
-              const entryPrice = curr.close;
-              const targetDist = 1.8 * atr;
-              const target2Dist = targetDist * (breakoutConfig.profitTarget2Multiple || 1.85);
-              const stopDist = 1.2 * atr;
-              const target = entryPrice + targetDist;
-              const target2 = entryPrice + target2Dist;
-              const stopLoss = entryPrice - stopDist;
-
-              lockedTarget = target;
-              lockedTarget2 = target2;
-              lockedStopLoss = stopLoss;
-
-              const newTrade: Trade = {
-                id: `${curr.time}-ALPHA-L`,
-                type: 'LONG',
-                signal: 'Alpha Long (Gold)',
-                entryTime: curr.time as number,
-                entryPrice,
-                stoploss: stopLoss,
-                target,
-                target2,
-                status: 'OPEN',
-                isBreakevenLocked: false
-              };
-              activeTrade = newTrade;
-              allTrades.push(newTrade);
-
-              markers.push({
-                time: curr.time,
-                position: 'belowBar',
-                color: '#38BDF8',
-                shape: 'arrowUp',
-                text: 'Alpha Buy'
-              });
-
-              targetPlot[i] = lockedTarget;
-              target2Plot[i] = lockedTarget2;
-              stopLossPlot[i] = lockedStopLoss;
-            } else if (alpha.sellSignal[i]) {
-              const entryPrice = curr.close;
-              const targetDist = 1.8 * atr;
-              const target2Dist = targetDist * (breakoutConfig.profitTarget2Multiple || 1.85);
-              const stopDist = 1.2 * atr;
-              const target = entryPrice - targetDist;
-              const target2 = entryPrice - target2Dist;
-              const stopLoss = entryPrice + stopDist;
-
-              lockedTarget = target;
-              lockedTarget2 = target2;
-              lockedStopLoss = stopLoss;
-
-              const newTrade: Trade = {
-                id: `${curr.time}-ALPHA-S`,
-                type: 'SHORT',
-                signal: 'Alpha Short (Gold)',
-                entryTime: curr.time as number,
-                entryPrice,
-                stoploss: stopLoss,
-                target,
-                target2,
-                status: 'OPEN',
-                isBreakevenLocked: false
-              };
-              activeTrade = newTrade;
-              allTrades.push(newTrade);
-
-              markers.push({
-                time: curr.time,
-                position: 'aboveBar',
-                color: '#F43F5E',
-                shape: 'arrowDown',
-                text: 'Alpha Sell'
-              });
-
-              targetPlot[i] = lockedTarget;
-              target2Plot[i] = lockedTarget2;
-              stopLossPlot[i] = lockedStopLoss;
-            }
-          }
-        }
-      }
-
-      // Check final active trade at the very end of data
-      if (activeTrade && (activeTrade as Trade).status === 'OPEN') {
-        const lastC = candles[candles.length - 1];
-        const t = activeTrade as Trade;
-        const isActuallyDayEnd = isSessionEndBar(lastC.time as number, undefined, true);
-        if (isActuallyDayEnd) {
-          t.exitPrice = lastC.close;
-          t.exitTime = lastC.time as number;
-          t.exitReason = 'DAY_END';
-          t.pnl = t.type === 'LONG' ? lastC.close - t.entryPrice : t.entryPrice - lastC.close;
-          t.status = t.pnl > 0 ? 'WIN' : t.pnl < 0 ? 'LOSS' : 'BE';
-          t.duration = formatDuration(t.entryTime, t.exitTime);
-        } else {
-          // Genuinely open live trade during market hours
-          t.status = 'OPEN';
-          t.exitPrice = undefined;
-          t.exitTime = undefined;
-          t.exitReason = undefined;
-          t.pnl = t.type === 'LONG' ? lastC.close - t.entryPrice : t.entryPrice - lastC.close;
-          t.duration = formatDuration(t.entryTime, lastC.time as number) + ' (Active)';
-        }
-        activeTrade = null;
-      }
-
-      // Update comparison metrics between RAW signals and active Filtered signals
-      const rawWinRate = boTotal > 0 ? ((boWins / boTotal) * 100).toFixed(1) : '0.0';
-      setComparisonStats({
-        rawTotal: boTotal,
-        rawWins: boWins,
-        rawLosses: boLosses,
-        rawWinRate,
-        rawNetPnL: boNetPnL,
-        filteredCount: exhaustionFiltered + rsiFiltered + wickFiltered + volumeFiltered + trendFiltered + boxFiltered + adxFiltered,
-        exhaustionFiltered,
-        rsiFiltered,
-        wickFiltered,
-        volumeFiltered,
-        trendFiltered,
-        boxFiltered,
-        adxFiltered,
-        beSavedCount,
-      });
-
-      // Update Gold Lines on chart
-      try {
-        if (!isDisposedRef.current) {
-          if (activeStrategies.adxBreakout) {
-            boxUpperRef.current?.setData(mapSeriesData(boxUpperPlot));
-            boxUpperRef.current?.applyOptions({ visible: true });
-            boxLowerRef.current?.setData(mapSeriesData(boxLowerPlot));
-            boxLowerRef.current?.applyOptions({ visible: true });
-            targetLineRef.current?.setData(mapSeriesData(targetPlot));
-            targetLineRef.current?.applyOptions({ visible: true });
-            target2LineRef.current?.setData(mapSeriesData(target2Plot));
-            target2LineRef.current?.applyOptions({ visible: true });
-            stopLossLineRef.current?.setData(mapSeriesData(stopLossPlot));
-            stopLossLineRef.current?.applyOptions({ visible: true });
-          } else {
-            boxUpperRef.current?.applyOptions({ visible: false });
-            boxLowerRef.current?.applyOptions({ visible: false });
-            targetLineRef.current?.applyOptions({ visible: false });
-            target2LineRef.current?.applyOptions({ visible: false });
-            stopLossLineRef.current?.applyOptions({ visible: false });
-          }
-
-          if (activeStrategies.alphaTrend) {
-            alphaTrendRef.current?.setData(mapSeriesData(alpha.alphaTrend));
-            alphaTrendRef.current?.applyOptions({ visible: true });
-            alphaTrendTriggerRef.current?.setData(mapSeriesData(alpha.trigger));
-            alphaTrendTriggerRef.current?.applyOptions({ visible: true });
-          } else {
-            alphaTrendRef.current?.applyOptions({ visible: false });
-            alphaTrendTriggerRef.current?.applyOptions({ visible: false });
-          }
-
-          // Always hide T3 on Gold
-          t3Lev0Ref.current?.applyOptions({ visible: false });
-          t3Lev5Ref.current?.applyOptions({ visible: false });
-        }
-      } catch (e: any) {
-        if (e?.message?.includes('disposed')) return;
-      }
-
-      setFilteredCount(exhaustionFiltered + rsiFiltered + wickFiltered + volumeFiltered + trendFiltered + boxFiltered + adxFiltered);
-      if (!isDisposedRef.current && series) {
-        try {
-          series.setMarkers(markers);
-        } catch (e: any) {
-          if (e?.message?.includes('disposed')) return;
-        }
-      }
-      setBacktestTrades([...allTrades].reverse());
-      return;
-    }
-
-    // =========================================================================
-    // NON-GOLD (NIFTY/BANKNIFTY): T3 STRIPED & ALPHATREND WITH SMART QUALITY FILTERS
-    // =========================================================================
-    // Hide Gold lines
+    // Hide unused breakout reference lines
     try {
       if (!isDisposedRef.current) {
         boxUpperRef.current?.applyOptions({ visible: false });
@@ -2102,6 +1068,15 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         alphaTrendTriggerRef.current.applyOptions({ visible: activeStrategies.alphaTrend });
       }
       
+      if (!isDisposedRef.current && vwapLineRef.current) {
+        if (samSignalsResult?.vwapValues && (activeStrategies.samSignals || activeSamConfig?.vwapFilterEnabled)) {
+          vwapLineRef.current.setData(mapSeriesData(samSignalsResult.vwapValues));
+          vwapLineRef.current.applyOptions({ visible: activeSamConfig?.showVwapLine ?? true });
+        } else {
+          vwapLineRef.current.applyOptions({ visible: false });
+        }
+      }
+
       if (!isDisposedRef.current && priceLinesRef.current.length > 0) {
         priceLinesRef.current.forEach(line => {
           try { series.removePriceLine(line); } catch (_) {}
@@ -2120,9 +1095,9 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     for (let i = 50; i < candles.length; i++) {
       const c = candles[i];
       const nextC = candles[i + 1];
-      const isDayEnd = isSessionEndBar(c.time as number, nextC?.time as number, isGold);
+      const isDayEnd = isSessionEndBar(c.time as number, nextC?.time as number);
       const shadowDate = new Date((c.time as number) * 1000);
-      const isShadowPreMarket = !isGold && (shadowDate.getUTCHours() * 60 + shadowDate.getUTCMinutes()) < (9 * 60 + 15);
+      const isShadowPreMarket = (shadowDate.getUTCHours() * 60 + shadowDate.getUTCMinutes()) < (9 * 60 + 15);
       const a = atr14[i] || Math.max(c.high - c.low, 1);
 
       for (let j = shadowOpenTrades.length - 1; j >= 0; j--) {
@@ -2218,6 +1193,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     let trendFiltered = 0;
     let openingFiltered = 0;
     let wickFiltered = 0;
+    let vwapFiltered = 0;
     let exhaustionFiltered = 0;
     let rsiFiltered = 0;
     let volumeFiltered = 0;
@@ -2230,20 +1206,20 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     for (let i = 50; i < candles.length; i++) {
        const curr = candles[i];
        const nextCandle = candles[i + 1];
-       const isDayEnd = isSessionEndBar(curr.time as number, nextCandle?.time as number, isGold);
+       const isDayEnd = isSessionEndBar(curr.time as number, nextCandle?.time as number);
        
        // Pre-market session check: strictly no trades before 09:15 AM IST for NSE
        const currDate = new Date((curr.time as number) * 1000);
        const currHour = currDate.getUTCHours();
        const currMin = currDate.getUTCMinutes();
        const currTotalMins = currHour * 60 + currMin;
-       const isPreMarket = !isGold && currTotalMins < (9 * 60 + 15);
+       const isPreMarket = currTotalMins < (9 * 60 + 15);
        const isSamPreMarketBlocked = (activeSamConfig?.noTradeBefore915 ?? true) && isPreMarket;
 
        // --- Process Pending Bar + 1 Open SAM Entry at open of candle i ---
        if (
          activeStrategies.samSignals &&
-         (activeSamConfig?.entryTiming ?? 'bar1Open') === 'bar1Open' &&
+         (activeSamConfig?.entryTiming ?? 'bar1Close') === 'bar1Open' &&
          pendingSamSignal &&
          !isDayEnd &&
          !isSamPreMarketBlocked
@@ -2450,7 +1426,10 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                  text: `close_long (SAM Bar+1 Adverse Cut ✂️ ${t.pnl >= 0 ? '+' : ''}${t.pnl}pt)`
                });
                continue;
-             } else if (activeSamConfig?.autoExitOpposite && samSignalsResult.putSignals[i]) {
+             } else if (
+               activeSamConfig?.autoExitOpposite && 
+               ((activeSamConfig?.vwapExitOppositeEnabled !== false && samSignalsResult.basePutSignals?.[i]) || samSignalsResult.putSignals[i])
+             ) {
                t.exitPrice = curr.close;
                t.exitTime = curr.time as number;
                t.exitReason = 'OPPOSITE_SIGNAL';
@@ -2589,7 +1568,10 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                  text: `close_short (SAM Bar+1 Adverse Cut ✂️ ${t.pnl >= 0 ? '+' : ''}${t.pnl}pt)`
                });
                continue;
-             } else if (activeSamConfig?.autoExitOpposite && samSignalsResult.callSignals[i]) {
+             } else if (
+               activeSamConfig?.autoExitOpposite && 
+               ((activeSamConfig?.vwapExitOppositeEnabled !== false && samSignalsResult.baseCallSignals?.[i]) || samSignalsResult.callSignals[i])
+             ) {
                t.exitPrice = curr.close;
                t.exitTime = curr.time as number;
                t.exitReason = 'OPPOSITE_SIGNAL';
@@ -3474,12 +2456,106 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
           const hasActiveTrade = (activeSamConfig?.oneTradeAtATime ?? true) && openTrades.some(
             t => t.status === 'OPEN' && t.strategyFamily === 'SAM_SIGNALS'
           );
+          const slPts = activeSamConfig?.stopLossPoints ?? 20;
+          const tpPts = activeSamConfig?.targetPoints ?? 60;
+          const entryTiming = activeSamConfig?.entryTiming ?? 'bar1Close';
+
+          // Visual Setup Markers on the setup candle (Bar 0)
+          if (entryTiming === 'bar1Close') {
+            if (samSignalsResult.candidateCallSignals?.[i]) {
+              markers.push({
+                time: curr.time,
+                position: 'belowBar',
+                color: '#F59E0B',
+                shape: 'circle',
+                text: 'SAM CALL (Setup: Awaiting Bar+1 Close ⏳)'
+              });
+            } else if (samSignalsResult.candidatePutSignals?.[i]) {
+              markers.push({
+                time: curr.time,
+                position: 'aboveBar',
+                color: '#F59E0B',
+                shape: 'circle',
+                text: 'SAM PUT (Setup: Awaiting Bar+1 Close ⏳)'
+              });
+            }
+
+            // Visual Filtered Rejection Markers on Bar + 1 candle when filtered out
+            if (i >= 1 && samSignalsResult.candidateCallSignals?.[i - 1] && !samSignalsResult.callSignals[i]) {
+              const curVwap = samSignalsResult.vwapValues?.[i];
+              const maxDist = activeSamConfig?.vwapMaxDistancePoints ?? 70;
+              const isBelowVwap = activeSamConfig?.vwapFilterEnabled && curVwap !== undefined && !isNaN(curVwap) && curr.close < curVwap;
+              const isClimaxOverextended = activeSamConfig?.vwapFilterEnabled && (activeSamConfig?.vwapClimaxFilterEnabled !== false) && curVwap !== undefined && !isNaN(curVwap) && (curr.close - curVwap) > maxDist;
+              markers.push({
+                time: curr.time,
+                position: 'aboveBar',
+                color: isBelowVwap || isClimaxOverextended ? '#06b6d4' : '#6B7280',
+                shape: 'circle',
+                text: isBelowVwap
+                  ? `SAM CALL (Filtered: Below VWAP ${curVwap.toFixed(1)} 🚫)` 
+                  : isClimaxOverextended
+                    ? `SAM CALL (Filtered: Climax +${(curr.close - curVwap).toFixed(1)}pt > VWAP 🚫)`
+                    : 'SAM CALL (Filtered: Adverse Bar+1 🚫)'
+              });
+            } else if (i >= 1 && samSignalsResult.candidatePutSignals?.[i - 1] && !samSignalsResult.putSignals[i]) {
+              const curVwap = samSignalsResult.vwapValues?.[i];
+              const maxDist = activeSamConfig?.vwapMaxDistancePoints ?? 70;
+              const isAboveVwap = activeSamConfig?.vwapFilterEnabled && curVwap !== undefined && !isNaN(curVwap) && curr.close > curVwap;
+              const isClimaxOversold = activeSamConfig?.vwapFilterEnabled && (activeSamConfig?.vwapClimaxFilterEnabled !== false) && curVwap !== undefined && !isNaN(curVwap) && (curVwap - curr.close) > maxDist;
+              markers.push({
+                time: curr.time,
+                position: 'belowBar',
+                color: isAboveVwap || isClimaxOversold ? '#06b6d4' : '#6B7280',
+                shape: 'circle',
+                text: isAboveVwap 
+                  ? `SAM PUT (Filtered: Above VWAP ${curVwap.toFixed(1)} 🚫)` 
+                  : isClimaxOversold
+                    ? `SAM PUT (Filtered: Climax -${(curVwap - curr.close).toFixed(1)}pt < VWAP 🚫)`
+                    : 'SAM PUT (Filtered: Adverse Bar+1 🚫)'
+              });
+            }
+
+            // Visual Setup Rejection Markers on Bar 0 when filtered by VWAP
+            if (samSignalsResult.rawCallSignals?.[i] && !samSignalsResult.candidateCallSignals?.[i]) {
+              const curVwap = samSignalsResult.vwapValues?.[i];
+              const maxDist = activeSamConfig?.vwapMaxDistancePoints ?? 70;
+              if (activeSamConfig?.vwapFilterEnabled && curVwap !== undefined && !isNaN(curVwap)) {
+                const isBelow = curr.close < curVwap;
+                const isClimax = (activeSamConfig?.vwapClimaxFilterEnabled !== false) && (curr.close - curVwap) > maxDist;
+                if (isBelow || isClimax) {
+                  markers.push({
+                    time: curr.time,
+                    position: 'aboveBar',
+                    color: '#0891b2',
+                    shape: 'circle',
+                    text: isBelow 
+                      ? `SAM CALL (Filtered: Below VWAP ${curVwap.toFixed(1)} 🚫)`
+                      : `SAM CALL (Filtered: Climax +${(curr.close - curVwap).toFixed(1)}pt > VWAP 🚫)`
+                  });
+                }
+              }
+            } else if (samSignalsResult.rawPutSignals?.[i] && !samSignalsResult.candidatePutSignals?.[i]) {
+              const curVwap = samSignalsResult.vwapValues?.[i];
+              const maxDist = activeSamConfig?.vwapMaxDistancePoints ?? 70;
+              if (activeSamConfig?.vwapFilterEnabled && curVwap !== undefined && !isNaN(curVwap)) {
+                const isAbove = curr.close > curVwap;
+                const isClimax = (activeSamConfig?.vwapClimaxFilterEnabled !== false) && (curVwap - curr.close) > maxDist;
+                if (isAbove || isClimax) {
+                  markers.push({
+                    time: curr.time,
+                    position: 'belowBar',
+                    color: '#0891b2',
+                    shape: 'circle',
+                    text: isAbove 
+                      ? `SAM PUT (Filtered: Above VWAP ${curVwap.toFixed(1)} 🚫)`
+                      : `SAM PUT (Filtered: Climax -${(curVwap - curr.close).toFixed(1)}pt < VWAP 🚫)`
+                  });
+                }
+              }
+            }
+          }
 
           if (!hasActiveTrade) {
-            const slPts = activeSamConfig?.stopLossPoints ?? 20;
-            const tpPts = activeSamConfig?.targetPoints ?? 60;
-            const entryTiming = activeSamConfig?.entryTiming ?? 'bar1Open';
-
             if (entryTiming === 'bar1Open') {
               // Signal detected on candle i. Entry executes on next candle open (Bar + 1).
               if (samSignalsResult.callSignals[i]) {
@@ -3488,34 +2564,38 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                 pendingSamSignal = { type: 'SHORT', signalBarIdx: i, signalTime: curr.time as number };
               }
             } else {
-              // Synthetic Bar 0 Close execution (Instant fill at signal candle close)
+              // bar1Close (Post-Adverse Filter Confirmed Entry) or bar0Close:
+              // For bar1Close: Entry executes at the close of candle i (which is Bar + 1 close).
+              // Stoploss & Target are calculated precisely from this Bar + 1 entry close price!
               if (samSignalsResult.callSignals[i]) {
                 markers.push({
                   time: curr.time,
                   position: 'belowBar',
                   color: activeSamConfig?.colorBuy || '#2196f3',
                   shape: 'arrowUp',
-                  text: 'SAM CALL'
+                  text: entryTiming === 'bar1Close' ? 'SAM CALL (Entry: Bar+1 Close)' : 'SAM CALL'
                 });
                 const entry = curr.close;
                 const stoploss = Number((entry - slPts).toFixed(2));
                 const target = Number((entry + tpPts).toFixed(2));
+                const target2 = Number((entry + (tpPts * 2)).toFixed(2));
                 const newTrade: Trade = {
                   id: `${curr.time}-SAM-CALL`,
                   type: 'LONG',
-                  signal: 'SAM CALL',
+                  signal: entryTiming === 'bar1Close' ? 'SAM CALL (Bar+1 Close)' : 'SAM CALL',
                   strategyFamily: 'SAM_SIGNALS',
                   entryTime: curr.time as number,
                   entryPrice: entry,
                   stoploss: stoploss,
                   target: target,
+                  target2: target2,
                   riskDist: slPts,
                   peakPrice: entry,
                   trailStage: 0,
                   status: 'OPEN',
                   isComboTrade: false,
                   entryBarIdx: i,
-                  signalBarIdx: i,
+                  signalBarIdx: entryTiming === 'bar1Close' ? i - 1 : i,
                 };
                 openTrades.push(newTrade);
                 allTrades.push(newTrade);
@@ -3525,27 +2605,29 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                   position: 'aboveBar',
                   color: activeSamConfig?.colorSell || '#ff5252',
                   shape: 'arrowDown',
-                  text: 'SAM PUT'
+                  text: entryTiming === 'bar1Close' ? 'SAM PUT (Entry: Bar+1 Close)' : 'SAM PUT'
                 });
                 const entry = curr.close;
                 const stoploss = Number((entry + slPts).toFixed(2));
                 const target = Number((entry - tpPts).toFixed(2));
+                const target2 = Number((entry - (tpPts * 2)).toFixed(2));
                 const newTrade: Trade = {
                   id: `${curr.time}-SAM-PUT`,
                   type: 'SHORT',
-                  signal: 'SAM PUT',
+                  signal: entryTiming === 'bar1Close' ? 'SAM PUT (Bar+1 Close)' : 'SAM PUT',
                   strategyFamily: 'SAM_SIGNALS',
                   entryTime: curr.time as number,
                   entryPrice: entry,
                   stoploss: stoploss,
                   target: target,
+                  target2: target2,
                   riskDist: slPts,
                   peakPrice: entry,
                   trailStage: 0,
                   status: 'OPEN',
                   isComboTrade: false,
                   entryBarIdx: i,
-                  signalBarIdx: i,
+                  signalBarIdx: entryTiming === 'bar1Close' ? i - 1 : i,
                 };
                 openTrades.push(newTrade);
                 allTrades.push(newTrade);
@@ -3555,7 +2637,48 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         }
      }
 
-    // Failsafe: If a pending signal occurred on the very last candle, show a status indicator
+    // Candidate indicators: If a candidate setup formed on the latest closed candle, track pending confirmation state
+    if (activeStrategies.samSignals && (activeSamConfig?.entryTiming ?? 'bar1Close') === 'bar1Close') {
+      const lastIdx = candles.length - 1;
+      const lastC = candles[lastIdx];
+      const hasActiveTrade = openTrades.some(t => t.status === 'OPEN' && t.strategyFamily === 'SAM_SIGNALS');
+      const currentPrice = livePrice || lastC?.close || 0;
+      const slPts = activeSamConfig?.stopLossPoints ?? 20;
+      const tpPts = activeSamConfig?.targetPoints ?? 60;
+      if (lastC && !hasActiveTrade && samSignalsResult.candidateCallSignals?.[lastIdx] && !samSignalsResult.callSignals[lastIdx]) {
+        setPendingSamSetup({
+          type: 'CALL',
+          time: lastC.time as number,
+          setupBarTime: lastC.time as number,
+          setupBarClose: lastC.close,
+          currentBar1Price: currentPrice,
+          estEntry: currentPrice,
+          estSL: Number((currentPrice - slPts).toFixed(2)),
+          estTP: Number((currentPrice + tpPts).toFixed(2)),
+          estTP2: Number((currentPrice + (tpPts * 2)).toFixed(2)),
+          formingTime: (lastC.time as number) + (timeframe * 60),
+        });
+      } else if (lastC && !hasActiveTrade && samSignalsResult.candidatePutSignals?.[lastIdx] && !samSignalsResult.putSignals[lastIdx]) {
+        setPendingSamSetup({
+          type: 'PUT',
+          time: lastC.time as number,
+          setupBarTime: lastC.time as number,
+          setupBarClose: lastC.close,
+          currentBar1Price: currentPrice,
+          estEntry: currentPrice,
+          estSL: Number((currentPrice + slPts).toFixed(2)),
+          estTP: Number((currentPrice - tpPts).toFixed(2)),
+          estTP2: Number((currentPrice - (tpPts * 2)).toFixed(2)),
+          formingTime: (lastC.time as number) + (timeframe * 60),
+        });
+      } else {
+        setPendingSamSetup(null);
+      }
+    } else {
+      setPendingSamSetup(null);
+    }
+
+    // Failsafe: If a pending signal occurred on the very last candle for bar1Open, show status indicator
     if (pendingSamSignal && activeStrategies.samSignals) {
       const lastC = candles[candles.length - 1];
       if (lastC) {
@@ -3573,7 +2696,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     for (const t of openTrades) {
       if (t.status === 'OPEN') {
         const lastC = candles[candles.length - 1];
-        const isActuallyDayEnd = isSessionEndBar(lastC.time as number, undefined, false);
+        const isActuallyDayEnd = isSessionEndBar(lastC.time as number);
         if (isActuallyDayEnd) {
           t.exitPrice = lastC.close;
           t.exitTime = lastC.time as number;
@@ -3600,12 +2723,16 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       rawWinRate,
       rawNetPnL,
       filteredCount: activeStrategies.samSignals
-        ? (samSignalsResult.wickFilteredCount || 0) + (samSignalsResult.bar1FilteredCount || 0)
+        ? (samSignalsResult.wickFilteredCount || 0) + (samSignalsResult.bar1FilteredCount || 0) + (samSignalsResult.vwapFilteredCount || 0) + (samSignalsResult.minBodyFilteredCount || 0) + (samSignalsResult.mtfEmaFilteredCount || 0) + (samSignalsResult.dayTrapFilteredCount || 0)
         : suppressedTrades,
       exhaustionFiltered,
       rsiFiltered,
       wickFiltered: activeStrategies.samSignals ? (samSignalsResult.wickFilteredCount || 0) : wickFiltered,
       bar1Filtered: activeStrategies.samSignals ? (samSignalsResult.bar1FilteredCount || 0) : 0,
+      vwapFiltered: activeStrategies.samSignals ? (samSignalsResult.vwapFilteredCount || 0) : vwapFiltered,
+      minBodyFiltered: activeStrategies.samSignals ? (samSignalsResult.minBodyFilteredCount || 0) : 0,
+      mtfEmaFiltered: activeStrategies.samSignals ? (samSignalsResult.mtfEmaFilteredCount || 0) : 0,
+      dayTrapFiltered: activeStrategies.samSignals ? (samSignalsResult.dayTrapFilteredCount || 0) : 0,
       volumeFiltered,
       trendFiltered,
       boxFiltered: 0,
@@ -3625,7 +2752,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         if (e?.message?.includes('disposed')) return;
       }
     }
-    setBacktestTrades([...allTrades].reverse());
+    const decoratedTrades = allTrades.map(t => decorateTradeWithOptionData(t, optionSnapshotsRef.current));
+    setBacktestTrades([...decoratedTrades].reverse());
   };
 
   const formatDate = (ts?: number) => {
@@ -3640,24 +2768,129 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     return d.toLocaleTimeString('en-IN', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', hour12: false });
   };
 
-  const totalTrades = backtestTrades.length;
-  const wins = backtestTrades.filter(t => t.status === 'WIN').length;
-  const losses = backtestTrades.filter(t => t.status === 'LOSS').length;
-  const beTrades = backtestTrades.filter(t => t.status === 'BE').length;
-  const dayEndSquareOffs = backtestTrades.filter(t => t.exitReason === 'DAY_END').length;
+  const getTradeDateKey = (ts?: number): string => {
+    if (!ts) return '';
+    const d = new Date(ts * 1000);
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  };
+
+  // Extract all unique dates from trades with trade counts and formatted labels
+  const availableTradeDates = useMemo(() => {
+    const dateMap = new Map<string, { dateKey: string; label: string; count: number }>();
+    for (const t of backtestTrades) {
+      if (!t.entryTime) continue;
+      const key = getTradeDateKey(t.entryTime);
+      if (!key) continue;
+      const label = formatDate(t.entryTime);
+      const existing = dateMap.get(key);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        dateMap.set(key, { dateKey: key, label, count: 1 });
+      }
+    }
+    // Sort descending by date (most recent date first)
+    return Array.from(dateMap.values()).sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+  }, [backtestTrades]);
+
+  // Filter trades based on selected date or custom range
+  const displayedTrades = useMemo(() => {
+    if (selectedDateFilter === 'ALL' && !isCustomRangeOpen) {
+      return backtestTrades;
+    }
+
+    if (isCustomRangeOpen) {
+      return backtestTrades.filter(t => {
+        const k = getTradeDateKey(t.entryTime);
+        if (!k) return false;
+        if (customStartDate && k < customStartDate) return false;
+        if (customEndDate && k > customEndDate) return false;
+        return true;
+      });
+    }
+
+    if (selectedDateFilter !== 'ALL') {
+      return backtestTrades.filter(t => getTradeDateKey(t.entryTime) === selectedDateFilter);
+    }
+
+    return backtestTrades;
+  }, [backtestTrades, selectedDateFilter, isCustomRangeOpen, customStartDate, customEndDate]);
+
+  const totalTrades = displayedTrades.length;
+  const wins = displayedTrades.filter(t => t.status === 'WIN').length;
+  const losses = displayedTrades.filter(t => t.status === 'LOSS').length;
+  const beTrades = displayedTrades.filter(t => t.status === 'BE').length;
+  const dayEndSquareOffs = displayedTrades.filter(t => t.exitReason === 'DAY_END').length;
   const winRate = (wins + losses) > 0 ? ((wins / (wins + losses)) * 100).toFixed(1) : '0.0';
-  const totalNetPnL = backtestTrades.reduce((acc, t) => acc + (t.pnl || 0), 0);
+  const totalNetPnL = displayedTrades.reduce((acc, t) => acc + (t.pnl || 0), 0);
+  const totalNetPremPnL = displayedTrades.reduce((acc, t) => acc + (t.premiumPnl || 0), 0);
+  const totalLotPnL = totalNetPremPnL * LOT_SIZE;
   const profitFactor = (() => {
-    const grossProfit = backtestTrades.filter(t => (t.pnl || 0) > 0).reduce((acc, t) => acc + (t.pnl || 0), 0);
-    const grossLoss = Math.abs(backtestTrades.filter(t => (t.pnl || 0) < 0).reduce((acc, t) => acc + (t.pnl || 0), 0));
+    const grossProfit = displayedTrades.filter(t => (t.pnl || 0) > 0).reduce((acc, t) => acc + (t.pnl || 0), 0);
+    const grossLoss = Math.abs(displayedTrades.filter(t => (t.pnl || 0) < 0).reduce((acc, t) => acc + (t.pnl || 0), 0));
     return grossLoss > 0 ? (grossProfit / grossLoss).toFixed(2) : grossProfit > 0 ? '∞' : '0.00';
   })();
 
-  const closedTradesWithDuration = backtestTrades.filter(t => t.exitTime && t.entryTime && t.status !== 'OPEN');
+  const closedTradesWithDuration = displayedTrades.filter(t => t.exitTime && t.entryTime && t.status !== 'OPEN');
   const avgDurationSec = closedTradesWithDuration.length > 0
     ? Math.floor(closedTradesWithDuration.reduce((acc, t) => acc + ((t.exitTime || 0) - t.entryTime), 0) / closedTradesWithDuration.length)
     : 0;
   const avgDurationFormatted = formatDuration(0, avgDurationSec);
+
+  const shouldShowPendingSetup = pendingSamSetup && (
+    (selectedDateFilter === 'ALL' && !isCustomRangeOpen) ||
+    (selectedDateFilter === getTradeDateKey(pendingSamSetup.setupBarTime)) ||
+    (isCustomRangeOpen && (
+      (!customStartDate || getTradeDateKey(pendingSamSetup.setupBarTime) >= customStartDate) &&
+      (!customEndDate || getTradeDateKey(pendingSamSetup.setupBarTime) <= customEndDate)
+    ))
+  );
+
+  const exportTradesCsv = () => {
+    if (displayedTrades.length === 0) return;
+    const headers = [
+      'Trade #', 'Date', 'Time', 'Strategy/Signal', 'Type', 'Entry Spot', 'Stoploss Spot', 
+      'Target Spot', 'Target 2 Spot', 'Exit Time', 'Duration', 'Exit Reason', 'Status', 
+      'Spot PnL (pts)', 'Option Contract', 'Option Delta', 'Entry Prem (₹)', 'Exit Prem (₹)', 
+      'Prem PnL (pts)', '1 Lot PnL (65 Qty)'
+    ];
+
+    const rows = displayedTrades.map((t, idx) => [
+      idx + 1,
+      formatDate(t.entryTime),
+      formatTime(t.entryTime),
+      `"${t.signal || ''}"`,
+      t.type,
+      t.entryPrice?.toFixed(2) ?? '',
+      t.stoploss?.toFixed(2) ?? '',
+      t.target?.toFixed(2) ?? '',
+      t.target2?.toFixed(2) ?? '',
+      t.exitTime ? formatTime(t.exitTime) : '',
+      t.duration || (t.exitTime ? formatDuration(t.entryTime, t.exitTime) : ''),
+      t.exitReason || '',
+      t.status || '',
+      t.pnl !== undefined ? t.pnl.toFixed(2) : '',
+      t.optionStrike ? `"${t.optionStrike} ${t.optionType}"` : '',
+      t.optionDelta !== undefined ? t.optionDelta.toFixed(2) : '',
+      t.optionEntryPremium !== undefined ? t.optionEntryPremium.toFixed(2) : '',
+      t.optionExitPremium !== undefined ? t.optionExitPremium.toFixed(2) : '',
+      t.premiumPnl !== undefined ? t.premiumPnl.toFixed(2) : '',
+      t.lotPnl !== undefined ? t.lotPnl.toFixed(2) : ''
+    ]);
+
+    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement('a');
+    link.setAttribute('href', encodedUri);
+    const dateSuffix = selectedDateFilter !== 'ALL' ? `_${selectedDateFilter}` : isCustomRangeOpen ? '_custom_range' : '';
+    link.setAttribute('download', `nifty_backtest_trades${dateSuffix}_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
 
   return (
     <div className="w-full flex flex-col gap-6">
@@ -3667,12 +2900,12 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         {/* Top Header */}
         <div className="p-3 sm:p-4 border-b border-[#1F2937] flex flex-wrap items-center justify-between gap-2.5 shrink-0 bg-[#0A0F1C]">
           <div className="flex items-center space-x-2 sm:space-x-3">
-            <span className={`w-2.5 h-2.5 rounded-full ${instrument.toUpperCase().includes('GOLD') ? 'bg-amber-400 animate-pulse' : 'bg-brand-blue animate-pulse'}`}></span>
+            <span className={`w-2.5 h-2.5 rounded-full $'bg-brand-blue animate-pulse'`}></span>
             <h3 className="text-sm sm:text-base md:text-lg font-bold text-white tracking-wide">
-              {instrument.toUpperCase().includes('GOLD') ? 'MCX GOLD Live Chart & PA Bot' : 'NIFTY 50 Live Chart & PA Bot'}
+              'NIFTY 50 Live Chart & PA Bot'
             </h3>
-            <span className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold uppercase ${instrument.toUpperCase().includes('GOLD') ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30' : 'bg-brand-blue/20 text-brand-blue border border-brand-blue/30'}`}>
-              {instrument.toUpperCase().includes('GOLD') ? 'MCX COMMODITY' : 'NSE INDEX'}
+            <span className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold uppercase $'bg-brand-blue/20 text-brand-blue border border-brand-blue/30'`}>
+              'NSE INDEX'
             </span>
           </div>
           
@@ -3725,165 +2958,15 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
           </div>
 
           <div className="hidden lg:flex items-center space-x-3 text-[10px] uppercase font-bold text-gray-500">
-            {isGold ? (
-              <>
-                <div className="flex items-center space-x-1"><span className="w-2 h-2 rounded-full bg-emerald-400"></span><span>open_long</span></div>
-                <div className="flex items-center space-x-1"><span className="w-2 h-2 rounded-full bg-red-400"></span><span>open_short</span></div>
-                <div className="flex items-center space-x-1"><span className="w-2 h-2 rounded-full bg-brand-blue"></span><span>close (TP)</span></div>
-                <div className="flex items-center space-x-1"><span className="w-2 h-2 rounded-full bg-red-500"></span><span>close (SL)</span></div>
-              </>
-            ) : (
-              <>
-                <div className="flex items-center space-x-1"><span className="w-2 h-2 rounded-full bg-brand-blue"></span><span>Auto Entry</span></div>
-                <div className="flex items-center space-x-1"><span className="w-2 h-2 rounded-full bg-red-500"></span><span>Auto SL</span></div>
-                <div className="flex items-center space-x-1"><span className="w-2 h-2 rounded-full bg-brand-green"></span><span>Auto Target</span></div>
-              </>
-            )}
+            <div className="flex items-center space-x-1"><span className="w-2 h-2 rounded-full bg-brand-blue"></span><span>Auto Entry</span></div>
+            <div className="flex items-center space-x-1"><span className="w-2 h-2 rounded-full bg-red-500"></span><span>Auto SL</span></div>
+            <div className="flex items-center space-x-1"><span className="w-2 h-2 rounded-full bg-brand-green"></span><span>Auto Target</span></div>
           </div>
         </div>
       
         {/* Strategies Settings Panel */}
         <div className="bg-[#0A0F1C] border-b border-[#1F2937] px-3 sm:px-4 py-2 sm:py-2.5 text-xs font-medium text-gray-300 shrink-0 w-full">
-          {isGold ? (
-            <div className="flex flex-col lg:flex-row lg:items-center justify-between w-full gap-3">
-              <div className="flex items-center gap-3 overflow-x-auto pb-1 sm:pb-0 touch-pan-x whitespace-nowrap scrollbar-thin">
-                {/* ADX Breakout Toggle */}
-                <label className="flex items-center gap-2 cursor-pointer font-bold text-amber-300 shrink-0">
-                  <input 
-                    type="checkbox" 
-                    checked={strategies.adxBreakout} 
-                    onChange={e => setStrategies(s => ({...s, adxBreakout: e.target.checked}))} 
-                    className="accent-amber-400" 
-                  />
-                  <span>Rob Booker - ADX Breakout</span>
-                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">GOLD ONLY</span>
-                </label>
 
-                {/* AlphaTrend Toggle for Gold */}
-                <label className="flex items-center gap-2 cursor-pointer font-bold text-cyan-400 shrink-0">
-                  <input 
-                    type="checkbox" 
-                    checked={strategies.alphaTrend} 
-                    onChange={e => setStrategies(s => ({...s, alphaTrend: e.target.checked}))} 
-                    className="accent-cyan-400" 
-                  />
-                  <span>AlphaTrend</span>
-                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">GOLD ONLY</span>
-                </label>
-
-                <div className="h-4 w-px bg-[#1F2937] shrink-0"></div>
-
-                {/* Gold Entry Mode Selector */}
-                <div className="flex items-center gap-1.5 bg-[#111827] px-2.5 py-1 rounded border border-[#1F2937] shrink-0">
-                  <span className="text-gray-400 font-semibold">Entry Mode:</span>
-                  <select
-                    value={entryMode}
-                    onChange={e => {
-                      const m = e.target.value as 'BREAKOUT' | 'RETEST' | 'ADAPTIVE';
-                      setEntryMode(m);
-                      setAdxBreakoutConfig(c => ({ ...c, entryMode: m }));
-                    }}
-                    className="bg-[#1A2234] border border-[#374151] rounded px-2 py-0.5 text-xs text-amber-300 font-bold focus:outline-none cursor-pointer"
-                  >
-                    <option value="BREAKOUT">🚀 Immediate Breakout</option>
-                    <option value="RETEST">🎯 Retest Confirmation</option>
-                    <option value="ADAPTIVE">⚡ Adaptive (Both)</option>
-                  </select>
-                </div>
-
-                <div className="h-4 w-px bg-[#1F2937] shrink-0"></div>
-
-                {/* Visual Strategy Legend */}
-                <div className="flex items-center gap-3 text-[11px] font-mono text-gray-400 shrink-0">
-                  <div className="flex items-center gap-1">
-                    <span className="w-3 h-0.5 bg-amber-400"></span>
-                    <span className="text-amber-400">Box High</span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <span className="w-3 h-0.5 bg-pink-500"></span>
-                    <span className="text-pink-400">Box Low</span>
-                  </div>
-                  {strategies.alphaTrend && (
-                    <div className="flex items-center gap-1">
-                      <span className="w-3 h-0.5 bg-cyan-400"></span>
-                      <span className="text-cyan-400">AlphaTrend</span>
-                    </div>
-                  )}
-                  <div className="flex items-center gap-1">
-                    <span className="w-3 h-0.5 bg-blue-500"></span>
-                    <span className="text-blue-400">Target</span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <span className="w-3 h-0.5 bg-red-500"></span>
-                    <span className="text-red-400">SL</span>
-                  </div>
-                </div>
-
-                <div className="h-4 w-px bg-[#1F2937] shrink-0"></div>
-
-                {/* Strategy Parameters */}
-                <div className="flex items-center gap-3 text-xs text-gray-400 shrink-0">
-                  <div className="flex items-center gap-1.5">
-                    <span>ADX Consolidation: &lt;</span>
-                    <select
-                      value={adxBreakoutConfig.adxLowerLevel}
-                      onChange={e => setAdxBreakoutConfig(c => ({ ...c, adxLowerLevel: Number(e.target.value) }))}
-                      className="bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-purple-400 font-mono focus:outline-none cursor-pointer"
-                    >
-                      <option value={15}>15</option>
-                      <option value={18}>18 (Default)</option>
-                      <option value={20}>20</option>
-                      <option value={25}>25</option>
-                    </select>
-                  </div>
-
-                  <div className="flex items-center gap-1.5">
-                    <span>Lookback:</span>
-                    <select
-                      value={adxBreakoutConfig.boxLookBack}
-                      onChange={e => setAdxBreakoutConfig(c => ({ ...c, boxLookBack: Number(e.target.value) }))}
-                      className="bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-amber-400 font-mono focus:outline-none cursor-pointer"
-                    >
-                      <option value={10}>10 bars</option>
-                      <option value={15}>15 bars</option>
-                      <option value={20}>20 bars (Default)</option>
-                      <option value={30}>30 bars</option>
-                    </select>
-                  </div>
-
-                  <div className="flex items-center gap-1.5">
-                    <span>Direction:</span>
-                    <select
-                      value={adxBreakoutConfig.enableDirection}
-                      onChange={e => setAdxBreakoutConfig(c => ({ ...c, enableDirection: Number(e.target.value) }))}
-                      className="bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-brand-blue font-mono focus:outline-none cursor-pointer"
-                    >
-                      <option value={0}>Both (Long &amp; Short)</option>
-                      <option value={1}>Long Only</option>
-                      <option value={-1}>Short Only</option>
-                    </select>
-                  </div>
-                </div>
-              </div>
-
-              {/* Real-time ADX Status Badge for Gold */}
-              {currentAdx && (
-                <div className="flex items-center gap-2 shrink-0">
-                  <div className={`px-2.5 py-1 rounded text-[11px] font-mono font-bold flex items-center gap-1.5 border ${
-                    currentAdx.value < adxBreakoutConfig.adxLowerLevel
-                      ? 'bg-purple-500/20 text-purple-300 border-purple-500/40 animate-pulse'
-                      : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                  }`}>
-                    <span className={`w-2 h-2 rounded-full ${currentAdx.value < adxBreakoutConfig.adxLowerLevel ? 'bg-purple-400' : 'bg-emerald-400'}`}></span>
-                    <span>ADX: {currentAdx.value}</span>
-                    <span className="font-normal text-gray-300">
-                      {currentAdx.value < adxBreakoutConfig.adxLowerLevel ? '(Consolidation: Box Armed)' : '(Trending)'}
-                    </span>
-                  </div>
-                </div>
-              )}
-            </div>
-          ) : (
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-2.5 w-full">
               {/* Primary Strategy Controls Strip (T3 Striped + AlphaTrend + Settings Button + ADX Filter) */}
               <div className="flex items-center gap-2 sm:gap-2.5 overflow-x-auto pb-1 sm:pb-0 touch-pan-x whitespace-nowrap scrollbar-thin w-full lg:w-auto">
@@ -4153,16 +3236,12 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                   {/* Quick Entry Timing toggle */}
                   <button
                     type="button"
-                    onClick={() => setSamConfig(c => ({ ...c, entryTiming: (c.entryTiming ?? 'bar1Open') === 'bar1Open' ? 'bar0Close' : 'bar1Open' }))}
+                    onClick={() => setSamConfig(c => ({ ...c, entryTiming: 'bar1Close' }))}
                     disabled={!strategies.samSignals}
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
-                      (samConfig.entryTiming ?? 'bar1Open') === 'bar1Open'
-                        ? 'bg-emerald-950/70 border-emerald-500/60 text-emerald-300 hover:bg-emerald-900/60'
-                        : 'bg-blue-950/70 border-blue-500/60 text-blue-300 hover:bg-blue-900/60'
-                    }`}
-                    title={(samConfig.entryTiming ?? 'bar1Open') === 'bar1Open' ? 'Entry Timing: Bar + 1 Open (Pine Script standard). Click to toggle to Bar 0 Close.' : 'Entry Timing: Bar 0 Close. Click to toggle to Bar + 1 Open.'}
+                    className="px-2 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer bg-emerald-950/70 border-emerald-500/60 text-emerald-300 hover:bg-emerald-900/60"
+                    title="Entry Timing: Bar + 1 Close (Post-Adverse Filter — Zero Repaint). Entry, Stoploss & Target are calculated strictly upon Bar+1 candle close."
                   >
-                    {(samConfig.entryTiming ?? 'bar1Open') === 'bar1Open' ? 'Entry:Bar+1' : 'Entry:Bar 0'}
+                    Entry: Bar+1 Close (Zero Repaint)
                   </button>
 
                   <div className="h-3 w-px bg-gray-700"></div>
@@ -4219,6 +3298,54 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     }
                   >
                     {samConfig.filterBar1AdverseCloseEnabled ? `Bar+1:ON` : `Bar+1:OFF`}
+                  </button>
+
+                  <div className="h-3 w-px bg-gray-700"></div>
+
+                  {/* Quick Min Body Filter toggle */}
+                  <button
+                    onClick={() => setSamConfig(c => ({ ...c, filterMinBodyEnabled: !c.filterMinBodyEnabled }))}
+                    disabled={!strategies.samSignals}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
+                      samConfig.filterMinBodyEnabled
+                        ? 'bg-amber-950/70 border-amber-500/60 text-amber-300 shadow-sm'
+                        : 'bg-[#0A0F1C] border-gray-700 text-gray-500 hover:text-gray-300'
+                    }`}
+                    title="Click to toggle Minimum Candle Body / Doji Filter"
+                  >
+                    {samConfig.filterMinBodyEnabled ? `Body:ON` : `Body:OFF`}
+                  </button>
+
+                  <div className="h-3 w-px bg-gray-700"></div>
+
+                  {/* Quick 5m MTF EMA Trend Filter toggle */}
+                  <button
+                    onClick={() => setSamConfig(c => ({ ...c, filterMtfEmaEnabled: !c.filterMtfEmaEnabled }))}
+                    disabled={!strategies.samSignals}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
+                      samConfig.filterMtfEmaEnabled
+                        ? 'bg-emerald-950/70 border-emerald-500/60 text-emerald-300 shadow-sm'
+                        : 'bg-[#0A0F1C] border-gray-700 text-gray-500 hover:text-gray-300'
+                    }`}
+                    title="Click to toggle 5-Minute MTF EMA Trend Filter"
+                  >
+                    {samConfig.filterMtfEmaEnabled ? `5mEMA:ON` : `5mEMA:OFF`}
+                  </button>
+
+                  <div className="h-3 w-px bg-gray-700"></div>
+
+                  {/* Quick Day High/Low Trap Filter toggle */}
+                  <button
+                    onClick={() => setSamConfig(c => ({ ...c, filterDayTrapEnabled: !c.filterDayTrapEnabled }))}
+                    disabled={!strategies.samSignals}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
+                      samConfig.filterDayTrapEnabled
+                        ? 'bg-indigo-950/70 border-indigo-500/60 text-indigo-300 shadow-sm'
+                        : 'bg-[#0A0F1C] border-gray-700 text-gray-500 hover:text-gray-300'
+                    }`}
+                    title="Click to toggle Day High/Low Trap Filter"
+                  >
+                    {samConfig.filterDayTrapEnabled ? `DayTrap:ON` : `DayTrap:OFF`}
                   </button>
 
                   <button
@@ -4320,7 +3447,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                 </div>
               )}
             </div>
-          )}
         </div>
       
         <div className="flex-1 relative min-h-[380px] w-full overflow-hidden">
@@ -4332,11 +3458,11 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       {/* Signals Dashboard Panel */}
       <div className="bg-[#111827] rounded-lg border border-[#1F2937] flex flex-col w-full">
         {/* Header & Metrics */}
-        <div className="p-3.5 sm:p-4 border-b border-[#1F2937] flex flex-col lg:flex-row lg:items-center justify-between shrink-0 bg-[#0A0F1C] gap-3">
-          <div className="flex items-center justify-between flex-wrap gap-2">
+        <div className="p-3.5 sm:p-4 border-b border-[#1F2937] flex flex-col shrink-0 bg-[#0A0F1C] gap-3">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
             <div className="flex items-center gap-2 flex-wrap">
               <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                <span>{isGold ? `Backtest Dashboard (${timeframe}m)` : `Backtest Dashboard (${instrument} ${timeframe}m)`}</span>
+                <span>{`Backtest Dashboard (${instrument} ${timeframe}m)`}</span>
                 <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">
                   {filterMode}
                 </span>
@@ -4346,7 +3472,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
               <div className="flex items-center bg-[#111827] p-0.5 rounded border border-[#1F2937] text-xs">
                 <button
                   onClick={() => setTradeViewMode('table')}
-                  className={`px-2 py-0.5 rounded transition-all font-medium ${
+                  className={`px-2 py-0.5 rounded transition-all font-medium cursor-pointer ${
                     tradeViewMode === 'table' ? 'bg-brand-blue text-black font-bold' : 'text-gray-400 hover:text-white'
                   }`}
                   title="Full detailed backtest table view"
@@ -4355,7 +3481,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                 </button>
                 <button
                   onClick={() => setTradeViewMode('cards')}
-                  className={`px-2 py-0.5 rounded transition-all font-medium ${
+                  className={`px-2 py-0.5 rounded transition-all font-medium cursor-pointer ${
                     tradeViewMode === 'cards' ? 'bg-brand-blue text-black font-bold' : 'text-gray-400 hover:text-white'
                   }`}
                   title="Mobile-optimized vertical card view"
@@ -4363,13 +3489,23 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                   📱 Cards
                 </button>
               </div>
+
+              {/* CSV Export Button */}
+              <button
+                onClick={exportTradesCsv}
+                disabled={displayedTrades.length === 0}
+                className="px-2.5 py-1 text-xs font-semibold rounded bg-[#111827] hover:bg-emerald-500/10 text-gray-300 hover:text-emerald-400 transition-colors flex items-center gap-1.5 border border-[#1F2937] hover:border-emerald-500/40 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                title="Export filtered backtest trades to CSV"
+              >
+                <span>📥 CSV</span>
+              </button>
             </div>
 
             {/* Collapsible Filters Toggle & Reset Button */}
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <button
                 onClick={() => setIsFiltersOpen(prev => !prev)}
-                className="px-2.5 py-1 text-xs font-semibold rounded bg-[#1F2937] hover:bg-[#374151] text-gray-200 transition-colors flex items-center gap-1.5 border border-[#374151]"
+                className="px-2.5 py-1 text-xs font-semibold rounded bg-[#1F2937] hover:bg-[#374151] text-gray-200 transition-colors flex items-center gap-1.5 border border-[#374151] cursor-pointer"
               >
                 <span>⚙️ Filters ({
                   (filterSettings.strictStoploss ? 1 : 0) +
@@ -4385,7 +3521,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
               </button>
               <button
                 onClick={handleResetFilters}
-                className="px-2 py-1 text-[11px] rounded bg-[#111827] hover:bg-amber-500/10 text-gray-400 hover:text-amber-300 border border-[#1F2937] hover:border-amber-400/40 transition-colors"
+                className="px-2 py-1 text-[11px] rounded bg-[#111827] hover:bg-amber-500/10 text-gray-400 hover:text-amber-300 border border-[#1F2937] hover:border-amber-400/40 transition-colors cursor-pointer"
                 title="Reset all filters back to default"
               >
                 ↺ Reset
@@ -4393,8 +3529,140 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
             </div>
           </div>
 
+          {/* Date Filter Control Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-2.5 pt-2.5 border-t border-[#1F2937]/70 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[11px] font-bold text-gray-300 uppercase tracking-wider flex items-center gap-1 shrink-0">
+                <span>📅</span>
+                <span>Date Filter:</span>
+              </span>
+
+              {/* Date Select Dropdown */}
+              <select
+                value={isCustomRangeOpen ? 'CUSTOM' : selectedDateFilter}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val === 'CUSTOM') {
+                    setIsCustomRangeOpen(true);
+                  } else {
+                    setIsCustomRangeOpen(false);
+                    setSelectedDateFilter(val);
+                  }
+                }}
+                className="bg-[#111827] border border-[#374151] rounded px-2.5 py-1 text-xs text-white font-mono focus:border-brand-blue outline-none cursor-pointer"
+              >
+                <option value="ALL">All Dates ({backtestTrades.length} Total Trades)</option>
+                {availableTradeDates.map(d => (
+                  <option key={d.dateKey} value={d.dateKey}>
+                    {d.label} ({d.count} {d.count === 1 ? 'trade' : 'trades'})
+                  </option>
+                ))}
+                <option value="CUSTOM">Custom Date Range...</option>
+              </select>
+
+              {/* Quick 1-Click Date Buttons */}
+              <div className="flex items-center gap-1 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsCustomRangeOpen(false);
+                    setSelectedDateFilter('ALL');
+                  }}
+                  className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors cursor-pointer border ${
+                    selectedDateFilter === 'ALL' && !isCustomRangeOpen
+                      ? 'bg-brand-blue/20 text-brand-blue border-brand-blue/40 font-bold'
+                      : 'bg-[#111827] text-gray-400 border-[#1F2937] hover:text-white'
+                  }`}
+                >
+                  All ({backtestTrades.length})
+                </button>
+                {availableTradeDates.slice(0, 5).map(d => (
+                  <button
+                    key={d.dateKey}
+                    type="button"
+                    onClick={() => {
+                      setIsCustomRangeOpen(false);
+                      setSelectedDateFilter(d.dateKey);
+                    }}
+                    className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors cursor-pointer border ${
+                      selectedDateFilter === d.dateKey && !isCustomRangeOpen
+                        ? 'bg-brand-green/20 text-brand-green border-brand-green/40 font-bold'
+                        : 'bg-[#111827] text-gray-400 border-[#1F2937] hover:text-white'
+                    }`}
+                  >
+                    {d.label.split(' ').slice(0, 2).join(' ')} ({d.count})
+                  </button>
+                ))}
+              </div>
+
+              {/* Custom Date Range Picker */}
+              {isCustomRangeOpen && (
+                <div className="flex items-center gap-1.5 bg-[#111827] px-2.5 py-1 rounded border border-brand-blue/50 text-xs font-mono">
+                  <span className="text-gray-400 text-[10px]">From:</span>
+                  <input
+                    type="date"
+                    value={customStartDate}
+                    onChange={e => setCustomStartDate(e.target.value)}
+                    className="bg-[#0A0F1C] border border-[#374151] rounded px-1.5 py-0.5 text-[11px] text-white focus:border-brand-blue outline-none cursor-pointer"
+                  />
+                  <span className="text-gray-400 text-[10px]">To:</span>
+                  <input
+                    type="date"
+                    value={customEndDate}
+                    onChange={e => setCustomEndDate(e.target.value)}
+                    className="bg-[#0A0F1C] border border-[#374151] rounded px-1.5 py-0.5 text-[11px] text-white focus:border-brand-blue outline-none cursor-pointer"
+                  />
+                  {(customStartDate || customEndDate) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCustomStartDate('');
+                        setCustomEndDate('');
+                      }}
+                      className="text-gray-400 hover:text-red-400 text-xs px-1 cursor-pointer font-bold"
+                      title="Clear Custom Date Range"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Clear Filter / Reset to All */}
+            {(selectedDateFilter !== 'ALL' || isCustomRangeOpen) && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedDateFilter('ALL');
+                  setIsCustomRangeOpen(false);
+                  setCustomStartDate('');
+                  setCustomEndDate('');
+                }}
+                className="px-2.5 py-0.5 rounded text-[11px] font-bold bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 border border-amber-500/30 transition-colors flex items-center gap-1 cursor-pointer shrink-0"
+              >
+                <span>✕ Clear Date Filter</span>
+                <span className="text-[10px] text-gray-400 font-mono">({displayedTrades.length} of {backtestTrades.length})</span>
+              </button>
+            )}
+          </div>
+
           {/* Performance Summary Metrics (Responsive Grid for Portrait/Landscape) */}
           <div className="grid grid-cols-2 sm:grid-cols-4 md:flex md:flex-wrap gap-x-3 gap-y-1.5 text-xs text-gray-400 items-center bg-[#111827]/60 p-2 rounded-lg border border-[#1F2937]/80">
+            {selectedDateFilter !== 'ALL' && !isCustomRangeOpen && (
+              <div className="flex items-center gap-1.5 bg-brand-blue/10 text-brand-blue px-2 py-0.5 rounded border border-brand-blue/30 font-mono font-bold">
+                <span>📅 Date:</span>
+                <span>{availableTradeDates.find(d => d.dateKey === selectedDateFilter)?.label || selectedDateFilter}</span>
+                <span className="text-gray-400 font-normal">({displayedTrades.length} of {backtestTrades.length})</span>
+              </div>
+            )}
+            {isCustomRangeOpen && (
+              <div className="flex items-center gap-1.5 bg-brand-blue/10 text-brand-blue px-2 py-0.5 rounded border border-brand-blue/30 font-mono font-bold">
+                <span>📅 Range:</span>
+                <span>{customStartDate || 'Start'} → {customEndDate || 'End'}</span>
+                <span className="text-gray-400 font-normal">({displayedTrades.length} of {backtestTrades.length})</span>
+              </div>
+            )}
             <div className="flex items-center gap-1.5">
               <span>Total:</span>
               <span className="text-white font-bold">{totalTrades}</span>
@@ -4418,9 +3686,21 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
               <span className="text-brand-blue font-bold">{winRate}%</span>
             </div>
             <div className="flex items-center gap-1.5">
-              <span>Net PnL:</span>
+              <span>Spot Net:</span>
               <span className={`font-bold ${totalNetPnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                 {(totalNetPnL >= 0 ? '+' : '') + totalNetPnL.toFixed(1)} pts
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-cyan-400">Prem Net:</span>
+              <span className={`font-bold ${totalNetPremPnL >= 0 ? 'text-cyan-300' : 'text-red-400'}`}>
+                {(totalNetPremPnL >= 0 ? '+' : '') + totalNetPremPnL.toFixed(2)} pts
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5 bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-500/30">
+              <span className="text-gray-300">1 Lot Net (65 Qty):</span>
+              <span className={`font-extrabold ${totalLotPnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                {(totalLotPnL >= 0 ? '+₹' : '-₹') + Math.abs(totalLotPnL).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </span>
             </div>
             <div className="flex items-center gap-1.5">
@@ -4445,106 +3725,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
             )}
           </div>
 
-          {/* Gold Retest vs Immediate Breakout Side-by-Side Comparison Card */}
-          {isGold && retestComparison.breakoutTotal > 0 && (
-            <div className="mt-3 p-3 rounded-lg bg-gradient-to-r from-[#0F172A] to-[#1E1B4B] border border-amber-500/30 text-xs">
-              <div className="flex items-center justify-between flex-wrap gap-2 pb-2 mb-2 border-b border-[#334155]/60">
-                <div className="flex items-center gap-2">
-                  <span className="text-base">⚖️</span>
-                  <span className="font-bold text-amber-300">Gold Setup Analysis: Retest vs Immediate Breakout Entry</span>
-                  <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-200 border border-amber-500/40 font-mono">
-                    Active Mode: {entryMode}
-                  </span>
-                </div>
-                <div className="text-[11px] text-gray-400">
-                  Dual backtested on {dataRef.current?.length || 0} bars of Gold data
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
-                {/* Immediate Breakout Column */}
-                <div className={`p-2.5 rounded border transition-all ${
-                  entryMode === 'BREAKOUT' 
-                    ? 'bg-[#1E293B]/80 border-amber-400/50 shadow-sm shadow-amber-500/10' 
-                    : 'bg-[#0B1120]/60 border-[#1E293B]'
-                }`}>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <span className="font-bold text-gray-200 flex items-center gap-1.5">
-                      <span>🚀 Immediate Breakout</span>
-                      {entryMode === 'BREAKOUT' && <span className="text-[9px] px-1 py-0.2 rounded bg-amber-400 text-black font-extrabold">SELECTED</span>}
-                    </span>
-                    <span className="font-mono font-bold text-blue-400">{retestComparison.breakoutWinRate}% WR</span>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2 text-[11px] font-mono">
-                    <div className="bg-[#0F172A] p-1.5 rounded">
-                      <span className="text-gray-400 block text-[10px]">Trades:</span>
-                      <span className="text-white font-bold">{retestComparison.breakoutTotal}</span> ({retestComparison.breakoutWins}W/{retestComparison.breakoutLosses}L)
-                    </div>
-                    <div className="bg-[#0F172A] p-1.5 rounded">
-                      <span className="text-gray-400 block text-[10px]">Net PnL:</span>
-                      <span className={`font-bold ${retestComparison.breakoutNetPnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {(retestComparison.breakoutNetPnL >= 0 ? '+' : '') + retestComparison.breakoutNetPnL.toFixed(1)} pts
-                      </span>
-                    </div>
-                    <div className="bg-[#0F172A] p-1.5 rounded">
-                      <span className="text-gray-400 block text-[10px]">Avg R:R:</span>
-                      <span className="text-amber-300 font-bold">1 : {retestComparison.breakoutAvgRR}</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Retest Confirmation Column */}
-                <div className={`p-2.5 rounded border transition-all ${
-                  entryMode === 'RETEST' 
-                    ? 'bg-[#1E293B]/80 border-emerald-400/50 shadow-sm shadow-emerald-500/10' 
-                    : 'bg-[#0B1120]/60 border-[#1E293B]'
-                }`}>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <span className="font-bold text-gray-200 flex items-center gap-1.5">
-                      <span>🎯 Retest Confirmation (Pullback)</span>
-                      {entryMode === 'RETEST' && <span className="text-[9px] px-1 py-0.2 rounded bg-emerald-400 text-black font-extrabold">SELECTED</span>}
-                    </span>
-                    <span className="font-mono font-bold text-emerald-400">{retestComparison.retestWinRate}% WR</span>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2 text-[11px] font-mono">
-                    <div className="bg-[#0F172A] p-1.5 rounded">
-                      <span className="text-gray-400 block text-[10px]">Trades:</span>
-                      <span className="text-white font-bold">{retestComparison.retestTotal}</span> ({retestComparison.retestWins}W/{retestComparison.retestLosses}L)
-                    </div>
-                    <div className="bg-[#0F172A] p-1.5 rounded">
-                      <span className="text-gray-400 block text-[10px]">Net PnL:</span>
-                      <span className={`font-bold ${retestComparison.retestNetPnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {(retestComparison.retestNetPnL >= 0 ? '+' : '') + retestComparison.retestNetPnL.toFixed(1)} pts
-                      </span>
-                    </div>
-                    <div className="bg-[#0F172A] p-1.5 rounded">
-                      <span className="text-gray-400 block text-[10px]">Avg R:R:</span>
-                      <span className="text-emerald-300 font-bold">1 : {retestComparison.retestAvgRR}</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Trade-off Key Takeaways */}
-              <div className="flex items-center justify-between flex-wrap gap-2 text-[11px] text-gray-300 bg-[#0B1120]/80 p-2 rounded border border-[#1E293B]">
-                <div className="flex items-center gap-4 flex-wrap">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-emerald-400 font-bold">🛡️ False Breakouts Saved:</span>
-                    <span className="text-white font-bold font-mono">{retestComparison.falseBreakoutsSaved}</span>
-                    <span className="text-gray-500 text-[10px]">(failed breakout spikes filtered out)</span>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-amber-400 font-bold">🏃 Missed Runaway Moves:</span>
-                    <span className="text-white font-bold font-mono">{retestComparison.missedRunaways}</span>
-                    <span className="text-gray-500 text-[10px]">(breakouts that didn't pull back)</span>
-                  </div>
-                </div>
-                <div className="text-purple-300 font-medium">
-                  {retestComparison.retestAvgRR > retestComparison.breakoutAvgRR ? '💡 Retest doubles R:R with tighter invalidation stop' : '⚡ Breakout captures instant momentum'}
-                </div>
-              </div>
-            </div>
-          )}
         </div>
 
         {/* Strategy Signal Filter Optimizer Controls (Collapsible) */}
@@ -4594,7 +3774,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     }`}
                   >
                     <span>🐢 Classic Booker</span>
-                    <span className={`text-[10px] px-1 py-0.2 rounded ${filterMode === 'BOOKER_ADX' ? 'bg-black/20 text-purple-100 font-extrabold' : 'bg-black/30 text-purple-300'}`}>ADX &lt; {isGold ? adxBreakoutConfig.adxLowerLevel : adxChopFilter.threshold}</span>
+                    <span className={`text-[10px] px-1 py-0.2 rounded ${filterMode === 'BOOKER_ADX' ? 'bg-black/20 text-purple-100 font-extrabold' : 'bg-black/30 text-purple-300'}`}>ADX &lt; {adxChopFilter.threshold}</span>
                   </button>
                   <button
                     onClick={() => {
@@ -4687,6 +3867,88 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                         70% Losses / 10% Wins [{samConfig.bar1ActionMode === 'exit' ? 'Cut' : 'Skip'}]
                       </span>
                     </label>
+
+                    {/* Filter 3: Smart Intraday VWAP & Climax Filter */}
+                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Smart Intraday VWAP: Institutional trend alignment (Long >= VWAP, Short <= VWAP) + Climax Exhaustion Band (<= 70pt) + Early Reversal Exit unblocking. Click to toggle ON/OFF.">
+                      <input
+                        type="checkbox"
+                        checked={samConfig.vwapFilterEnabled ?? true}
+                        onChange={e => setSamConfig(c => ({ ...c, vwapFilterEnabled: e.target.checked }))}
+                        className="accent-cyan-400 cursor-pointer"
+                      />
+                      <span className={`font-semibold ${samConfig.vwapFilterEnabled ? 'text-cyan-300' : 'text-gray-400'}`}>
+                        Smart VWAP ({comparisonStats.vwapFiltered})
+                      </span>
+                      <span className={`text-[10px] px-1.5 py-0.2 rounded border font-mono ${
+                        samConfig.vwapFilterEnabled
+                          ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20'
+                          : 'bg-gray-800 text-gray-400 border-gray-700'
+                      }`}>
+                        {samConfig.vwapFilterEnabled ? 'ON' : 'OFF'} • &le;{samConfig.vwapMaxDistancePoints ?? 70}pt Band
+                      </span>
+                    </label>
+
+                    {/* Show VWAP Line Toggle */}
+                    <label className="flex items-center gap-1 cursor-pointer text-gray-400 hover:text-cyan-300 text-[11px]" title="Toggle Intraday VWAP line overlay on chart">
+                      <input
+                        type="checkbox"
+                        checked={samConfig.showVwapLine ?? true}
+                        onChange={e => setSamConfig(c => ({ ...c, showVwapLine: e.target.checked }))}
+                        className="accent-cyan-400 cursor-pointer w-3.5 h-3.5"
+                      />
+                      <span className="flex items-center gap-1">
+                        <span className="w-2 h-2 rounded-full bg-cyan-400 inline-block"></span>
+                        <span>VWAP Line</span>
+                      </span>
+                    </label>
+
+                    {/* Filter 4: Minimum Candle Body Filter (Kill Dojis) */}
+                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Filters entry candles with tiny body or doji (lacks institutional follow-through)">
+                      <input
+                        type="checkbox"
+                        checked={samConfig.filterMinBodyEnabled}
+                        onChange={e => setSamConfig(c => ({ ...c, filterMinBodyEnabled: e.target.checked }))}
+                        className="accent-amber-400 cursor-pointer"
+                      />
+                      <span className={`font-semibold ${samConfig.filterMinBodyEnabled ? 'text-amber-300' : 'text-gray-400'}`}>
+                        Min Body &ge;{samConfig.minBodyPoints ?? 7}pt ({comparisonStats.minBodyFiltered})
+                      </span>
+                      <span className="text-[10px] bg-amber-500/10 text-amber-300 px-1.5 py-0.2 rounded border border-amber-500/20 font-mono">
+                        Kill Dojis
+                      </span>
+                    </label>
+
+                    {/* Filter 5: 5-Minute MTF EMA Trend Alignment */}
+                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Only takes CALLs above 5m EMA20 and PUTs below 5m EMA20. Dynamic momentum without VWAP lag.">
+                      <input
+                        type="checkbox"
+                        checked={samConfig.filterMtfEmaEnabled}
+                        onChange={e => setSamConfig(c => ({ ...c, filterMtfEmaEnabled: e.target.checked }))}
+                        className="accent-emerald-400 cursor-pointer"
+                      />
+                      <span className={`font-semibold ${samConfig.filterMtfEmaEnabled ? 'text-emerald-300' : 'text-gray-400'}`}>
+                        5m EMA{samConfig.mtfEmaPeriod ?? 20} ({comparisonStats.mtfEmaFiltered})
+                      </span>
+                      <span className="text-[10px] bg-emerald-500/10 text-emerald-300 px-1.5 py-0.2 rounded border border-emerald-500/20 font-mono">
+                        MTF Trend
+                      </span>
+                    </label>
+
+                    {/* Filter 6: Day High / Day Low Trap */}
+                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Prevents buying into Day High resistance or shorting into Day Low support within 10 points.">
+                      <input
+                        type="checkbox"
+                        checked={samConfig.filterDayTrapEnabled}
+                        onChange={e => setSamConfig(c => ({ ...c, filterDayTrapEnabled: e.target.checked }))}
+                        className="accent-indigo-400 cursor-pointer"
+                      />
+                      <span className={`font-semibold ${samConfig.filterDayTrapEnabled ? 'text-indigo-300' : 'text-gray-400'}`}>
+                        Day H/L Trap &le;{samConfig.dayTrapBufferPoints ?? 10}pt ({comparisonStats.dayTrapFiltered})
+                      </span>
+                      <span className="text-[10px] bg-indigo-500/10 text-indigo-300 px-1.5 py-0.2 rounded border border-indigo-500/20 font-mono">
+                        Range Guard
+                      </span>
+                    </label>
                   </div>
 
                   <button
@@ -4723,7 +3985,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                       />
                       <span className="text-cyan-300 font-semibold">BE Lock @ 50% TP ({comparisonStats.beSavedCount} saved)</span>
                     </label>
-                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Avoids taking trades during opening market buffer (before 09:25 IST for Nifty, 09:15 IST for Gold) when spreads and volatility whipsaws are highest">
+                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Avoids taking trades during opening market buffer (before 09:25 IST for Nifty) when spreads and volatility whipsaws are highest">
                       <input
                         type="checkbox"
                         checked={filterSettings.openingRangeBuffer}
@@ -4804,23 +4066,120 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
           </div>
         )}
 
+        {/* Pending Confirmation Banner for SAM Bar+1 Setup */}
+        {shouldShowPendingSetup && (
+          <div className="mx-3.5 sm:mx-4 mt-3 mb-1 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs text-amber-200">
+            <div className="flex items-start sm:items-center gap-2.5">
+              <span className="text-base animate-pulse">⏳</span>
+              <div>
+                <div className="font-bold text-amber-300 flex items-center gap-2">
+                  <span>POTENTIAL TRADE / PENDING CONFIRMATION</span>
+                  <span className="px-1.5 py-0.2 rounded text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                    SAM {pendingSamSetup.type}
+                  </span>
+                  <span className="px-1.5 py-0.2 rounded text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-mono">
+                    Zero Repaint Rule
+                  </span>
+                </div>
+                <div className="text-[11px] text-gray-300 mt-1">
+                  Setup crossover formed on prior candle at {formatTime(pendingSamSetup.setupBarTime)} (Spot: ₹{pendingSamSetup.setupBarClose.toFixed(2)}).
+                  Trade entry is <span className="text-amber-300 font-bold">NOT</span> taken at the earlier candle. 
+                  Actual entry executes <span className="text-emerald-400 font-bold">strictly upon close of Immediate Adverse Bar + 1</span> (currently forming @ ~₹{pendingSamSetup.estEntry.toFixed(2)}). 
+                  Stoploss ({pendingSamSetup.type === 'CALL' ? '-20pt' : '+20pt'}: ₹{pendingSamSetup.estSL.toFixed(2)}) and Target ({pendingSamSetup.type === 'CALL' ? '+60pt' : '-60pt'}: ₹{pendingSamSetup.estTP.toFixed(2)}) are calculated strictly from this Bar + 1 close entry price.
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 self-start sm:self-auto shrink-0">
+              <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono text-[10px] font-bold animate-pulse">
+                AWAITING BAR+1 CLOSE
+              </span>
+            </div>
+          </div>
+        )}
+
         {/* Backtest Trades Container: Responsive Cards or Horizontal Table */}
         {tradeViewMode === 'cards' ? (
           /* Mobile / Portrait Card View: Fully readable vertically without horizontal scrolling */
           <div className="overflow-y-auto max-h-[550px] min-h-[350px] p-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 bg-[#0A0F1C]">
-            {backtestTrades.length === 0 ? (
-              <div className="col-span-full py-12 text-center text-gray-500">
-                No trades generated for this period or all filtered out by selected filters.
+            {/* Pending Setup Card */}
+            {shouldShowPendingSetup && (
+              <div className="bg-[#111827] rounded-lg border border-amber-500/50 p-3 flex flex-col justify-between gap-2.5 hover:border-amber-400 transition-colors shadow-sm ring-1 ring-amber-500/20">
+                <div className="flex items-start justify-between gap-2 border-b border-[#1F2937]/70 pb-2">
+                  <div className="flex flex-col">
+                    <div className="flex items-center gap-1.5">
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                        pendingSamSetup.type === 'CALL'
+                          ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                          : 'bg-red-500/10 text-red-400 border border-red-500/20'
+                      }`}>
+                        {pendingSamSetup.type === 'CALL' ? 'LONG' : 'SHORT'}
+                      </span>
+                      <span className="font-semibold text-xs text-amber-300 truncate max-w-[130px]">
+                        SAM {pendingSamSetup.type}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-amber-400/80 font-mono mt-0.5">
+                      At Bar+1 Close ⏳ (Setup @ {formatTime(pendingSamSetup.setupBarTime)})
+                    </div>
+                  </div>
+                  <div className="flex flex-col items-end">
+                    <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse">
+                      POTENTIAL ⏳
+                    </span>
+                    <span className="text-[10px] text-gray-400 mt-0.5 font-mono">Bar+1 Forming</span>
+                  </div>
+                </div>
+
+                {/* Pending Setup Price Levels */}
+                <div className="grid grid-cols-4 gap-1.5 text-center text-[11px] font-mono bg-[#0A0F1C] p-2 rounded border border-amber-500/20">
+                  <div className="flex flex-col">
+                    <span className="text-amber-400/80 text-[10px]">Entry Point</span>
+                    <span className="text-amber-300 font-bold">~{pendingSamSetup.estEntry.toFixed(2)}</span>
+                    <span className="text-[9px] text-gray-400">At Bar+1 Close</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-red-400/80 text-[10px]">Stoploss</span>
+                    <span className="text-red-400 font-medium">~{pendingSamSetup.estSL.toFixed(2)}</span>
+                    <span className="text-[9px] text-gray-400">{pendingSamSetup.type === 'CALL' ? '-20pt' : '+20pt'}</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-emerald-400/80 text-[10px]">Target 1</span>
+                    <span className="text-emerald-400 font-medium">~{pendingSamSetup.estTP.toFixed(2)}</span>
+                    <span className="text-[9px] text-gray-400">{pendingSamSetup.type === 'CALL' ? '+60pt' : '-60pt'}</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-purple-400/80 text-[10px]">Target 2</span>
+                    <span className="text-purple-300 font-medium">~{pendingSamSetup.estTP2.toFixed(2)}</span>
+                    <span className="text-[9px] text-gray-400">{pendingSamSetup.type === 'CALL' ? '+120pt' : '-120pt'}</span>
+                  </div>
+                </div>
+
+                {/* Pending Setup Option Estimate */}
+                <div className="flex items-center justify-between text-[11px] font-mono bg-amber-950/20 px-2 py-1.5 rounded border border-amber-500/30 text-amber-200">
+                  <span>Option ATM: ~{Math.round(pendingSamSetup.estEntry / 50) * 50} {pendingSamSetup.type === 'CALL' ? 'CE' : 'PE'} (Δ 0.50)</span>
+                  <span className="font-bold text-emerald-400">1 Lot Est: ~+₹1,950 / -₹1,138</span>
+                </div>
+
+                <div className="text-[10px] text-gray-400 bg-gray-900/80 px-2 py-1 rounded border border-gray-800 text-center">
+                  Trade executes strictly on Immediate Adverse Bar+1 close (Zero Repaint). Stoploss &amp; Target are locked from this Bar+1 close.
+                </div>
+              </div>
+            )}
+            {displayedTrades.length === 0 && !shouldShowPendingSetup ? (
+              <div className="col-span-full py-12 text-center text-gray-500 font-mono text-xs">
+                {selectedDateFilter !== 'ALL' || isCustomRangeOpen 
+                  ? 'No trades found matching the selected date filter.' 
+                  : 'No trades generated for this period or all filtered out by selected filters.'}
               </div>
             ) : (
-              backtestTrades.map((t, idx) => (
+              displayedTrades.map((t, idx) => (
                 <div
                   key={t.id + '-' + idx}
                   className="bg-[#111827] rounded-lg border border-[#1F2937] p-3 flex flex-col justify-between gap-2.5 hover:border-gray-600 transition-colors shadow-sm"
                 >
                   <div className="flex items-start justify-between gap-2 border-b border-[#1F2937]/70 pb-2">
                     <div className="flex flex-col">
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex items-center gap-1.5 flex-wrap">
                         <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
                           t.type === 'LONG' 
                             ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' 
@@ -4829,6 +4188,11 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                           {t.type}
                         </span>
                         <span className="font-semibold text-xs text-white truncate max-w-[130px]">{t.signal}</span>
+                        {t.optionStrike && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-cyan-950/60 text-cyan-300 border border-cyan-800/60">
+                            {t.optionStrike} {t.optionType}
+                          </span>
+                        )}
                       </div>
                       <div className="text-[11px] text-gray-400 font-mono mt-0.5">
                         {formatDate(t.entryTime)} {formatTime(t.entryTime)}
@@ -4844,10 +4208,13 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                       }`}>
                         {t.status === 'BE' ? 'BE (Safe)' : t.status}
                       </span>
-                      <div className={`text-xs font-mono font-bold mt-0.5 ${
-                        t.pnl === undefined ? 'text-gray-500' : t.pnl > 0 ? 'text-emerald-400' : t.pnl < 0 ? 'text-red-400' : 'text-gray-300'
-                      }`}>
-                        {t.pnl !== undefined ? (t.pnl > 0 ? '+' : '') + t.pnl.toFixed(2) + ' pts' : '-'}
+                      <div className="text-[10px] font-mono text-gray-400 mt-0.5">
+                        Spot: <span className={t.pnl === undefined ? 'text-gray-500' : t.pnl > 0 ? 'text-emerald-400 font-semibold' : t.pnl < 0 ? 'text-red-400 font-semibold' : 'text-gray-300 font-semibold'}>
+                          {t.pnl !== undefined ? (t.pnl > 0 ? '+' : '') + t.pnl.toFixed(2) + ' pts' : '-'}
+                        </span>
+                      </div>
+                      <div className="text-[11px] font-mono font-bold text-cyan-300">
+                        Prem: {t.premiumPnl !== undefined ? (t.premiumPnl > 0 ? '+' : '') + t.premiumPnl.toFixed(2) + ' pts' : '-'}
                       </div>
                     </div>
                   </div>
@@ -4869,6 +4236,22 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     <div className="flex flex-col">
                       <span className="text-purple-400/80 text-[10px]">Target 2</span>
                       <span className="text-purple-300 font-medium">{t.target2 ? t.target2.toFixed(2) : '-'}</span>
+                    </div>
+                  </div>
+
+                  {/* Option Premium & 1-Lot PnL Bar */}
+                  <div className="flex items-center justify-between text-[11px] font-mono bg-cyan-950/20 px-2 py-1.5 rounded border border-cyan-500/20">
+                    <div className="flex items-center gap-1 text-cyan-200">
+                      <span className="text-gray-400 text-[10px]">Prem:</span>
+                      <span>₹{t.optionEntryPremium?.toFixed(1) || '-'} {t.optionExitPremium !== undefined ? `→ ₹${t.optionExitPremium.toFixed(1)}` : ''}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] text-gray-400">1 Lot (65 Qty):</span>
+                      <span className={`font-bold ${
+                        t.lotPnl === undefined ? 'text-gray-500' : t.lotPnl > 0 ? 'text-emerald-400' : t.lotPnl < 0 ? 'text-red-400' : 'text-gray-300'
+                      }`}>
+                        {t.lotPnl !== undefined ? (t.lotPnl >= 0 ? '+' : '') + '₹' + t.lotPnl.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '-'}
+                      </span>
                     </div>
                   </div>
 
@@ -4931,14 +4314,80 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                   <th className="py-2.5 px-3 text-center whitespace-nowrap">Time in Trade</th>
                   <th className="py-2.5 px-3 text-center whitespace-nowrap">Exit Trigger</th>
                   <th className="py-2.5 px-3 text-center whitespace-nowrap">Status</th>
-                  <th className="py-2.5 px-3 text-right whitespace-nowrap">PnL</th>
+                  <th className="py-2.5 px-3 text-right whitespace-nowrap">Spot PnL</th>
+                  <th className="py-2.5 px-3 whitespace-nowrap text-cyan-400">Option Contract</th>
+                  <th className="py-2.5 px-3 text-right whitespace-nowrap text-cyan-400">Prem PnL (pts)</th>
+                  <th className="py-2.5 px-3 text-right whitespace-nowrap text-emerald-400">1 Lot PnL (65 Qty)</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#1F2937]">
-                {backtestTrades.length === 0 && (
-                   <tr><td colSpan={12} className="py-8 text-center text-gray-500">No trades generated for this period</td></tr>
+                {shouldShowPendingSetup && (
+                  <tr className="bg-amber-950/20 border-b border-amber-500/30 text-amber-200 hover:bg-amber-950/30 transition-colors">
+                    <td className="py-2.5 px-3 whitespace-nowrap font-mono text-amber-300">{formatDate(pendingSamSetup.time || pendingSamSetup.setupBarTime)}</td>
+                    <td className="py-2.5 px-3 whitespace-nowrap font-mono text-amber-300">
+                      <span className="flex items-center gap-1.5">
+                        <span>{formatTime(pendingSamSetup.time || pendingSamSetup.setupBarTime)}</span>
+                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-sans font-bold">Bar 0 Setup</span>
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 whitespace-nowrap font-bold text-amber-300">
+                      SAM {pendingSamSetup.type} (Pending Confirmation ⏳)
+                    </td>
+                    <td className="py-2.5 px-3 whitespace-nowrap">
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${pendingSamSetup.type === 'CALL' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-red-500/10 text-red-400 border border-red-500/20'}`}>
+                        {pendingSamSetup.type === 'CALL' ? 'LONG' : 'SHORT'}
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono whitespace-nowrap text-amber-300 font-bold" title="Will enter at Bar+1 close; approx level near current price">
+                      ~{pendingSamSetup.estEntry.toFixed(2)} (At Bar+1 Close)
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono text-red-400/90 whitespace-nowrap" title="Stoploss is decided at Bar+1 close (Entry - 20 pts)">
+                      ~{pendingSamSetup.estSL.toFixed(2)} (-20pt from Entry)
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono text-emerald-400/90 whitespace-nowrap" title="Target is decided at Bar+1 close (Entry + 60 pts)">
+                      ~{pendingSamSetup.estTP.toFixed(2)} (+60pt from Entry)
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono text-purple-300/80 whitespace-nowrap">
+                      ~{(pendingSamSetup.type === 'CALL' ? pendingSamSetup.estEntry + 120 : pendingSamSetup.estEntry - 120).toFixed(2)}
+                    </td>
+                    <td className="py-2.5 px-3 font-mono text-gray-500 whitespace-nowrap">-</td>
+                    <td className="py-2.5 px-3 text-center font-mono whitespace-nowrap">
+                      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse">
+                        Bar + 1 Forming ⏳
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 text-center whitespace-nowrap">
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/10 text-amber-300 border border-amber-500/20">
+                        Awaiting Filter
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 text-center whitespace-nowrap">
+                      <span className="px-2 py-0.5 rounded text-[10px] font-extrabold bg-amber-500/30 text-amber-200 border border-amber-500/50 shadow-sm animate-pulse">
+                        POTENTIAL ⏳
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono text-gray-500 whitespace-nowrap">-</td>
+                    <td className="py-2.5 px-3 whitespace-nowrap font-mono text-cyan-300">
+                      ~{Math.round(pendingSamSetup.estEntry / 50) * 50} {pendingSamSetup.type === 'CALL' ? 'CE' : 'PE'} (ATM)
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono text-cyan-300/80 whitespace-nowrap">
+                      ~+30.00 / -17.50 pt
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-400 whitespace-nowrap">
+                      ~+₹1,950 / -₹1,138
+                    </td>
+                  </tr>
                 )}
-                {backtestTrades.map((t, idx) => (
+                {displayedTrades.length === 0 && !shouldShowPendingSetup && (
+                   <tr>
+                     <td colSpan={16} className="py-8 text-center text-gray-500 font-mono text-xs">
+                       {selectedDateFilter !== 'ALL' || isCustomRangeOpen 
+                         ? 'No trades found matching the selected date filter.' 
+                         : 'No trades generated for this period'}
+                     </td>
+                   </tr>
+                )}
+                {displayedTrades.map((t, idx) => (
                   <tr key={t.id + '-' + idx} className="hover:bg-[#111827] transition-colors">
                     <td className="py-2 px-3 whitespace-nowrap font-mono text-gray-300">{formatDate(t.entryTime)}</td>
                     <td className="py-2 px-3 whitespace-nowrap font-mono text-gray-300">{formatTime(t.entryTime)}</td>
@@ -5015,12 +4464,47 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     <td className={`py-2 px-3 text-right font-mono whitespace-nowrap ${t.pnl === undefined ? 'text-gray-500' : t.pnl > 0 ? 'text-emerald-400 font-semibold' : t.pnl < 0 ? 'text-red-400 font-semibold' : 'text-gray-300 font-semibold'}`}>
                       {t.pnl !== undefined ? (
                         <span>
-                          {t.pnl > 0 ? '+' : ''}{t.pnl.toFixed(2)}
+                          {t.pnl > 0 ? '+' : ''}{t.pnl.toFixed(2)} pts
                           {t.status === 'OPEN' && <span className="text-[10px] text-gray-500 ml-1">(unrealized)</span>}
                         </span>
                       ) : (
                         '-'
                       )}
+                    </td>
+                    <td className="py-2 px-3 whitespace-nowrap font-mono">
+                      {t.optionStrike ? (
+                        <div className="flex items-center gap-1">
+                          <span className="px-1.5 py-0.5 rounded text-[11px] font-bold bg-cyan-950/60 text-cyan-300 border border-cyan-800/60">
+                            {t.optionStrike} {t.optionType}
+                          </span>
+                          <span className="text-[10px] text-gray-400 font-mono">(Δ {t.optionDelta?.toFixed(2) || '0.50'})</span>
+                        </div>
+                      ) : (
+                        <span className="text-gray-500">-</span>
+                      )}
+                    </td>
+                    <td className={`py-2 px-3 text-right font-mono whitespace-nowrap ${
+                      t.premiumPnl === undefined ? 'text-gray-500' : t.premiumPnl > 0 ? 'text-cyan-300 font-semibold' : t.premiumPnl < 0 ? 'text-red-400 font-semibold' : 'text-gray-300 font-semibold'
+                    }`}>
+                      {t.premiumPnl !== undefined ? (
+                        <div className="flex flex-col items-end">
+                          <span>{t.premiumPnl > 0 ? '+' : ''}{t.premiumPnl.toFixed(2)} pts</span>
+                          {t.optionEntryPremium !== undefined && (
+                            <span className="text-[10px] text-gray-400 font-mono">
+                              ₹{t.optionEntryPremium.toFixed(1)} {t.optionExitPremium !== undefined ? `→ ₹${t.optionExitPremium.toFixed(1)}` : ''}
+                            </span>
+                          )}
+                        </div>
+                      ) : '-'}
+                    </td>
+                    <td className={`py-2 px-3 text-right font-mono whitespace-nowrap font-bold ${
+                      t.lotPnl === undefined ? 'text-gray-500' : t.lotPnl > 0 ? 'text-emerald-400' : t.lotPnl < 0 ? 'text-red-400' : 'text-gray-300'
+                    }`}>
+                      {t.lotPnl !== undefined ? (
+                        <span>
+                          {t.lotPnl >= 0 ? '+' : ''}₹{t.lotPnl.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </span>
+                      ) : '-'}
                     </td>
                   </tr>
                 ))}
@@ -5035,7 +4519,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       {/* ========================================================================= */}
       {showStrategySettingsModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4 animate-in fade-in duration-200">
-          <div className="bg-[#111827] border border-[#374151] rounded-2xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+          <div className="bg-[#111827] border border-[#374151] rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
             {/* Header */}
             <div className="px-6 py-4 border-b border-[#1F2937] flex items-center justify-between bg-[#0A0F1C]/80">
               <div className="flex items-center gap-3">
@@ -5825,44 +5309,68 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                       </div>
                     </div>
 
-                    {/* Entry Timing Toggle (Bar + 1 Open vs Bar 0 Close) */}
+                    {/* Entry Timing Toggle (Bar + 1 Close vs Bar + 1 Open vs Bar 0 Close) */}
                     <div className="p-3.5 rounded-lg bg-[#111827] border border-[#1F2937] space-y-2.5">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
                           <span className="text-sm">⏱️</span>
-                          <span className="text-xs font-semibold text-white">Entry Timing</span>
+                          <span className="text-xs font-semibold text-white">Entry Timing &amp; Invalidation Point</span>
                           <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                            (samConfig.entryTiming ?? 'bar1Open') === 'bar1Open'
+                            (samConfig.entryTiming ?? 'bar1Close') === 'bar1Close'
                               ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                              : 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                              : samConfig.entryTiming === 'bar1Open'
+                                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                                : 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
                           }`}>
-                            {(samConfig.entryTiming ?? 'bar1Open') === 'bar1Open' ? 'Bar + 1 Open (Active)' : 'Bar 0 Close (Active)'}
+                            {(samConfig.entryTiming ?? 'bar1Close') === 'bar1Close' ? 'Bar + 1 Close (Zero Repaint)' : samConfig.entryTiming === 'bar1Open' ? 'Bar + 1 Open' : 'Bar 0 Close'}
                           </span>
                         </div>
                       </div>
                       <p className="text-[11px] text-gray-300">
-                        Choose whether trades execute realistically on the next candle open, or instantaneously at the signal candle close:
+                        Choose your exact entry trigger point. Stop loss and profit target levels are calculated directly from this entry price:
                       </p>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                         <button
                           type="button"
-                          onClick={() => setSamConfig(c => ({ ...c, entryTiming: 'bar1Open' }))}
+                          onClick={() => setSamConfig(c => ({ ...c, entryTiming: 'bar1Close' }))}
                           className={`p-3 rounded-lg text-left transition-all cursor-pointer border ${
-                            (samConfig.entryTiming ?? 'bar1Open') === 'bar1Open'
+                            (samConfig.entryTiming ?? 'bar1Close') === 'bar1Close'
                               ? 'bg-emerald-950/40 border-emerald-500/60 shadow-sm ring-1 ring-emerald-500/30'
                               : 'bg-[#0A0F1C] border-[#374151] hover:border-gray-500 text-gray-400'
                           }`}
                         >
                           <div className="flex items-center justify-between mb-1">
-                            <span className={`text-xs font-bold ${(samConfig.entryTiming ?? 'bar1Open') === 'bar1Open' ? 'text-emerald-400' : 'text-gray-300'}`}>
-                              Bar + 1 Open
+                            <span className={`text-xs font-bold ${(samConfig.entryTiming ?? 'bar1Close') === 'bar1Close' ? 'text-emerald-400' : 'text-gray-300'}`}>
+                              Bar + 1 Close
                             </span>
                             <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                              Recommended
+                              Zero Repaint
                             </span>
                           </div>
                           <p className="text-[10px] text-gray-400 leading-relaxed">
-                            Realistic / Pine Script standard. Waits for the signal candle to confirm and close; order fills at the Open of Bar + 1. Entry markers and trade logs are positioned on Bar + 1.
+                            Waits for Immediate Adverse Bar + 1 to close. If favorable, enters at Bar + 1 close. Stop loss and target are calculated from this exact entry. Completely eliminates repainting!
+                          </p>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setSamConfig(c => ({ ...c, entryTiming: 'bar1Open' }))}
+                          className={`p-3 rounded-lg text-left transition-all cursor-pointer border ${
+                            samConfig.entryTiming === 'bar1Open'
+                              ? 'bg-cyan-950/40 border-cyan-500/60 shadow-sm ring-1 ring-cyan-500/30'
+                              : 'bg-[#0A0F1C] border-[#374151] hover:border-gray-500 text-gray-400'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between mb-1">
+                            <span className={`text-xs font-bold ${samConfig.entryTiming === 'bar1Open' ? 'text-cyan-400' : 'text-gray-300'}`}>
+                              Bar + 1 Open
+                            </span>
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                              Pine Script
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-gray-400 leading-relaxed">
+                            Waits for signal candle to close; fills at the opening tick of Bar + 1. Stop loss &amp; target are calculated from Bar + 1 open.
                           </p>
                         </button>
 
@@ -5880,7 +5388,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                               Bar 0 Close
                             </span>
                             <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-gray-800 text-gray-400 border border-gray-700">
-                              Instant Synthetic
+                              Bar 0 Close Fill
                             </span>
                           </div>
                           <p className="text-[10px] text-gray-400 leading-relaxed">
@@ -6004,7 +5512,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                       {/* Filter 1: Adverse Rejection Wick */}
                       <div className={`p-3.5 rounded-lg border transition-all ${
                         samConfig.filterRejectionWickEnabled
@@ -6152,6 +5660,359 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                           </div>
                           <p className="text-gray-400 pt-1 font-mono text-[9px] leading-tight">
                             Win #3 (12:22 SHORT): Entry c0 (22,675.25 &rarr; 22,668.65 Red), Bar+1 c1 (22,667.80 &rarr; 22,669.85 Green).
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Filter 3: Smart Intraday VWAP & Climax Protection */}
+                      <div className={`p-3.5 rounded-lg border transition-all ${
+                        samConfig.vwapFilterEnabled
+                          ? 'bg-cyan-950/20 border-cyan-500/40 shadow-sm'
+                          : 'bg-[#111827] border-[#1F2937]'
+                      }`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={samConfig.vwapFilterEnabled ?? true}
+                              onChange={e => setSamConfig(c => ({ ...c, vwapFilterEnabled: e.target.checked }))}
+                              className="accent-cyan-400 w-4 h-4 cursor-pointer"
+                            />
+                            <span className="text-xs font-bold text-white">3. Smart Intraday VWAP &amp; Climax Guard</span>
+                          </label>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            samConfig.vwapFilterEnabled
+                              ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                              : 'bg-gray-800 text-gray-400'
+                          }`}>
+                            {samConfig.vwapFilterEnabled ? 'FILTER ACTIVE (ON)' : 'OFF'}
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-gray-300 mb-2">
+                          Institutional benchmark filter: Enforces trend alignment + limits climax overextension + unblocks early reversal exits:
+                        </p>
+
+                        <div className="text-[10px] space-y-1 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800/80 font-mono mb-3 text-gray-300">
+                          <p className="text-cyan-300">• For LONG: Price &ge; VWAP &amp; Distance &le; {samConfig.vwapMaxDistancePoints ?? 70}pt</p>
+                          <p className="text-rose-300">• For SHORT: Price &le; VWAP &amp; Distance &le; {samConfig.vwapMaxDistancePoints ?? 70}pt</p>
+                        </div>
+
+                        {/* Climax Band Protection Controls */}
+                        <div className="space-y-2 mb-3 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800">
+                          <label className="flex items-center justify-between cursor-pointer">
+                            <span className="text-[11px] text-gray-300 font-medium">Climax / Overextension Protection:</span>
+                            <input
+                              type="checkbox"
+                              checked={samConfig.vwapClimaxFilterEnabled ?? true}
+                              onChange={e => setSamConfig(c => ({ ...c, vwapClimaxFilterEnabled: e.target.checked }))}
+                              className="accent-cyan-400 cursor-pointer"
+                            />
+                          </label>
+                          
+                          <div className={`space-y-1.5 transition-opacity ${samConfig.vwapClimaxFilterEnabled !== false ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
+                            <div className="flex items-center justify-between gap-2">
+                              <label className="text-[10px] text-gray-400">Max Distance from VWAP:</label>
+                              <div className="flex items-center gap-1.5">
+                                <input
+                                  type="number"
+                                  min={30}
+                                  max={150}
+                                  step={5}
+                                  value={samConfig.vwapMaxDistancePoints ?? 70}
+                                  onChange={e => setSamConfig(c => ({ ...c, vwapMaxDistancePoints: Math.max(20, Number(e.target.value) || 70) }))}
+                                  className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                                />
+                                <span className="text-[10px] text-gray-400">pts</span>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              {[50, 70, 85].map(pts => (
+                                <button
+                                  key={pts}
+                                  type="button"
+                                  onClick={() => setSamConfig(c => ({ ...c, vwapMaxDistancePoints: pts }))}
+                                  className={`px-2 py-0.5 rounded text-[9px] font-mono transition-colors cursor-pointer border ${
+                                    (samConfig.vwapMaxDistancePoints ?? 70) === pts
+                                      ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40 font-bold'
+                                      : 'bg-[#111827] text-gray-400 border-gray-700 hover:text-white'
+                                  }`}
+                                >
+                                  {pts}pt {pts === 70 ? '(Ideal)' : ''}
+                                </button>
+                              ))}
+                            </div>
+                            <p className="text-[9px] text-gray-400">
+                              Blocks taking long entries when price is &gt; {samConfig.vwapMaxDistancePoints ?? 70}pt above VWAP (prevents climax exhaustion entries).
+                            </p>
+                          </div>
+                        </div>
+
+                        {/* Opening Buffer & Opposite Exit Toggles */}
+                        <div className="space-y-2 mb-3 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800 text-[11px]">
+                          <label className="flex items-center justify-between cursor-pointer">
+                            <div>
+                              <span className="text-gray-300 font-medium">Opening 09:25 Buffer:</span>
+                              <p className="text-[9px] text-gray-400">Skip entries before 09:25 AM when VWAP is forming</p>
+                            </div>
+                            <input
+                              type="checkbox"
+                              checked={samConfig.vwapOpeningBufferEnabled ?? true}
+                              onChange={e => setSamConfig(c => ({ ...c, vwapOpeningBufferEnabled: e.target.checked }))}
+                              className="accent-cyan-400 cursor-pointer"
+                            />
+                          </label>
+
+                          <label className="flex items-center justify-between cursor-pointer pt-1.5 border-t border-gray-800">
+                            <div>
+                              <span className="text-gray-300 font-medium">Early Reversal Exit Unblocked:</span>
+                              <p className="text-[9px] text-gray-400">Exit open trades on opposite signal even if counter entry is blocked</p>
+                            </div>
+                            <input
+                              type="checkbox"
+                              checked={samConfig.vwapExitOppositeEnabled ?? true}
+                              onChange={e => setSamConfig(c => ({ ...c, vwapExitOppositeEnabled: e.target.checked }))}
+                              className="accent-cyan-400 cursor-pointer"
+                            />
+                          </label>
+                        </div>
+
+                        {/* Chart Overlay Toggle */}
+                        <div className="flex items-center justify-between gap-2 pt-1 mb-3 bg-[#0A0F1C] p-2 rounded border border-[#374151]">
+                          <label className="flex items-center gap-2 cursor-pointer text-[11px] text-gray-300">
+                            <input
+                              type="checkbox"
+                              checked={samConfig.showVwapLine ?? true}
+                              onChange={e => setSamConfig(c => ({ ...c, showVwapLine: e.target.checked }))}
+                              className="accent-cyan-400 cursor-pointer"
+                            />
+                            <span>Plot VWAP Cyan Line on Chart</span>
+                          </label>
+                          <span className="w-3 h-0.5 bg-cyan-400 rounded"></span>
+                        </div>
+
+                        {/* Occurrence Stats Pill */}
+                        <div className="p-2 rounded bg-cyan-900/10 border border-cyan-800/30 text-[10px] space-y-0.5">
+                          <div className="flex justify-between text-gray-300">
+                            <span>Trades Filtered on Chart:</span>
+                            <span className="font-bold text-cyan-300 font-mono">{comparisonStats.vwapFiltered} Blocked</span>
+                          </div>
+                          <p className="text-cyan-300/90 pt-1 font-sans text-[10px] leading-relaxed">
+                            ⚡ Prevents buying climax exhaustion spikes (like the 13:00 trade at +168 pts above VWAP) and enables early reversal exits instead of taking full -20pt stop losses.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Filter 4: Minimum Candle Body Filter (Kill Dojis) */}
+                      <div className={`p-3.5 rounded-lg border transition-all ${
+                        samConfig.filterMinBodyEnabled
+                          ? 'bg-amber-950/20 border-amber-500/40 shadow-sm'
+                          : 'bg-[#111827] border-[#1F2937]'
+                      }`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={samConfig.filterMinBodyEnabled}
+                              onChange={e => setSamConfig(c => ({ ...c, filterMinBodyEnabled: e.target.checked }))}
+                              className="accent-amber-400 w-4 h-4 cursor-pointer"
+                            />
+                            <span className="text-xs font-bold text-white">4. Min Candle Body Filter (Kill Dojis)</span>
+                          </label>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            samConfig.filterMinBodyEnabled
+                              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                              : 'bg-gray-800 text-gray-400'
+                          }`}>
+                            {samConfig.filterMinBodyEnabled ? 'FILTER ACTIVE' : 'OFF'}
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-gray-300 mb-2">
+                          Eliminates hesitation candles (Dojis, spinning tops) that lack institutional volume and follow-through:
+                        </p>
+
+                        <div className="text-[10px] space-y-1 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800/80 font-mono mb-3 text-gray-300">
+                          <p className="text-amber-300">• Min Real Body Height: &ge; {samConfig.minBodyPoints ?? 7} pts on Nifty Spot</p>
+                          <p className="text-gray-300">• Min Body-to-Range Ratio: &ge; {samConfig.minBodyRatioPercent ?? 45}%</p>
+                        </div>
+
+                        <div className="space-y-2 mb-3 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800">
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">Min Body Height (pts):</label>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min={3}
+                                max={30}
+                                step={1}
+                                value={samConfig.minBodyPoints ?? 7}
+                                onChange={e => setSamConfig(c => ({ ...c, minBodyPoints: Math.max(2, Number(e.target.value) || 7) }))}
+                                className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                              />
+                              <span className="text-[10px] text-gray-400">pts</span>
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">Min Body Ratio (% of Range):</label>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min={20}
+                                max={80}
+                                step={5}
+                                value={samConfig.minBodyRatioPercent ?? 45}
+                                onChange={e => setSamConfig(c => ({ ...c, minBodyRatioPercent: Math.max(10, Number(e.target.value) || 45) }))}
+                                className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                              />
+                              <span className="text-[10px] text-gray-400">%</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="p-2 rounded bg-amber-900/10 border border-amber-800/30 text-[10px] space-y-0.5">
+                          <div className="flex justify-between text-gray-300">
+                            <span>Dojis Filtered on Chart:</span>
+                            <span className="font-bold text-amber-300 font-mono">{comparisonStats.minBodyFiltered} Blocked</span>
+                          </div>
+                          <p className="text-amber-300/90 pt-1 font-sans text-[10px]">
+                            ✨ Removes low-energy chop signals where buyers and sellers are indecisive.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Filter 5: 5-Minute MTF EMA Trend Alignment */}
+                      <div className={`p-3.5 rounded-lg border transition-all ${
+                        samConfig.filterMtfEmaEnabled
+                          ? 'bg-emerald-950/20 border-emerald-500/40 shadow-sm'
+                          : 'bg-[#111827] border-[#1F2937]'
+                      }`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={samConfig.filterMtfEmaEnabled}
+                              onChange={e => setSamConfig(c => ({ ...c, filterMtfEmaEnabled: e.target.checked }))}
+                              className="accent-emerald-400 w-4 h-4 cursor-pointer"
+                            />
+                            <span className="text-xs font-bold text-white">5. 5-Min MTF EMA Trend Alignment</span>
+                          </label>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            samConfig.filterMtfEmaEnabled
+                              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                              : 'bg-gray-800 text-gray-400'
+                          }`}>
+                            {samConfig.filterMtfEmaEnabled ? 'FILTER ACTIVE' : 'OFF'}
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-gray-300 mb-2">
+                          Higher-timeframe trend filter: Fast and dynamic without the lagging day-anchor flaws of VWAP:
+                        </p>
+
+                        <div className="text-[10px] space-y-1 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800/80 font-mono mb-3 text-gray-300">
+                          <p className="text-emerald-300">• For CALL: Price &ge; 5-min EMA {samConfig.mtfEmaPeriod ?? 20} (or slope &gt; 0)</p>
+                          <p className="text-rose-300">• For PUT: Price &le; 5-min EMA {samConfig.mtfEmaPeriod ?? 20} (or slope &lt; 0)</p>
+                        </div>
+
+                        <div className="space-y-2 mb-3 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800">
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">5-Min EMA Period:</label>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min={5}
+                                max={100}
+                                step={1}
+                                value={samConfig.mtfEmaPeriod ?? 20}
+                                onChange={e => setSamConfig(c => ({ ...c, mtfEmaPeriod: Math.max(3, Number(e.target.value) || 20) }))}
+                                className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                              />
+                              <span className="text-[10px] text-gray-400">bars</span>
+                            </div>
+                          </div>
+                          <label className="flex items-center justify-between cursor-pointer pt-1 border-t border-gray-800">
+                            <span className="text-[10px] text-gray-300">Strict Slope Confirmation:</span>
+                            <input
+                              type="checkbox"
+                              checked={samConfig.mtfEmaRequireSlope ?? false}
+                              onChange={e => setSamConfig(c => ({ ...c, mtfEmaRequireSlope: e.target.checked }))}
+                              className="accent-emerald-400 cursor-pointer"
+                            />
+                          </label>
+                        </div>
+
+                        <div className="p-2 rounded bg-emerald-900/10 border border-emerald-800/30 text-[10px] space-y-0.5">
+                          <div className="flex justify-between text-gray-300">
+                            <span>Counter-Trend Filtered:</span>
+                            <span className="font-bold text-emerald-300 font-mono">{comparisonStats.mtfEmaFiltered} Blocked</span>
+                          </div>
+                          <p className="text-emerald-300/90 pt-1 font-sans text-[10px]">
+                            🚀 Prevents taking trades against the active 5-minute directional tide.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Filter 6: Day High / Day Low Trap Filter */}
+                      <div className={`p-3.5 rounded-lg border transition-all ${
+                        samConfig.filterDayTrapEnabled
+                          ? 'bg-indigo-950/20 border-indigo-500/40 shadow-sm'
+                          : 'bg-[#111827] border-[#1F2937]'
+                      }`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={samConfig.filterDayTrapEnabled}
+                              onChange={e => setSamConfig(c => ({ ...c, filterDayTrapEnabled: e.target.checked }))}
+                              className="accent-indigo-400 w-4 h-4 cursor-pointer"
+                            />
+                            <span className="text-xs font-bold text-white">6. Day High / Day Low Trap Guard</span>
+                          </label>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            samConfig.filterDayTrapEnabled
+                              ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
+                              : 'bg-gray-800 text-gray-400'
+                          }`}>
+                            {samConfig.filterDayTrapEnabled ? 'FILTER ACTIVE' : 'OFF'}
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-gray-300 mb-2">
+                          Prevents buying directly under resistance (Day High) or selling directly above support (Day Low):
+                        </p>
+
+                        <div className="text-[10px] space-y-1 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800/80 font-mono mb-3 text-gray-300">
+                          <p className="text-indigo-300">• For CALL: Block if within {samConfig.dayTrapBufferPoints ?? 10}pt below Day High</p>
+                          <p className="text-rose-300">• For PUT: Block if within {samConfig.dayTrapBufferPoints ?? 10}pt above Day Low</p>
+                          <p className="text-gray-400">• Clean breakouts/breakdowns are always permitted!</p>
+                        </div>
+
+                        <div className="space-y-2 mb-3 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800">
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">Trap Danger Buffer Distance:</label>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min={5}
+                                max={30}
+                                step={1}
+                                value={samConfig.dayTrapBufferPoints ?? 10}
+                                onChange={e => setSamConfig(c => ({ ...c, dayTrapBufferPoints: Math.max(3, Number(e.target.value) || 10) }))}
+                                className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                              />
+                              <span className="text-[10px] text-gray-400">pts</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="p-2 rounded bg-indigo-900/10 border border-indigo-800/30 text-[10px] space-y-0.5">
+                          <div className="flex justify-between text-gray-300">
+                            <span>Range Traps Filtered:</span>
+                            <span className="font-bold text-indigo-300 font-mono">{comparisonStats.dayTrapFiltered} Blocked</span>
+                          </div>
+                          <p className="text-indigo-300/90 pt-1 font-sans text-[10px]">
+                            🛡️ Saves you from buying the absolute top and selling the absolute bottom of the day.
                           </p>
                         </div>
                       </div>

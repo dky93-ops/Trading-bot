@@ -25,21 +25,13 @@ export interface AppSettings {
   MIN_ENTRY_TIME_IST?: string;
   LAST_ENTRY_TIME_IST?: string;
   strategies: {
-    openingTrap: StrategyConfig;
-    failedRetest: StrategyConfig;
-    continuationBreakdown: StrategyConfig;
-    continuationBreakout: StrategyConfig;
-    oiWallRejection: StrategyConfig;
-    technicalConfluence?: StrategyConfig;
-    adxBreakout?: StrategyConfig;
-    alphaTrend?: StrategyConfig;
-    comboUnfiltered?: StrategyConfig;
-    comboFiltered?: StrategyConfig;
-    macdAdaptiveSupertrend?: StrategyConfig;
     samSignals?: StrategyConfig;
+    comboFiltered?: StrategyConfig;
+    comboUnfiltered?: StrategyConfig;
+    alphaTrend?: StrategyConfig;
+    t3Striped?: StrategyConfig;
+    macdAdaptiveSupertrend?: StrategyConfig;
   };
-  goldInstrumentKey?: string;
-  goldEntryMode?: 'BREAKOUT' | 'RETEST' | 'ADAPTIVE';
   maxTradeDurationMinutes?: 30 | 60 | 120 | number;
   oneTradeAtATime?: boolean;
 }
@@ -74,7 +66,6 @@ export interface AppState {
   nifty50: InstrumentData;
   bankNifty?: InstrumentData;
   indiaVix: InstrumentData;
-  gold?: InstrumentData;
   isConnected: boolean;
   apiError?: string;
   signals: any[];
