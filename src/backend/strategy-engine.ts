@@ -1,4 +1,4 @@
-import { computeEMA, computeSMA, computeRSI, computeMACD, computeBollinger, computeATR, computeSuperTrend, computeADX, computeAlphaTrend, computeT3, computeMFI } from './technical-indicators';
+import { computeEMA, computeSMA, computeRSI, computeMACD, computeBollinger, computeATR, computeSuperTrend, computeADX } from './technical-indicators';
 import { computeKMeansAdaptiveSuperTrend, computeCMMACD } from './ml-adaptive-supertrend';
 import { NiftyMacdAdaptiveSupertrend } from './nifty-macd-adaptive-supertrend';
 import { computeSamSignals, DEFAULT_SAM_CONFIG } from './sam-signals';
@@ -380,9 +380,11 @@ export class StrategyEngine {
       const curPrice = sig.latestPrice || sig.entryPrice;
       const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
       const lotConfig = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
-      const qty = 75 * lotConfig;
-      const isShort = sig.signal === 'SELL' || sig.direction === 'PUT';
-      const pnlPerUnit = isShort ? (sig.entryPrice - curPrice) : (curPrice - sig.entryPrice);
+      const qty = 65 * lotConfig;
+      const isOptionBuy = Boolean(sig.optionEntry) || sig.signal === 'BUY_CALL' || sig.signal === 'BUY_PUT';
+      const entry = sig.optionEntry || sig.entryPrice;
+      const isShortSpot = !isOptionBuy && (sig.signal === 'SELL' || sig.direction === 'PUT');
+      const pnlPerUnit = isShortSpot ? (entry - curPrice) : (curPrice - entry);
       this.unrealizedPnL += pnlPerUnit * qty;
     }
     this.overallPnL = this.realizedPnL + this.unrealizedPnL;
@@ -609,52 +611,6 @@ export class StrategyEngine {
       nearestPeWallBelow,
     });
 
-    // 0. COMBO STRATEGIES (Filtered & Unfiltered)
-    // Evaluated SOLELY on their own rules without interference from global prechecks or other strategy filters
-    if (this.settings.strategies?.comboFiltered?.enabled) {
-      const comboSig = await this.checkComboStrategy(
-        'COMBO_FILTERED',
-        valCtx,
-        index,
-        spotPrice,
-        candles,
-        rows,
-        sessState,
-        nearestCeWallAbove,
-        nearestPeWallBelow,
-        passed,
-        failed,
-      );
-      if (comboSig) {
-        sessState.tradeTakenFlag = true;
-        sessState.totalTradesToday = (sessState.totalTradesToday || 0) + 1;
-        sessState.lastProcessedCandleTimestamp = candleIso;
-        return comboSig;
-      }
-    }
-
-    if (this.settings.strategies?.comboUnfiltered?.enabled) {
-      const comboSig = await this.checkComboStrategy(
-        'COMBO_UNFILTERED',
-        valCtx,
-        index,
-        spotPrice,
-        candles,
-        rows,
-        sessState,
-        nearestCeWallAbove,
-        nearestPeWallBelow,
-        passed,
-        failed,
-      );
-      if (comboSig) {
-        sessState.tradeTakenFlag = true;
-        sessState.totalTradesToday = (sessState.totalTradesToday || 0) + 1;
-        sessState.lastProcessedCandleTimestamp = candleIso;
-        return comboSig;
-      }
-    }
-
     // 0.1 NIFTY MACD + Adaptive SuperTrend Strategy
     // Evaluated SOLELY on its own rules without interference from global prechecks or other strategy filters
     if (this.settings.strategies?.macdAdaptiveSupertrend?.enabled) {
@@ -729,219 +685,6 @@ export class StrategyEngine {
 
     sessState.lastProcessedCandleTimestamp = candleIso;
     return this.createNoTrade(index, spotPrice, failed.length > 0 ? failed.join(', ') : 'No chart strategy signal');
-  }
-
-  private async checkComboStrategy(
-    variant: 'COMBO_FILTERED' | 'COMBO_UNFILTERED',
-    valCtx: ValidationContext,
-    index: string,
-    spot: number,
-    candles: Candle[],
-    chainRows: any[],
-    sess: LocalSessionState,
-    wallAbove: number,
-    wallBelow: number,
-    passed: string[],
-    failed: string[],
-  ): Promise<InternalSignal | null> {
-    if (!candles || candles.length < 25) return null;
-    
-    // Condition 1: One trade at a time (strictly for THIS strategy variant, no interference from any other strategy)
-    const hasActiveComboTrade = Array.from(this.activeSignals.values()).some(
-      s => s.status === 'ACTIVE' && s.strategy_family === variant
-    );
-    if (hasActiveComboTrade) return null;
-
-    const highs = candles.map(c => c.high);
-    const lows = candles.map(c => c.low);
-    const closes = candles.map(c => c.close);
-    const volumes = candles.map(c => c.volume || 1);
-
-    const { alphaTrend, buySignal: alphaBuy, sellSignal: alphaSell } = computeAlphaTrend(highs, lows, closes, volumes, 14, 1.0, false);
-    const t3 = computeT3(closes, 14, 0.7);
-
-    const i = candles.length - 1;
-    if (i < 2) return null;
-
-    const t3Bullish = t3.lev0[i] > t3.lev5[i];
-    const t3Bearish = t3.lev0[i] < t3.lev5[i];
-    const t3CrossOver = t3.lev0[i-1] <= t3.lev5[i-1] && t3.lev0[i] > t3.lev5[i];
-    const t3CrossUnder = t3.lev0[i-1] >= t3.lev5[i-1] && t3.lev0[i] < t3.lev5[i];
-    
-    const alphaBullish = alphaTrend[i] > alphaTrend[i-2];
-    const alphaBearish = alphaTrend[i] < alphaTrend[i-2];
-
-    const comboLong = (alphaBuy[i] && t3Bullish) || (t3CrossOver && alphaBullish);
-    const comboShort = (alphaSell[i] && t3Bearish) || (t3CrossUnder && alphaBearish);
-
-    if (!comboLong && !comboShort) return null;
-
-    const direction: 'CALL' | 'PUT' = comboLong ? 'CALL' : 'PUT';
-    const atrs = computeATR(highs, lows, closes, 14);
-    const atr = atrs[i] || 15;
-
-    // Filtered version enforces SOLELY its own confirmation rules (PDF Strategy + Advanced Filters)
-    if (variant === 'COMBO_FILTERED') {
-      const c = candles[i];
-      // 1. Upstox Volume confirmation (>= 0.85x 20-period Vol SMA)
-      const volSma = computeSMA(volumes, 20);
-      const currVolSma = volSma[i] || 0;
-      if (currVolSma > 0 && (c.volume || 0) < currVolSma * 0.85) {
-        failed.push('COMBO_FILTERED: Low volume confirmation');
-        return null;
-      }
-      // 2. Candle confirmation
-      if (direction === 'CALL' && c.close < c.open) {
-        failed.push('COMBO_FILTERED: Candle conviction red for Call');
-        return null;
-      }
-      if (direction === 'PUT' && c.close > c.open) {
-        failed.push('COMBO_FILTERED: Candle conviction green for Put');
-        return null;
-      }
-      // 3. Ribbon Spread Expansion (>= 0.20x ATR)
-      const ribbonSpread = Math.abs(t3.lev0[i] - t3.lev5[i]);
-      if (ribbonSpread < 0.20 * atr) {
-        failed.push('COMBO_FILTERED: Ribbon spread compressed (< 0.20x ATR)');
-        return null;
-      }
-      // 4. Trend Alignment (50 EMA)
-      const ema50 = computeEMA(closes, 50);
-      const currEma50 = ema50[i];
-      if (!isNaN(currEma50)) {
-        if (direction === 'CALL' && c.close < currEma50 - 0.25 * atr) {
-          failed.push('COMBO_FILTERED: Price below 50 EMA trend');
-          return null;
-        }
-        if (direction === 'PUT' && c.close > currEma50 + 0.25 * atr) {
-          failed.push('COMBO_FILTERED: Price above 50 EMA trend');
-          return null;
-        }
-      }
-      // 5. ADX Trend Strength Confirmation (ADX >= 20.0 eliminates low-volatility dead range)
-      const adxData = computeADX(highs, lows, closes, 14);
-      const currAdx = adxData.adx[i];
-      if (!isNaN(currAdx) && currAdx < 20.0) {
-        failed.push(`COMBO_FILTERED: ADX too low (${currAdx.toFixed(1)} < 20.0)`);
-        return null;
-      }
-      // 6. Money Flow Index (MFI) Institutional Conviction (Call >= 65, Put <= 35)
-      const mfi14 = computeMFI(highs, lows, closes, volumes, 14);
-      const currMfi = mfi14[i];
-      if (!isNaN(currMfi)) {
-        if (direction === 'CALL' && currMfi < 65) {
-          failed.push(`COMBO_FILTERED: MFI below bullish threshold (${currMfi.toFixed(1)} < 65)`);
-          return null;
-        }
-        if (direction === 'PUT' && currMfi > 35) {
-          failed.push(`COMBO_FILTERED: MFI above bearish threshold (${currMfi.toFixed(1)} > 35)`);
-          return null;
-        }
-      }
-      // 7. Macro 200 EMA Protection (Avoid buying deep below or selling deep above 200 EMA)
-      const ema200 = computeEMA(closes, 200);
-      const currEma200 = ema200[i];
-      if (!isNaN(currEma200)) {
-        if (direction === 'CALL' && c.close < currEma200 - 25.0) {
-          failed.push(`COMBO_FILTERED: Call entered deep below 200 EMA (${(c.close - currEma200).toFixed(1)} pts)`);
-          return null;
-        }
-        if (direction === 'PUT' && c.close > currEma200 + 25.0) {
-          failed.push(`COMBO_FILTERED: Put entered deep above 200 EMA (${(c.close - currEma200).toFixed(1)} pts)`);
-          return null;
-        }
-      }
-    }
-
-    const option = this.selectStrike(direction, spot, chainRows);
-    if (!option) return null;
-
-    // Separate Stop Loss & Target Rules for Filtered vs Unfiltered
-    const recentCandles = candles.slice(Math.max(0, i - 4), i + 1);
-    const alphaLine = alphaTrend[i];
-    let riskDist: number;
-
-    if (variant === 'COMBO_FILTERED') {
-      // PDF Section 4: Structural Spot SL with dynamic invalidation buffer (1.2x ATR buffer)
-      if (direction === 'CALL') {
-        const recentLow = Math.min(...recentCandles.map(c => c.low));
-        const rawSL = (!isNaN(alphaLine) && alphaLine < spot) ? Math.min(recentLow, alphaLine) : recentLow;
-        const rawRisk = spot - rawSL;
-        riskDist = Math.min(2.5 * atr, Math.max(1.2 * atr, rawRisk > 0 ? rawRisk : atr * 1.2));
-      } else {
-        const recentHigh = Math.max(...recentCandles.map(c => c.high));
-        const rawSL = (!isNaN(alphaLine) && alphaLine > spot) ? Math.max(recentHigh, alphaLine) : recentHigh;
-        const rawRisk = rawSL - spot;
-        riskDist = Math.min(2.5 * atr, Math.max(1.2 * atr, rawRisk > 0 ? rawRisk : atr * 1.2));
-      }
-    } else {
-      // Unfiltered Strategy: Pure Technical Pivot SL (1.0x ATR buffer)
-      if (direction === 'CALL') {
-        const recentLow = Math.min(...recentCandles.map(c => c.low));
-        const rawSL = (!isNaN(alphaLine) && alphaLine < spot) ? Math.min(recentLow, alphaLine) : recentLow;
-        const rawRisk = spot - rawSL;
-        riskDist = Math.min(2.5 * atr, Math.max(1.0 * atr, rawRisk > 0 ? rawRisk : atr * 1.0));
-      } else {
-        const recentHigh = Math.max(...recentCandles.map(c => c.high));
-        const rawSL = (!isNaN(alphaLine) && alphaLine > spot) ? Math.max(recentHigh, alphaLine) : recentHigh;
-        const rawRisk = rawSL - spot;
-        riskDist = Math.min(2.5 * atr, Math.max(1.0 * atr, rawRisk > 0 ? rawRisk : atr * 1.0));
-      }
-    }
-
-    const sl = direction === 'CALL' ? spot - riskDist : spot + riskDist;
-
-    // Targets:
-    // Filtered as per PDF Section 4: Spot Target 1 = 1:2 R:R (Risk x 2.0); Spot Target 2 = 1:3 R:R (Risk x 3.0)
-    // Unfiltered: Quick Momentum Spot Target 1 = 1:1.5 R:R; Spot Target 2 = 1:2.5 R:R
-    const target1 = direction === 'CALL'
-      ? spot + riskDist * (variant === 'COMBO_FILTERED' ? 2.0 : 1.5)
-      : spot - riskDist * (variant === 'COMBO_FILTERED' ? 2.0 : 1.5);
-    const target2 = direction === 'CALL'
-      ? spot + riskDist * (variant === 'COMBO_FILTERED' ? 3.0 : 2.5)
-      : spot - riskDist * (variant === 'COMBO_FILTERED' ? 3.0 : 2.5);
-
-    const targets: any = {
-      target1Spot: target1,
-      target2Spot: target2,
-      target1Option: option.ltp + (variant === 'COMBO_FILTERED' ? riskDist * 0.5 : (direction === 'CALL' ? (target1 - spot) * 0.5 : (spot - target1) * 0.5)),
-      target2Option: option.ltp + (variant === 'COMBO_FILTERED' ? riskDist * 0.75 : (direction === 'CALL' ? (target2 - spot) * 0.5 : (spot - target2) * 0.5)),
-      stopLossSpot: sl,
-      stopLossOption: variant === 'COMBO_FILTERED'
-        ? Math.max(option.ltp * 0.65, option.ltp - riskDist * 0.5) // PDF 35% cap
-        : Math.max(1, option.ltp - riskDist * 0.5),
-      breakEvenThresholdOption: option.ltp,
-      trailingStepOption: 5,
-      riskRewardRatio: variant === 'COMBO_FILTERED' ? 2.0 : 1.5,
-    };
-
-    passed.push(variant);
-
-    return {
-      decision: {
-        signal: direction === 'CALL' ? 'BUY_CALL' : 'BUY_PUT',
-        strategy_family: variant,
-        direction,
-        entryPrice: option.ltp,
-        entrySpot: spot,
-        underlying: index,
-        instrumentKey: option.instrumentKey,
-        strike: option.strike,
-        optionType: direction === 'CALL' ? 'CE' : 'PE',
-        stopLoss: targets.stopLossOption,
-        target1: targets.target1Option,
-        target2: targets.target2Option,
-        invalidationLevel: sl,
-        confidence: 0.85,
-        status: 'OPEN',
-        targets,
-      } as any,
-      reason: [`${variant}: Confluence of AlphaTrend & T3 Striped Ribbon (${direction})`],
-      passedRules: passed,
-      failedRules: failed,
-      targets,
-      structuralLevel: sl,
-    } as any;
   }
 
   /**
@@ -2183,45 +1926,7 @@ export class StrategyEngine {
       const currentOptPrice = Number(signal.latestPrice ?? signal.optionEntry);
       const currentSpot = Number(this.state.nifty50.lastPrice);
 
-      // Dedicated Exit Rules for Combo Strategies (Filtered & Unfiltered)
-      if (signal.strategy_family === 'COMBO_FILTERED' || signal.strategy_family === 'COMBO_UNFILTERED') {
-        const entryTs = signal.entryTime || (typeof signal.timestamp === 'string' ? new Date(signal.timestamp).getTime() : signal.timestamp) || Date.now();
-        const elapsedMins = Math.max(0, (Date.now() - entryTs) / 60000);
-        const maxMins = (this.settings as any).maxTradeDurationMinutes || 60;
-        if (elapsedMins >= maxMins) {
-          const blendedExit = signal.firstTargetHitFlag ? Number(((signal.optionTarget1 + currentOptPrice) / 2).toFixed(2)) : currentOptPrice;
-          this.closeSignal(signal, blendedExit, `MAX TRADE DURATION EXPIRED (${maxMins}m limit reached)`);
-          newSignals.push(signal);
-          continue;
-        }
-
-        // Opposite Signal / Trend Reversal Exit
-        const candles = (this.state.nifty50 as any)?.candles1m || [];
-        if (candles.length >= 15) {
-          const highs = candles.map((c: any) => c.high);
-          const lows = candles.map((c: any) => c.low);
-          const closes = candles.map((c: any) => c.close);
-          const vols = candles.map((c: any) => c.volume || 1);
-          const alpha = computeAlphaTrend(highs, lows, closes, vols, 14, 1.0, false);
-          const t3 = computeT3(closes, 14, 0.7);
-          const lastIdx = candles.length - 1;
-          const isBearishReversal = alpha.sellSignal[lastIdx] || (t3.lev0[lastIdx - 1] >= t3.lev5[lastIdx - 1] && t3.lev0[lastIdx] < t3.lev5[lastIdx]);
-          const isBullishReversal = alpha.buySignal[lastIdx] || (t3.lev0[lastIdx - 1] <= t3.lev5[lastIdx - 1] && t3.lev0[lastIdx] > t3.lev5[lastIdx]);
-
-          if (signal.direction === 'CALL' && isBearishReversal) {
-            const blendedExit = signal.firstTargetHitFlag ? Number(((signal.optionTarget1 + currentOptPrice) / 2).toFixed(2)) : currentOptPrice;
-            this.closeSignal(signal, blendedExit, 'OPPOSITE SIGNAL REVERSAL: AlphaTrend / T3 Bearish Reversal');
-            newSignals.push(signal);
-            continue;
-          }
-          if (signal.direction === 'PUT' && isBullishReversal) {
-            const blendedExit = signal.firstTargetHitFlag ? Number(((signal.optionTarget1 + currentOptPrice) / 2).toFixed(2)) : currentOptPrice;
-            this.closeSignal(signal, blendedExit, 'OPPOSITE SIGNAL REVERSAL: AlphaTrend / T3 Bullish Reversal');
-            newSignals.push(signal);
-            continue;
-          }
-        }
-      } else if (signal.strategy_family === 'MACD_ADAPTIVE_SUPERTREND') {
+      if (signal.strategy_family === 'MACD_ADAPTIVE_SUPERTREND') {
         const entryTs = signal.entryTime || (typeof signal.timestamp === 'string' ? new Date(signal.timestamp).getTime() : signal.timestamp) || Date.now();
         const elapsedMins = Math.max(0, (Date.now() - entryTs) / 60000);
         const maxMins = (this.settings as any).maxTradeDurationMinutes || 60;
@@ -2370,17 +2075,8 @@ export class StrategyEngine {
 
       const optionRisk = signal.optionTarget1 - signal.optionEntry;
       if (signal.firstTargetHitFlag && optionRisk > 0) {
-         if (signal.strategy_family === 'COMBO_FILTERED') {
-           // PDF Section 4 Trailing Stop Loss Mechanics:
-           // Trails at 50% of maximum risk distance behind peak price
-           const peakPrice = Number((signal as any).peakPrice || signal.latestPrice || signal.optionEntry);
-           const dynamicTrailStop = Number((peakPrice - 0.5 * optionRisk).toFixed(2));
-           if (dynamicTrailStop > signal.optionStoploss) {
-             signal.optionStoploss = dynamicTrailStop;
-             signal.stoploss = dynamicTrailStop;
-           }
-         } else if (signal.strategy_family === 'COMBO_UNFILTERED' || signal.strategy_family === 'MACD_ADAPTIVE_SUPERTREND') {
-           // Unfiltered / MACD+ST: Breakeven lock is already set upon Target 1, no other strategy rules apply
+         if (signal.strategy_family === 'MACD_ADAPTIVE_SUPERTREND') {
+           // MACD+ST: Breakeven lock is already set upon Target 1, no other strategy rules apply
          } else {
          // 5. Market Structure (Swing) Trailing Stop-Loss
          const candles = (this.state.nifty50 as any)?.candles1m || [];
@@ -2490,9 +2186,14 @@ export class StrategyEngine {
 
     signal.status = 'CLOSED';
     signal.latestPrice = exitPrice;
-    const isShort = signal.signal === 'SELL' || signal.direction === 'PUT';
+    const stratKey = (signal.strategy_family || signal.strategy || '').toLowerCase();
+    const lotConfig = (this.settings.strategies as any)[stratKey]?.lotSize || this.settings.defaultLotsPerTrade || 1;
+    const qty = 65 * lotConfig;
+    const isOptionBuy = Boolean(signal.optionEntry) || signal.signal === 'BUY_CALL' || signal.signal === 'BUY_PUT';
+    const isShortSpot = !isOptionBuy && (signal.signal === 'SELL' || signal.direction === 'PUT');
     const entry = (signal.optionEntry || signal.entryPrice);
-    signal.realizedPnL = isShort ? (entry - exitPrice) : (exitPrice - entry);
+    const pnlPerUnit = isShortSpot ? (entry - exitPrice) : (exitPrice - entry);
+    signal.realizedPnL = Number((pnlPerUnit * qty).toFixed(2));
     signal.exitReason = reason;
     
     this.realizedPnL += signal.realizedPnL;

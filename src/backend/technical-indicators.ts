@@ -247,210 +247,7 @@ export function computeVWAP(candles: Array<{high: number, low: number, close: nu
   return vwap;
 }
 
-export function computeT3(series: number[], period: number = 14, hot: number = 0.7, type: 'T3 New' | 'T3 Original' = 'T3 New') {
-  const lev0: number[] = new Array(series.length).fill(NaN);
-  const lev1: number[] = new Array(series.length).fill(NaN);
-  const lev2: number[] = new Array(series.length).fill(NaN);
-  const lev3: number[] = new Array(series.length).fill(NaN);
-  const lev4: number[] = new Array(series.length).fill(NaN);
-  const lev5: number[] = new Array(series.length).fill(NaN);
 
-  let alpha = 0;
-  if (type === 'T3 New') {
-    alpha = 2.0 / (2.0 + (period - 1.0) / 2.0);
-  } else {
-    alpha = 2.0 / (1.0 + period);
-  }
-
-  let prev_t30 = NaN, prev_t31 = NaN, prev_t32 = NaN, prev_t33 = NaN, prev_t34 = NaN, prev_t35 = NaN;
-
-  for (let i = 0; i < series.length; i++) {
-    const src = series[i];
-    if (isNaN(src)) {
-      continue;
-    }
-    
-    // Initialize to src instead of 0 to minimize warmup lag on the 1000-candle limited dataset
-    const nz30 = isNaN(prev_t30) ? src : prev_t30;
-    const t30 = nz30 + alpha * (src - nz30);
-    
-    const nz31 = isNaN(prev_t31) ? src : prev_t31;
-    const t31 = nz31 + alpha * (t30 - nz31);
-    
-    const nz32 = isNaN(prev_t32) ? src : prev_t32;
-    const t32 = nz32 + alpha * (t31 - nz32);
-    
-    const nz33 = isNaN(prev_t33) ? src : prev_t33;
-    const t33 = nz33 + alpha * (t32 - nz33);
-    
-    const nz34 = isNaN(prev_t34) ? src : prev_t34;
-    const t34 = nz34 + alpha * (t33 - nz34);
-    
-    const nz35 = isNaN(prev_t35) ? src : prev_t35;
-    const t35 = nz35 + alpha * (t34 - nz35);
-    
-    lev0[i] = t30;
-    lev1[i] = t31;
-    lev2[i] = t32;
-    lev3[i] = t33;
-    lev4[i] = t34;
-    lev5[i] = t35;
-
-    prev_t30 = t30;
-    prev_t31 = t31;
-    prev_t32 = t32;
-    prev_t33 = t33;
-    prev_t34 = t34;
-    prev_t35 = t35;
-  }
-
-  return { lev0, lev1, lev2, lev3, lev4, lev5 };
-}
-
-export function computeMFI(high: number[], low: number[], close: number[], volume: number[], period: number = 14): number[] {
-  const mfi = new Array(close.length).fill(NaN);
-  const hlc3 = new Array(close.length).fill(0);
-  const rawMoneyFlow = new Array(close.length).fill(0);
-  
-  for (let i = 0; i < close.length; i++) {
-    hlc3[i] = (high[i] + low[i] + close[i]) / 3;
-    rawMoneyFlow[i] = hlc3[i] * (volume[i] || 1);
-  }
-  
-  for (let i = period; i < close.length; i++) {
-    let posFlow = 0;
-    let negFlow = 0;
-    for (let j = i - period + 1; j <= i; j++) {
-      if (hlc3[j] > hlc3[j - 1]) {
-        posFlow += rawMoneyFlow[j];
-      } else if (hlc3[j] < hlc3[j - 1]) {
-        negFlow += rawMoneyFlow[j];
-      }
-    }
-    if (negFlow === 0) {
-      mfi[i] = 100;
-    } else {
-      const moneyRatio = posFlow / negFlow;
-      mfi[i] = 100 - (100 / (1 + moneyRatio));
-    }
-  }
-  return mfi;
-}
-
-export function computeAlphaTrend(
-  high: number[],
-  low: number[],
-  close: number[],
-  volume: number[],
-  period: number = 14,
-  coeff: number = 1.0,
-  noVolumeData: boolean = false
-) {
-  const alphaTrend = new Array(close.length).fill(NaN);
-  const buySignal = new Array(close.length).fill(false);
-  const sellSignal = new Array(close.length).fill(false);
-  
-  const tr = new Array(close.length).fill(0);
-  tr[0] = high[0] - low[0];
-  for (let i = 1; i < close.length; i++) {
-    const hl = high[i] - low[i];
-    const hc = Math.abs(high[i] - close[i - 1]);
-    const lc = Math.abs(low[i] - close[i - 1]);
-    tr[i] = Math.max(hl, hc, lc);
-  }
-  
-  const atrSma = computeSMA(tr, period);
-  const rsi = computeRSI(close, period);
-  const mfi = computeMFI(high, low, close, volume, period);
-  
-  let prevAlphaTrend = NaN;
-  
-  const hasRealVolume = volume && volume.length > 0 && volume.some(v => v > 0 && v !== 1);
-  const useRsiCondition = noVolumeData || !hasRealVolume;
-
-  for (let i = 0; i < close.length; i++) {
-    if (isNaN(atrSma[i])) continue;
-    
-    const upT = low[i] - atrSma[i] * coeff;
-    const downT = high[i] + atrSma[i] * coeff;
-    
-    let condition = false;
-    if (useRsiCondition || isNaN(mfi[i])) {
-      condition = rsi[i] >= 50;
-    } else {
-      condition = mfi[i] >= 50;
-    }
-    
-    const nzPrevAlphaTrend = isNaN(prevAlphaTrend) ? 0 : prevAlphaTrend;
-    
-    let currentAlphaTrend = 0;
-    if (condition) {
-      currentAlphaTrend = upT < nzPrevAlphaTrend ? nzPrevAlphaTrend : upT;
-    } else {
-      currentAlphaTrend = downT > nzPrevAlphaTrend ? nzPrevAlphaTrend : downT;
-    }
-    
-    alphaTrend[i] = currentAlphaTrend;
-    prevAlphaTrend = currentAlphaTrend;
-  }
-  
-  let lastBuyIndex = -1;
-  let lastSellIndex = -1;
-  let direction = 0;
-  
-  const trigger = new Array(close.length).fill(NaN);
-  
-  for (let i = 2; i < close.length; i++) {
-    const at = alphaTrend[i];
-    const at2 = alphaTrend[i - 2];
-    const prev_at = alphaTrend[i - 1];
-    const prev_at2 = alphaTrend[i - 3] !== undefined ? alphaTrend[i - 3] : NaN;
-    
-    trigger[i] = at2;
-    
-    const crossover = !isNaN(at) && !isNaN(at2) && !isNaN(prev_at) && !isNaN(prev_at2) && prev_at <= prev_at2 && at > at2;
-    const crossunder = !isNaN(at) && !isNaN(at2) && !isNaN(prev_at) && !isNaN(prev_at2) && prev_at >= prev_at2 && at < at2;
-    
-    const currentBuy = crossover;
-    const currentSell = crossunder;
-    
-    const k1 = lastBuyIndex !== -1 ? (i - lastBuyIndex) : Infinity;
-    const k2 = lastSellIndex !== -1 ? (i - lastSellIndex) : Infinity;
-    
-    const o1 = lastBuyIndex !== -1 ? (i - lastBuyIndex) : Infinity;
-    const o2 = lastSellIndex !== -1 ? (i - lastSellIndex) : Infinity;
-    
-    if (currentBuy && o1 > k2) {
-      direction = 1;
-      buySignal[i] = true;
-    } else if (currentSell && o2 > k1) {
-      direction = -1;
-      sellSignal[i] = true;
-    }
-    
-    if (currentBuy) lastBuyIndex = i;
-    if (currentSell) lastSellIndex = i;
-  }
-  
-  const colors = new Array(close.length).fill('');
-  for (let i = 3; i < close.length; i++) {
-    const at = alphaTrend[i];
-    const at1 = alphaTrend[i - 1];
-    const at2 = alphaTrend[i - 2];
-    const at3 = alphaTrend[i - 3];
-    if (at > at2) {
-      colors[i] = '#00E60F';
-    } else if (at < at2) {
-      colors[i] = '#80000B';
-    } else if (at1 > at3) {
-      colors[i] = '#00E60F';
-    } else {
-      colors[i] = '#80000B';
-    }
-  }
-  
-  return { alphaTrend, trigger, colors, buySignal, sellSignal };
-}
 
 export function computeADX(
   high: number[],
@@ -657,18 +454,14 @@ export function compute5MinEMA(
   const slope = new Array(len).fill(0);
   if (len === 0) return { ema, slope };
 
-  interface FiveMinBar {
-    bucketKey: number | string;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    startIndex: number;
-    endIndex: number;
-  }
-
-  const fiveMinBars: FiveMinBar[] = [];
-  let curBar: FiveMinBar | null = null;
+  // Strictly causal (zero-lookahead) 5-min EMA:
+  // At any 1-min candle i, ONLY candles[0..i] are used.
+  // Previous completed 5-min buckets lock in `lastCompletedEma`; intra-bar candles
+  // update live against `lastCompletedEma` using only candle i's own close.
+  const k = 2 / (period + 1);
+  let lastBucketKey: number | string | null = null;
+  let lastCompletedEma = NaN;
+  let lastBucketClose = NaN;
 
   for (let i = 0; i < len; i++) {
     const c = candles[i];
@@ -683,46 +476,25 @@ export function compute5MinEMA(
       } catch (_) {}
     }
 
-    if (!curBar || curBar.bucketKey !== bucketKey) {
-      curBar = {
-        bucketKey,
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-        startIndex: i,
-        endIndex: i,
-      };
-      fiveMinBars.push(curBar);
-    } else {
-      curBar.high = Math.max(curBar.high, c.high);
-      curBar.low = Math.min(curBar.low, c.low);
-      curBar.close = c.close;
-      curBar.endIndex = i;
+    if (lastBucketKey !== null && bucketKey !== lastBucketKey) {
+      // Previous 5-min bucket just closed at i - 1; commit its closing EMA
+      lastCompletedEma = isNaN(lastCompletedEma)
+        ? lastBucketClose
+        : (lastBucketClose - lastCompletedEma) * k + lastCompletedEma;
     }
-  }
 
-  // Calculate Progressive EMA on 5-min bars so even opening bars get continuous trend guidance
-  const k = 2 / (period + 1);
-  let runningEma = fiveMinBars[0]?.close || 0;
-  let prevEma = runningEma;
+    lastBucketKey = bucketKey;
+    lastBucketClose = c.close;
 
-  for (let bIdx = 0; bIdx < fiveMinBars.length; bIdx++) {
-    const cClose = fiveMinBars[bIdx].close;
-    if (bIdx === 0) {
-      runningEma = cClose;
-      prevEma = cClose;
-    } else {
-      prevEma = runningEma;
-      runningEma = (cClose - runningEma) * k + runningEma;
-    }
-    const roundedEma = Number(runningEma.toFixed(2));
-    const roundedSlope = Number((runningEma - prevEma).toFixed(2));
-    const bar = fiveMinBars[bIdx];
-    for (let i = bar.startIndex; i <= bar.endIndex; i++) {
-      ema[i] = roundedEma;
-      slope[i] = roundedSlope;
-    }
+    const curLiveEma = isNaN(lastCompletedEma)
+      ? c.close
+      : (c.close - lastCompletedEma) * k + lastCompletedEma;
+    const curLiveSlope = isNaN(lastCompletedEma)
+      ? 0
+      : curLiveEma - lastCompletedEma;
+
+    ema[i] = Number(curLiveEma.toFixed(2));
+    slope[i] = Number(curLiveSlope.toFixed(2));
   }
 
   return { ema, slope };

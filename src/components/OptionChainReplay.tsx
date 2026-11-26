@@ -5,6 +5,7 @@ import { OptionChainSnapshot } from '../backend/types';
 export const OptionChainReplay: React.FC = () => {
   const [history, setHistory] = useState<OptionChainSnapshot[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
+  const [extracting, setExtracting] = useState<boolean>(false);
   const [selectedSnap, setSelectedSnap] = useState<OptionChainSnapshot | null>(null);
   const [message, setMessage] = useState<string>('');
 
@@ -49,6 +50,31 @@ export const OptionChainReplay: React.FC = () => {
     }
   };
 
+  const handleBackfill = async () => {
+    setExtracting(true);
+    try {
+      const res = await fetch('/api/option-chain/backfill', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ maxDays: 15 }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        await fetchHistory();
+        setMessage(
+          data.snapshotsCreated > 0
+            ? `Extracted ${data.snapshotsCreated} historical snapshots (${data.extractedDays?.join(', ')}) into PostgreSQL.`
+            : `All recent trading days are already synced in PostgreSQL (${data.totalSnapshots} snapshots).`
+        );
+        setTimeout(() => setMessage(''), 6000);
+      }
+    } catch (err) {
+      console.error('Failed to extract historical option chain:', err);
+    } finally {
+      setExtracting(false);
+    }
+  };
+
   const handleExport = () => {
     window.open('/api/option-chain/export', '_blank');
   };
@@ -82,6 +108,15 @@ export const OptionChainReplay: React.FC = () => {
             >
               <RefreshCw size={14} className={loading ? 'animate-spin text-brand-green' : ''} />
               <span>Refresh</span>
+            </button>
+
+            <button
+              onClick={handleBackfill}
+              disabled={extracting}
+              className="flex items-center space-x-1.5 px-3 py-2 rounded bg-cyan-950/70 border border-cyan-700/60 hover:bg-cyan-900/70 text-xs font-bold text-cyan-200 transition-colors disabled:opacity-50 cursor-pointer"
+            >
+              <Database size={14} className={extracting ? 'animate-pulse text-cyan-300' : ''} />
+              <span>{extracting ? 'Extracting...' : 'Extract Historical'}</span>
             </button>
 
             <button

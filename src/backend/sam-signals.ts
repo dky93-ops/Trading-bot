@@ -11,7 +11,7 @@
  *  - ADX Filter option (toggle, length, threshold, directional DI check)
  */
 
-import { computeSMA, computeWMA, computeADX, computeVWAP, compute5MinEMA } from './technical-indicators';
+import { computeSMA, computeEMA, computeWMA, computeADX, computeVWAP, compute5MinEMA } from './technical-indicators';
 
 export interface SamSignalsConfig {
   maFastPeriod: number; // default: 1
@@ -69,6 +69,42 @@ export interface SamSignalsConfig {
   // 7. Day High / Day Low Trap Filter (Range Boundary Exhaustion)
   filterDayTrapEnabled: boolean; // default: false
   dayTrapBufferPoints: number; // default: 10 (points within Day High / Day Low danger band)
+
+  // 8. Dynamic Regime Classification (Dual-Mode Adaptive VWAP)
+  // Resolves the dilemma where static VWAP turns trend days into wins but kills range days (like 30 Oct).
+  adaptiveRegimeEnabled?: boolean; // default: true (Automatically distinguishes Trend vs Range)
+  adaptiveTrendDistancePoints?: number; // default: 20 (pts from VWAP with slope to confirm Trend Mode)
+  adaptiveClimaxBandPoints?: number; // default: 50 (pts from VWAP for overextension guard)
+  adaptiveAllowReversionBounce?: boolean; // default: true (Permits deep exhaustion counter-bounces at climax band)
+
+  // 9. Directional Loss-Frequency Circuit Breaker & Anti-Whipsaw Protection
+  circuitBreakerEnabled?: boolean; // default: true
+  circuitBreakerConsecutiveLosses?: number; // default: 3
+  circuitBreakerCooldownMinutes?: number; // default: 20
+  antiWhipsawEnabled?: boolean; // default: false
+  antiWhipsawMinutes?: number; // default: 10
+
+  // 10. Volatility-Adaptive Daily Drawdown Guard
+  maxDailyLossEnabled?: boolean; // default: false
+  maxDailyLossPoints?: number; // default: 75
+
+  // 11. S12 Confluence Filter (DI Spread > +5 + EMA 100/200 Alignment + RVOL >= 0.70)
+  filterS12ConfluenceEnabled?: boolean; // default: false
+  s12DiSpreadMin?: number; // default: 5 (+DI - -DI > 5 for CALL, -DI - +DI > 5 for PUT)
+  s12EmaFastPeriod?: number; // default: 100
+  s12EmaSlowPeriod?: number; // default: 200
+  s12MinRvol?: number; // default: 0.70 (Bar volume >= 0.70 * 20-bar volume SMA)
+
+  // 12. Institutional Recommendation #1: 1-Min SAM(21/5) Afternoon Breakout (12:30–14:50 IST)
+  //     PDH/PDL Breakout + Causal 5m ADX(14) >= 30 & DI Spread > 5
+  //     Exit modes: 'fixed40' (#3: SL 40 / BE +30 / EOD) or 'chandelier' (#5: SL 0.30% / Trail 0.40% / EOD)
+  filterSam21AfternoonEnabled?: boolean; // default: false
+  sam21AfternoonExitMode?: 'fixed40' | 'chandelier'; // default: 'fixed40'
+
+  // 13. Institutional Recommendation #2: Morning + Afternoon Combined (SAM 21/5)
+  //     Morning: 3m SAM(21/5) OpenDrive (09:20–10:30 IST, PDH/PDL + StrongBar + 15m Supertrend, 2x/3x 5m ATR)
+  //     Afternoon: 1m SAM(21/5) Afternoon Breakout (12:30–14:50 IST, #3 Fixed or #5 Chandelier)
+  filterSam21CombinedEnabled?: boolean; // default: false
 }
 
 export const DEFAULT_SAM_CONFIG: SamSignalsConfig = {
@@ -107,6 +143,25 @@ export const DEFAULT_SAM_CONFIG: SamSignalsConfig = {
   mtfEmaRequireSlope: false,
   filterDayTrapEnabled: false,
   dayTrapBufferPoints: 10,
+  adaptiveRegimeEnabled: true,
+  adaptiveTrendDistancePoints: 20,
+  adaptiveClimaxBandPoints: 50,
+  adaptiveAllowReversionBounce: true,
+  circuitBreakerEnabled: true,
+  circuitBreakerConsecutiveLosses: 3,
+  circuitBreakerCooldownMinutes: 20,
+  antiWhipsawEnabled: false,
+  antiWhipsawMinutes: 10,
+  maxDailyLossEnabled: false,
+  maxDailyLossPoints: 75,
+  filterS12ConfluenceEnabled: false,
+  s12DiSpreadMin: 5,
+  s12EmaFastPeriod: 100,
+  s12EmaSlowPeriod: 200,
+  s12MinRvol: 0.7,
+  filterSam21AfternoonEnabled: false,
+  sam21AfternoonExitMode: 'fixed40',
+  filterSam21CombinedEnabled: false,
   visibleBuy: true,
   visibleSell: true,
   colorBuy: '#2196f3',
@@ -139,8 +194,19 @@ export interface SamSignalsResult {
   minBodyFilteredCount?: number;
   mtfEmaFilteredCount?: number;
   dayTrapFilteredCount?: number;
+  adaptiveFilteredCount?: number;
+  circuitBreakerFilteredCount?: number;
+  antiWhipsawFilteredCount?: number;
+  s12FilteredCount?: number;
+  sam21AfternoonSignalCount?: number;
+  sam21OpenDriveSignalCount?: number;
+  samSignalProfile?: Array<'STANDARD' | 'SAM21_AFT_FIXED' | 'SAM21_AFT_CHAND' | 'SAM21_3M_OPENDRIVE'>;
+  atr5mValues?: number[];
+  regimeState?: ('TREND_BULL' | 'TREND_BEAR' | 'RANGE')[];
   mtfEmaValues?: number[];
   mtfEmaSlopes?: number[];
+  ema100Values?: number[];
+  ema200Values?: number[];
   currentDayHighs?: number[];
   currentDayLows?: number[];
   vwapFilterDetails?: Array<{
@@ -152,6 +218,150 @@ export interface SamSignalsResult {
     stage: 'SETUP_BAR' | 'CONFIRMATION_BAR';
     distance: number;
   }>;
+}
+
+// --- Strictly Causal Helpers for Institutional SAM(21/5) Filters ---
+
+function getIstDayAndMinute(c: { time?: any; timestamp?: any }): { dayKey: number; mins: number } | null {
+  if (typeof c.time === 'number' && !isNaN(c.time)) {
+    const dayKey = Math.floor(c.time / 86400);
+    const secInDay = ((c.time % 86400) + 86400) % 86400;
+    const mins = Math.floor(secInDay / 60);
+    return { dayKey, mins };
+  }
+  if (c.timestamp) {
+    const ms = typeof c.timestamp === 'number' ? c.timestamp : Date.parse(String(c.timestamp));
+    if (!isNaN(ms)) {
+      const istSec = Math.floor((ms + 19800000) / 1000);
+      const dayKey = Math.floor(istSec / 86400);
+      const secInDay = ((istSec % 86400) + 86400) % 86400;
+      const mins = Math.floor(secInDay / 60);
+      return { dayKey, mins };
+    }
+  }
+  return null;
+}
+
+interface CausalHtfBar {
+  dayKey: number;
+  bucket: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+}
+
+/**
+ * Strictly causal higher-timeframe resampler:
+ * Every 1m bar i ONLY references bars formed from 0..i (zero future lookahead).
+ */
+function resampleCausalHTF(
+  candles: Array<{ open: number; high: number; low: number; close: number }>,
+  barMeta: Array<{ dayKey: number; mins: number } | null>,
+  tfMinutes: number
+): { bars: CausalHtfBar[]; lastClosedBarIdx: number[]; isClosing1mBar: boolean[] } {
+  const n = candles.length;
+  const bars: CausalHtfBar[] = [];
+  const lastClosedBarIdx = new Array<number>(n).fill(-1);
+  const isClosing1mBar = new Array<boolean>(n).fill(false);
+
+  let curBar: CausalHtfBar | null = null;
+  let lastCompleted = -1;
+
+  for (let i = 0; i < n; i++) {
+    const meta = barMeta[i];
+    if (!meta) {
+      lastClosedBarIdx[i] = lastCompleted;
+      continue;
+    }
+    const bucket = Math.floor(meta.mins / tfMinutes);
+    if (!curBar || curBar.dayKey !== meta.dayKey || curBar.bucket !== bucket) {
+      if (curBar) {
+        lastCompleted = bars.length - 1;
+      }
+      curBar = {
+        dayKey: meta.dayKey,
+        bucket,
+        open: candles[i].open,
+        high: candles[i].high,
+        low: candles[i].low,
+        close: candles[i].close,
+      };
+      bars.push(curBar);
+    } else {
+      curBar.high = Math.max(curBar.high, candles[i].high);
+      curBar.low = Math.min(curBar.low, candles[i].low);
+      curBar.close = candles[i].close;
+    }
+
+    if ((meta.mins % tfMinutes) === (tfMinutes - 1)) {
+      lastCompleted = bars.length - 1;
+      isClosing1mBar[i] = true;
+    }
+    lastClosedBarIdx[i] = lastCompleted;
+  }
+
+  return { bars, lastClosedBarIdx, isClosing1mBar };
+}
+
+function computeWilderATR(highs: number[], lows: number[], closes: number[], period = 14): number[] {
+  const n = closes.length;
+  const atr = new Array<number>(n).fill(NaN);
+  if (n <= period) return atr;
+  const tr = new Array<number>(n).fill(0);
+  tr[0] = highs[0] - lows[0];
+  for (let i = 1; i < n; i++) {
+    tr[i] = Math.max(
+      highs[i] - lows[i],
+      Math.abs(highs[i] - closes[i - 1]),
+      Math.abs(lows[i] - closes[i - 1])
+    );
+  }
+  let sum = 0;
+  for (let i = 1; i <= period; i++) sum += tr[i];
+  let prev = sum / period;
+  atr[period] = prev;
+  for (let i = period + 1; i < n; i++) {
+    prev = (prev * (period - 1) + tr[i]) / period;
+    atr[i] = prev;
+  }
+  return atr;
+}
+
+function computeSupertrendDirection(
+  highs: number[],
+  lows: number[],
+  closes: number[],
+  period = 10,
+  mult = 3.0
+): number[] {
+  const n = closes.length;
+  const dir = new Array<number>(n).fill(0);
+  const atr = computeWilderATR(highs, lows, closes, period);
+  const finalUpper = new Array<number>(n).fill(NaN);
+  const finalLower = new Array<number>(n).fill(NaN);
+  let trend = 1;
+  for (let i = period; i < n; i++) {
+    if (isNaN(atr[i])) continue;
+    const hl2 = (highs[i] + lows[i]) / 2;
+    const basicUpper = hl2 + mult * atr[i];
+    const basicLower = hl2 - mult * atr[i];
+    if (i === period || isNaN(finalUpper[i - 1])) {
+      finalUpper[i] = basicUpper;
+      finalLower[i] = basicLower;
+      trend = closes[i] >= hl2 ? 1 : -1;
+    } else {
+      finalUpper[i] = (basicUpper < finalUpper[i - 1] || closes[i - 1] > finalUpper[i - 1]) ? basicUpper : finalUpper[i - 1];
+      finalLower[i] = (basicLower > finalLower[i - 1] || closes[i - 1] < finalLower[i - 1]) ? basicLower : finalLower[i - 1];
+      if (trend === 1 && closes[i] < finalLower[i]) {
+        trend = -1;
+      } else if (trend === -1 && closes[i] > finalUpper[i]) {
+        trend = 1;
+      }
+    }
+    dir[i] = trend;
+  }
+  return dir;
 }
 
 export function computeSamSignals(
@@ -181,8 +391,210 @@ export function computeSamSignals(
     minBodyFilteredCount: 0,
     mtfEmaFilteredCount: 0,
     dayTrapFilteredCount: 0,
+    adaptiveFilteredCount: 0,
+    circuitBreakerFilteredCount: 0,
+    antiWhipsawFilteredCount: 0,
+    s12FilteredCount: 0,
+    sam21AfternoonSignalCount: 0,
+    sam21OpenDriveSignalCount: 0,
+    samSignalProfile: new Array(len).fill('STANDARD'),
+    atr5mValues: new Array(len).fill(NaN),
+    regimeState: new Array(len).fill('RANGE'),
     vwapFilterDetails: [],
   };
+
+  // --- Institutional SAM(21/5) Modes (Recommendation #1 Afternoon & #2 Morning+Afternoon Combined) ---
+  const useSam21Afternoon = Boolean(config.filterSam21AfternoonEnabled || config.filterSam21CombinedEnabled);
+  const useSam21OpenDrive = Boolean(config.filterSam21CombinedEnabled);
+
+  if (useSam21Afternoon || useSam21OpenDrive) {
+    if (len < 30) {
+      return res;
+    }
+
+    const closes1m = candles.map(c => c.close);
+    const barMeta = candles.map(c => getIstDayAndMinute(c));
+
+    // Keep VWAP line available if chart displays VWAP
+    if (config.showVwapLine || config.vwapFilterEnabled) {
+      res.vwapValues = computeVWAP(candles);
+    }
+
+    // 1. Compute strictly causal Previous Day High (PDH) & Previous Day Low (PDL)
+    const pdhArr = new Array<number>(len).fill(NaN);
+    const pdlArr = new Array<number>(len).fill(NaN);
+    let curDay = -1;
+    let curDayH = -Infinity;
+    let curDayL = Infinity;
+    let prevDayH = NaN;
+    let prevDayL = NaN;
+
+    for (let i = 0; i < len; i++) {
+      const meta = barMeta[i];
+      if (!meta) continue;
+      if (meta.dayKey !== curDay) {
+        if (curDay !== -1) {
+          prevDayH = curDayH;
+          prevDayL = curDayL;
+        }
+        curDay = meta.dayKey;
+        curDayH = candles[i].high;
+        curDayL = candles[i].low;
+      } else {
+        if (candles[i].high > curDayH) curDayH = candles[i].high;
+        if (candles[i].low < curDayL) curDayL = candles[i].low;
+      }
+      pdhArr[i] = prevDayH;
+      pdlArr[i] = prevDayL;
+    }
+
+    // 2. 1-Min SAM(21/5) oscillator
+    const smaFast21 = [...closes1m];
+    const smaSlow21 = computeSMA(closes1m, 21);
+    const buf1_21 = new Array<number>(len).fill(NaN);
+    for (let i = 0; i < len; i++) {
+      if (!isNaN(smaSlow21[i])) {
+        buf1_21[i] = smaFast21[i] - smaSlow21[i];
+      }
+    }
+    const buf2_21 = computeWMA(buf1_21, 5);
+    res.smaFast = smaFast21;
+    res.smaSlow = smaSlow21;
+    res.buffer1 = buf1_21;
+    res.buffer2 = buf2_21;
+
+    // 3. Causal 5-Min resampling -> 5m ADX(14) & 5m ATR(14)
+    const htf5m = resampleCausalHTF(candles, barMeta, 5);
+    const highs5m = htf5m.bars.map(b => b.high);
+    const lows5m = htf5m.bars.map(b => b.low);
+    const closes5m = htf5m.bars.map(b => b.close);
+    const adx5m = computeADX(highs5m, lows5m, closes5m, 14);
+    const atr5m = computeWilderATR(highs5m, lows5m, closes5m, 14);
+
+    // Map 5m ATR onto every 1m bar causally
+    for (let i = 0; i < len; i++) {
+      const idx5 = htf5m.lastClosedBarIdx[i];
+      if (idx5 >= 0 && !isNaN(atr5m[idx5])) {
+        res.atr5mValues![i] = atr5m[idx5];
+      }
+    }
+
+    // 4. Optional Causal 3-Min SAM(21/5) + 3m ATR(14) + Causal 15-Min Supertrend(10, 3) for Morning OpenDrive
+    let htf3m: ReturnType<typeof resampleCausalHTF> | null = null;
+    let buf1_3m: number[] | null = null;
+    let buf2_3m: number[] | null = null;
+    let atr3m: number[] | null = null;
+    let htf15m: ReturnType<typeof resampleCausalHTF> | null = null;
+    let st15mDir: number[] | null = null;
+
+    if (useSam21OpenDrive) {
+      htf3m = resampleCausalHTF(candles, barMeta, 3);
+      const highs3m = htf3m.bars.map(b => b.high);
+      const lows3m = htf3m.bars.map(b => b.low);
+      const closes3m = htf3m.bars.map(b => b.close);
+      const smaSlow3m = computeSMA(closes3m, 21);
+      buf1_3m = closes3m.map((c, idx) => (isNaN(smaSlow3m[idx]) ? NaN : c - smaSlow3m[idx]));
+      buf2_3m = computeWMA(buf1_3m, 5);
+      atr3m = computeWilderATR(highs3m, lows3m, closes3m, 14);
+
+      htf15m = resampleCausalHTF(candles, barMeta, 15);
+      const highs15m = htf15m.bars.map(b => b.high);
+      const lows15m = htf15m.bars.map(b => b.low);
+      const closes15m = htf15m.bars.map(b => b.close);
+      st15mDir = computeSupertrendDirection(highs15m, lows15m, closes15m, 10, 3.0);
+    }
+
+    const aftProfile: 'SAM21_AFT_FIXED' | 'SAM21_AFT_CHAND' =
+      config.sam21AfternoonExitMode === 'chandelier' ? 'SAM21_AFT_CHAND' : 'SAM21_AFT_FIXED';
+
+    // 5. Evaluate institutional signal triggers causally per 1m bar
+    for (let i = 1; i < len; i++) {
+      const meta = barMeta[i];
+      if (!meta) continue;
+      const mins = meta.mins;
+      const pdh = pdhArr[i];
+      const pdl = pdlArr[i];
+      if (isNaN(pdh) || isNaN(pdl)) continue;
+
+      // A. Morning Window (#1): 3m SAM(21/5) OpenDrive (09:20–10:30 IST)
+      if (useSam21OpenDrive && mins >= 560 && mins <= 630 && htf3m && buf1_3m && buf2_3m && atr3m && htf15m && st15mDir) {
+        if (htf3m.isClosing1mBar[i]) {
+          const idx3 = htf3m.lastClosedBarIdx[i];
+          const idx15 = htf15m.lastClosedBarIdx[i];
+          if (idx3 >= 1 && idx15 >= 0) {
+            const b1c = buf1_3m[idx3];
+            const b2c = buf2_3m[idx3];
+            const b1p = buf1_3m[idx3 - 1];
+            const b2p = buf2_3m[idx3 - 1];
+            const a3 = atr3m[idx3];
+            const stDir = st15mDir[idx15];
+            const bar3 = htf3m.bars[idx3];
+
+            if (!isNaN(b1c) && !isNaN(b2c) && !isNaN(b1p) && !isNaN(b2p) && !isNaN(a3) && a3 > 0 && stDir !== 0 && bar3) {
+              const crossUp3m = b1c > b2c && b1p <= b2p;
+              const crossDn3m = b1c < b2c && b1p >= b2p;
+              const barRange = bar3.high - bar3.low;
+              const barBody = Math.abs(bar3.close - bar3.open);
+              const strongExpansion = barRange > 0 && (barBody / barRange) >= 0.60 && barBody >= 1.1 * a3;
+
+              if (crossUp3m && strongExpansion && bar3.close > bar3.open && bar3.close > pdh && stDir === 1) {
+                if (res.rawCallSignals) res.rawCallSignals[i] = true;
+                if (config.visibleBuy !== false) {
+                  res.callSignals[i] = true;
+                  res.samSignalProfile![i] = 'SAM21_3M_OPENDRIVE';
+                  res.sam21OpenDriveSignalCount = (res.sam21OpenDriveSignalCount || 0) + 1;
+                }
+              } else if (crossDn3m && strongExpansion && bar3.close < bar3.open && bar3.close < pdl && stDir === -1) {
+                if (res.rawPutSignals) res.rawPutSignals[i] = true;
+                if (config.visibleSell !== false) {
+                  res.putSignals[i] = true;
+                  res.samSignalProfile![i] = 'SAM21_3M_OPENDRIVE';
+                  res.sam21OpenDriveSignalCount = (res.sam21OpenDriveSignalCount || 0) + 1;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // B. Afternoon Window (#3 / #5): 1m SAM(21/5) Afternoon Breakout (12:30–14:50 IST)
+      if (useSam21Afternoon && mins >= 750 && mins <= 890) {
+        const b1c = buf1_21[i];
+        const b2c = buf2_21[i];
+        const b1p = buf1_21[i - 1];
+        const b2p = buf2_21[i - 1];
+        const idx5 = htf5m.lastClosedBarIdx[i];
+
+        if (!isNaN(b1c) && !isNaN(b2c) && !isNaN(b1p) && !isNaN(b2p) && idx5 >= 0) {
+          const crossUp1m = b1c > b2c && b1p <= b2p;
+          const crossDn1m = b1c < b2c && b1p >= b2p;
+          const curAdx5 = adx5m.adx[idx5];
+          const curPlus5 = adx5m.plusDI[idx5];
+          const curMinus5 = adx5m.minusDI[idx5];
+
+          if (!isNaN(curAdx5) && !isNaN(curPlus5) && !isNaN(curMinus5) && curAdx5 >= 30) {
+            if (crossUp1m && candles[i].close > pdh && (curPlus5 - curMinus5) > 5) {
+              if (res.rawCallSignals) res.rawCallSignals[i] = true;
+              if (config.visibleBuy !== false) {
+                res.callSignals[i] = true;
+                res.samSignalProfile![i] = aftProfile;
+                res.sam21AfternoonSignalCount = (res.sam21AfternoonSignalCount || 0) + 1;
+              }
+            } else if (crossDn1m && candles[i].close < pdl && (curMinus5 - curPlus5) > 5) {
+              if (res.rawPutSignals) res.rawPutSignals[i] = true;
+              if (config.visibleSell !== false) {
+                res.putSignals[i] = true;
+                res.samSignalProfile![i] = aftProfile;
+                res.sam21AfternoonSignalCount = (res.sam21AfternoonSignalCount || 0) + 1;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return res;
+  }
 
   if (len < Math.max(config.maSlowPeriod, config.maFastPeriod) + config.signalPeriod) {
     return res;
@@ -224,9 +636,9 @@ export function computeSamSignals(
   const buffer2 = computeWMA(buffer1, config.signalPeriod);
   res.buffer2 = buffer2;
 
-  // 6. Optional ADX Filter
+  // 6. Optional ADX / DI Indicators (also required by S12 Confluence Filter)
   let adxData: { adx: number[]; plusDI: number[]; minusDI: number[] } | null = null;
-  if (config.adxFilterEnabled) {
+  if (config.adxFilterEnabled || config.filterS12ConfluenceEnabled) {
     const highs = candles.map(c => c.high);
     const lows = candles.map(c => c.low);
     const closes = candles.map(c => c.close);
@@ -236,11 +648,76 @@ export function computeSamSignals(
     res.minusDI = adxData.minusDI;
   }
 
-  // 6.2 Intraday VWAP Calculation (for filter & chart line display)
+  // 6.1 S12 Confluence Filter indicators (Strictly Causal: DI Spread > +5, EMA 100/200 Alignment, RVOL >= 0.70)
+  let s12EmaFast: number[] | null = null;
+  let s12EmaSlow: number[] | null = null;
+  let s12VolSma20: number[] | null = null;
+  if (config.filterS12ConfluenceEnabled) {
+    const closes = candles.map(c => c.close);
+    const vols = candles.map(c => c.volume ?? 0);
+    s12EmaFast = computeEMA(closes, config.s12EmaFastPeriod ?? 100);
+    s12EmaSlow = computeEMA(closes, config.s12EmaSlowPeriod ?? 200);
+    s12VolSma20 = computeSMA(vols, 20);
+    res.ema100Values = s12EmaFast;
+    res.ema200Values = s12EmaSlow;
+  }
+
+  const passesS12Confluence = (barIdx: number, direction: 'CALL' | 'PUT'): boolean => {
+    if (!config.filterS12ConfluenceEnabled) return true;
+    if (!adxData || !s12EmaFast || !s12EmaSlow || !s12VolSma20) return false;
+    const candle = candles[barIdx];
+    if (!candle) return false;
+
+    const dir = direction === 'CALL' ? 1 : -1;
+    const minDiSpread = config.s12DiSpreadMin ?? 5;
+    const minRvol = config.s12MinRvol ?? 0.7;
+
+    // 1. Directional Momentum: DI Spread > +5
+    const plus = adxData.plusDI[barIdx];
+    const minus = adxData.minusDI[barIdx];
+    if (plus === undefined || minus === undefined || isNaN(plus) || isNaN(minus)) return false;
+    if (!(dir * (plus - minus) > minDiSpread)) return false;
+
+    // 2. Macro Trend Alignment: Price on right side of both EMA100 & EMA200
+    const eFast = s12EmaFast[barIdx];
+    const eSlow = s12EmaSlow[barIdx];
+    if (isNaN(eFast) || isNaN(eSlow)) return false;
+    if (!(dir * (candle.close - eFast) > 0 && dir * (candle.close - eSlow) > 0)) return false;
+
+    // 3. Volume Participation: RVOL >= 0.70 (falls back to 1.0 if feed has no volume)
+    const avgVol = s12VolSma20[barIdx];
+    const rvol = (!isNaN(avgVol) && avgVol > 0) ? ((candle.volume ?? 0) / avgVol) : 1;
+    if (rvol < minRvol) return false;
+
+    return true;
+  };
+
+  // 6.2 Intraday VWAP & Dynamic Regime Classification (for adaptive filter & chart display)
   let vwapValues: number[] | null = null;
-  if (config.vwapFilterEnabled || config.showVwapLine) {
+  if (config.vwapFilterEnabled || config.adaptiveRegimeEnabled || config.showVwapLine) {
     vwapValues = computeVWAP(candles);
     res.vwapValues = vwapValues;
+
+    // Dynamic Regime Classification per bar
+    const trendDist = config.adaptiveTrendDistancePoints ?? 20;
+    const regimeArr: ('TREND_BULL' | 'TREND_BEAR' | 'RANGE')[] = new Array(len).fill('RANGE');
+    for (let idx = 1; idx < len; idx++) {
+      const curV = vwapValues[idx];
+      const prevV = vwapValues[idx - 1];
+      const c = candles[idx];
+      if (!isNaN(curV) && !isNaN(prevV) && c) {
+        const dist = c.close - curV;
+        const slope = curV - prevV;
+        if (dist >= trendDist && slope > 0) {
+          regimeArr[idx] = 'TREND_BULL';
+        } else if (dist <= -trendDist && slope < 0) {
+          regimeArr[idx] = 'TREND_BEAR';
+        } else {
+          regimeArr[idx] = 'RANGE';
+        }
+      }
+    }
+    res.regimeState = regimeArr;
   }
 
   // 6.3 5-Minute Higher Timeframe (MTF) EMA Trend Alignment
@@ -451,25 +928,26 @@ export function computeSamSignals(
       }
     }
 
-    // 4. Smart Intraday VWAP Filter:
-    // (a) Institutional Trend Alignment:
-    //     - CALL (Long): Candle close >= VWAP (Bullish institutional control)
-    //     - PUT (Short): Candle close <= VWAP (Bearish institutional control)
-    // (b) Climax / Overextension Protection:
-    //     - CALL: (Close - VWAP) <= maxVwapDistance (Default: 70 pts).
-    //       Blocks buying into exhaustion tops (e.g. 13:00 trade at +168 pts above VWAP).
-    //     - PUT: (VWAP - Close) <= maxVwapDistance (Default: 70 pts).
-    //       Blocks shorting into exhausted panic bottoms.
-    // (c) Opening 09:25 Buffer:
-    //     - Blocks taking fresh setups in the first 10 minutes when VWAP has too few samples.
+    // 4. Smart Intraday VWAP & Dynamic Regime Filter:
+    // When adaptiveRegimeEnabled is true:
+    //   - Bull Trend Mode: CALL favored, PUT blocked (unless deep climax fade >= climaxBand)
+    //   - Bear Trend Mode: PUT favored, CALL blocked (unless deep climax bounce <= -climaxBand)
+    //   - Range Mode: Both CALL and PUT allowed (enables winning dip-buys), but climax exhaustion (> climaxBand) blocked!
+    // When adaptiveRegimeEnabled is false: classic static VWAP filter.
     let passVwapBuy = true;
     let passVwapSell = true;
+    const isAdaptive = config.adaptiveRegimeEnabled !== false;
+    const climaxBand = config.adaptiveClimaxBandPoints ?? (config.vwapMaxDistancePoints ?? 50);
+    const allowRev = config.adaptiveAllowReversionBounce !== false;
     const maxVwapDist = config.vwapMaxDistancePoints ?? 70;
     const climaxProtection = config.vwapClimaxFilterEnabled !== false;
 
-    if (config.vwapFilterEnabled && vwapValues) {
+    if ((config.vwapFilterEnabled || isAdaptive) && vwapValues) {
       const curVwap = vwapValues[i];
       if (!isNaN(curVwap) && c) {
+        const distFromVwap = c.close - curVwap;
+        const curRegime = res.regimeState?.[i] || 'RANGE';
+
         // Opening buffer check (< 09:25 IST)
         if (config.vwapOpeningBufferEnabled && istMins >= 0 && istMins < 9 * 60 + 25) {
           passVwapBuy = false;
@@ -483,75 +961,157 @@ export function computeSamSignals(
               price: c.close,
               vwap: curVwap,
               stage: 'SETUP_BAR',
-              distance: Number(Math.abs(c.close - curVwap).toFixed(2)),
+              distance: Number(Math.abs(distFromVwap).toFixed(2)),
             });
           }
         }
 
-        // Long Trend & Climax Check
-        if (passVwapBuy) {
-          if (c.close < curVwap) {
-            passVwapBuy = false;
-            if (rawBuy && passWickBuy && passAdxBuy && passPreMarket) {
-              if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
-              res.vwapFilterDetails?.push({
-                barIdx: i,
-                time: c.time || c.timestamp,
-                direction: 'CALL',
-                price: c.close,
-                vwap: curVwap,
-                stage: 'SETUP_BAR',
-                distance: Number((curVwap - c.close).toFixed(2)),
-              });
-            }
-          } else if (climaxProtection && (c.close - curVwap) > maxVwapDist) {
-            passVwapBuy = false;
-            if (rawBuy && passWickBuy && passAdxBuy && passPreMarket) {
-              if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
-              if (res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
-              res.vwapFilterDetails?.push({
-                barIdx: i,
-                time: c.time || c.timestamp,
-                direction: 'CALL',
-                price: c.close,
-                vwap: curVwap,
-                stage: 'SETUP_BAR',
-                distance: Number((c.close - curVwap).toFixed(2)),
-              });
+        if (isAdaptive) {
+          // Dynamic Adaptive Dual-Mode Regime Logic
+          if (passVwapBuy) {
+            if (curRegime === 'TREND_BEAR') {
+              if (allowRev && distFromVwap <= -climaxBand) {
+                passVwapBuy = true; // Deep panic oversold bounce allowed!
+              } else {
+                passVwapBuy = false; // Block counter-trend CALL in active Bear Trend
+                if (rawBuy && passWickBuy && passAdxBuy && passPreMarket) {
+                  if (res.adaptiveFilteredCount !== undefined) res.adaptiveFilteredCount++;
+                  if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
+                  res.vwapFilterDetails?.push({
+                    barIdx: i,
+                    time: c.time || c.timestamp,
+                    direction: 'CALL',
+                    price: c.close,
+                    vwap: curVwap,
+                    stage: 'SETUP_BAR',
+                    distance: Number((curVwap - c.close).toFixed(2)),
+                  });
+                }
+              }
+            } else if (curRegime === 'RANGE') {
+              if (distFromVwap > climaxBand) {
+                passVwapBuy = false; // Block buying into climax exhaustion top
+                if (rawBuy && passWickBuy && passAdxBuy && passPreMarket) {
+                  if (res.adaptiveFilteredCount !== undefined) res.adaptiveFilteredCount++;
+                  if (res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
+                  res.vwapFilterDetails?.push({
+                    barIdx: i,
+                    time: c.time || c.timestamp,
+                    direction: 'CALL',
+                    price: c.close,
+                    vwap: curVwap,
+                    stage: 'SETUP_BAR',
+                    distance: Number(distFromVwap.toFixed(2)),
+                  });
+                }
+              }
             }
           }
-        }
 
-        // Short Trend & Climax Check
-        if (passVwapSell) {
-          if (c.close > curVwap) {
-            passVwapSell = false;
-            if (rawSell && passWickSell && passAdxSell && passPreMarket) {
-              if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
-              res.vwapFilterDetails?.push({
-                barIdx: i,
-                time: c.time || c.timestamp,
-                direction: 'PUT',
-                price: c.close,
-                vwap: curVwap,
-                stage: 'SETUP_BAR',
-                distance: Number((c.close - curVwap).toFixed(2)),
-              });
+          if (passVwapSell) {
+            if (curRegime === 'TREND_BULL') {
+              if (allowRev && distFromVwap >= climaxBand) {
+                passVwapSell = true; // Deep euphoria overbought fade allowed!
+              } else {
+                passVwapSell = false; // Block counter-trend PUT in active Bull Trend
+                if (rawSell && passWickSell && passAdxSell && passPreMarket) {
+                  if (res.adaptiveFilteredCount !== undefined) res.adaptiveFilteredCount++;
+                  if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
+                  res.vwapFilterDetails?.push({
+                    barIdx: i,
+                    time: c.time || c.timestamp,
+                    direction: 'PUT',
+                    price: c.close,
+                    vwap: curVwap,
+                    stage: 'SETUP_BAR',
+                    distance: Number(distFromVwap.toFixed(2)),
+                  });
+                }
+              }
+            } else if (curRegime === 'RANGE') {
+              if (distFromVwap < -climaxBand) {
+                passVwapSell = false; // Block shorting into panic exhaustion bottom
+                if (rawSell && passWickSell && passAdxSell && passPreMarket) {
+                  if (res.adaptiveFilteredCount !== undefined) res.adaptiveFilteredCount++;
+                  if (res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
+                  res.vwapFilterDetails?.push({
+                    barIdx: i,
+                    time: c.time || c.timestamp,
+                    direction: 'PUT',
+                    price: c.close,
+                    vwap: curVwap,
+                    stage: 'SETUP_BAR',
+                    distance: Number((curVwap - c.close).toFixed(2)),
+                  });
+                }
+              }
             }
-          } else if (climaxProtection && (curVwap - c.close) > maxVwapDist) {
-            passVwapSell = false;
-            if (rawSell && passWickSell && passAdxSell && passPreMarket) {
-              if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
-              if (res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
-              res.vwapFilterDetails?.push({
-                barIdx: i,
-                time: c.time || c.timestamp,
-                direction: 'PUT',
-                price: c.close,
-                vwap: curVwap,
-                stage: 'SETUP_BAR',
-                distance: Number((curVwap - c.close).toFixed(2)),
-              });
+          }
+        } else if (config.vwapFilterEnabled) {
+          // Classic Static VWAP Trend & Climax Check
+          if (passVwapBuy) {
+            if (c.close < curVwap) {
+              passVwapBuy = false;
+              if (rawBuy && passWickBuy && passAdxBuy && passPreMarket) {
+                if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
+                res.vwapFilterDetails?.push({
+                  barIdx: i,
+                  time: c.time || c.timestamp,
+                  direction: 'CALL',
+                  price: c.close,
+                  vwap: curVwap,
+                  stage: 'SETUP_BAR',
+                  distance: Number((curVwap - c.close).toFixed(2)),
+                });
+              }
+            } else if (climaxProtection && (c.close - curVwap) > maxVwapDist) {
+              passVwapBuy = false;
+              if (rawBuy && passWickBuy && passAdxBuy && passPreMarket) {
+                if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
+                if (res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
+                res.vwapFilterDetails?.push({
+                  barIdx: i,
+                  time: c.time || c.timestamp,
+                  direction: 'CALL',
+                  price: c.close,
+                  vwap: curVwap,
+                  stage: 'SETUP_BAR',
+                  distance: Number((c.close - curVwap).toFixed(2)),
+                });
+              }
+            }
+          }
+
+          if (passVwapSell) {
+            if (c.close > curVwap) {
+              passVwapSell = false;
+              if (rawSell && passWickSell && passAdxSell && passPreMarket) {
+                if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
+                res.vwapFilterDetails?.push({
+                  barIdx: i,
+                  time: c.time || c.timestamp,
+                  direction: 'PUT',
+                  price: c.close,
+                  vwap: curVwap,
+                  stage: 'SETUP_BAR',
+                  distance: Number((c.close - curVwap).toFixed(2)),
+                });
+              }
+            } else if (climaxProtection && (curVwap - c.close) > maxVwapDist) {
+              passVwapSell = false;
+              if (rawSell && passWickSell && passAdxSell && passPreMarket) {
+                if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
+                if (res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
+                res.vwapFilterDetails?.push({
+                  barIdx: i,
+                  time: c.time || c.timestamp,
+                  direction: 'PUT',
+                  price: c.close,
+                  vwap: curVwap,
+                  stage: 'SETUP_BAR',
+                  distance: Number((curVwap - c.close).toFixed(2)),
+                });
+              }
             }
           }
         }
@@ -565,8 +1125,8 @@ export function computeSamSignals(
     const baseSetupSell = rawSell && passWickSell && passMinBodySell && passMtfEmaSell && passDayTrapSell && passPreMarket && passAdxSell;
 
     // Filtered Candidate Setups on Bar 0
-    const setupBuy = baseSetupBuy && (config.vwapFilterEnabled ? passVwapBuy : true);
-    const setupSell = baseSetupSell && (config.vwapFilterEnabled ? passVwapSell : true);
+    const setupBuy = baseSetupBuy && ((config.vwapFilterEnabled || isAdaptive) ? passVwapBuy : true);
+    const setupSell = baseSetupSell && ((config.vwapFilterEnabled || isAdaptive) ? passVwapSell : true);
 
     if (timing === 'bar1Close') {
       if (res.candidateCallSignals) {
@@ -602,9 +1162,29 @@ export function computeSamSignals(
         // CALL Signal Evaluation on Bar + 1 Close
         if (res.candidateCallSignals?.[i - 1]) {
           const isAdverse = (curC.close < curC.open || curC.close < prevC.close);
-          const breaksVwapTrend = config.vwapFilterEnabled && !isNaN(curVwap) && curC.close < curVwap;
-          const breaksVwapClimax = config.vwapFilterEnabled && climaxProtection && !isNaN(curVwap) && (curC.close - curVwap) > maxVwapDist;
-          const breaksVwap = breaksVwapTrend || breaksVwapClimax;
+          
+          let breaksVwap = false;
+          let breaksVwapClimax = false;
+          if (isAdaptive && !isNaN(curVwap)) {
+            const bar1Dist = curC.close - curVwap;
+            const bar1Regime = res.regimeState?.[i] || 'RANGE';
+            if (bar1Regime === 'TREND_BEAR') {
+              if (allowRev && bar1Dist <= -climaxBand) {
+                breaksVwap = false; // Oversold bottom bounce permitted!
+              } else {
+                breaksVwap = true;
+              }
+            } else if (bar1Regime === 'RANGE') {
+              if (bar1Dist > climaxBand) {
+                breaksVwap = true;
+                breaksVwapClimax = true;
+              }
+            }
+          } else if (config.vwapFilterEnabled && !isNaN(curVwap)) {
+            const breaksVwapTrend = curC.close < curVwap;
+            breaksVwapClimax = climaxProtection && (curC.close - curVwap) > maxVwapDist;
+            breaksVwap = breaksVwapTrend || breaksVwapClimax;
+          }
 
           // Check Day High Trap at Bar + 1 close
           const dHigh = dayHighsBeforeBar[i];
@@ -621,10 +1201,14 @@ export function computeSamSignals(
             }
           }
 
-          if ((config.filterBar1AdverseCloseEnabled && isAdverse) || breaksVwap || breaksDayTrap || breaksMtfEma) {
+          // Check S12 Confluence Filter at Bar + 1 close (DI Spread > +5, EMA100/200 aligned, RVOL >= 0.70)
+          const breaksS12 = config.filterS12ConfluenceEnabled ? !passesS12Confluence(i, 'CALL') : false;
+
+          if ((config.filterBar1AdverseCloseEnabled && isAdverse) || breaksVwap || breaksDayTrap || breaksMtfEma || breaksS12) {
             if (breaksVwap) {
               if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
               if (breaksVwapClimax && res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
+              if (isAdaptive && res.adaptiveFilteredCount !== undefined) res.adaptiveFilteredCount++;
               res.vwapFilterDetails?.push({
                 barIdx: i,
                 time: curC.time || curC.timestamp,
@@ -638,6 +1222,9 @@ export function computeSamSignals(
             if (breaksDayTrap && res.dayTrapFilteredCount !== undefined) res.dayTrapFilteredCount++;
             if (breaksMtfEma && res.mtfEmaFilteredCount !== undefined) res.mtfEmaFilteredCount++;
             if (isAdverse && res.bar1FilteredCount !== undefined) res.bar1FilteredCount++;
+            if (breaksS12 && !(config.filterBar1AdverseCloseEnabled && isAdverse) && !breaksVwap && !breaksDayTrap && !breaksMtfEma && res.s12FilteredCount !== undefined) {
+              res.s12FilteredCount++;
+            }
           } else {
             // Passed! Fire confirmed entry signal at candle i (Bar + 1) close!
             res.callSignals[i] = config.visibleBuy !== false;
@@ -648,9 +1235,29 @@ export function computeSamSignals(
         // PUT Signal Evaluation on Bar + 1 Close
         if (res.candidatePutSignals?.[i - 1]) {
           const isAdverse = (curC.close > curC.open || curC.close > prevC.close);
-          const breaksVwapTrend = config.vwapFilterEnabled && !isNaN(curVwap) && curC.close > curVwap;
-          const breaksVwapClimax = config.vwapFilterEnabled && climaxProtection && !isNaN(curVwap) && (curVwap - curC.close) > maxVwapDist;
-          const breaksVwap = breaksVwapTrend || breaksVwapClimax;
+          
+          let breaksVwap = false;
+          let breaksVwapClimax = false;
+          if (isAdaptive && !isNaN(curVwap)) {
+            const bar1Dist = curC.close - curVwap;
+            const bar1Regime = res.regimeState?.[i] || 'RANGE';
+            if (bar1Regime === 'TREND_BULL') {
+              if (allowRev && bar1Dist >= climaxBand) {
+                breaksVwap = false; // Overbought top fade permitted!
+              } else {
+                breaksVwap = true;
+              }
+            } else if (bar1Regime === 'RANGE') {
+              if (bar1Dist < -climaxBand) {
+                breaksVwap = true;
+                breaksVwapClimax = true;
+              }
+            }
+          } else if (config.vwapFilterEnabled && !isNaN(curVwap)) {
+            const breaksVwapTrend = curC.close > curVwap;
+            breaksVwapClimax = climaxProtection && (curVwap - curC.close) > maxVwapDist;
+            breaksVwap = breaksVwapTrend || breaksVwapClimax;
+          }
 
           // Check Day Low Trap at Bar + 1 close
           const dLow = dayLowsBeforeBar[i];
@@ -667,10 +1274,14 @@ export function computeSamSignals(
             }
           }
 
-          if ((config.filterBar1AdverseCloseEnabled && isAdverse) || breaksVwap || breaksDayTrap || breaksMtfEma) {
+          // Check S12 Confluence Filter at Bar + 1 close (DI Spread > +5, EMA100/200 aligned, RVOL >= 0.70)
+          const breaksS12 = config.filterS12ConfluenceEnabled ? !passesS12Confluence(i, 'PUT') : false;
+
+          if ((config.filterBar1AdverseCloseEnabled && isAdverse) || breaksVwap || breaksDayTrap || breaksMtfEma || breaksS12) {
             if (breaksVwap) {
               if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
               if (breaksVwapClimax && res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
+              if (isAdaptive && res.adaptiveFilteredCount !== undefined) res.adaptiveFilteredCount++;
               res.vwapFilterDetails?.push({
                 barIdx: i,
                 time: curC.time || curC.timestamp,
@@ -684,6 +1295,9 @@ export function computeSamSignals(
             if (breaksDayTrap && res.dayTrapFilteredCount !== undefined) res.dayTrapFilteredCount++;
             if (breaksMtfEma && res.mtfEmaFilteredCount !== undefined) res.mtfEmaFilteredCount++;
             if (isAdverse && res.bar1FilteredCount !== undefined) res.bar1FilteredCount++;
+            if (breaksS12 && !(config.filterBar1AdverseCloseEnabled && isAdverse) && !breaksVwap && !breaksDayTrap && !breaksMtfEma && res.s12FilteredCount !== undefined) {
+              res.s12FilteredCount++;
+            }
           } else {
             // Passed! Fire confirmed entry signal at candle i (Bar + 1) close!
             res.putSignals[i] = config.visibleSell !== false;
@@ -710,19 +1324,25 @@ export function computeSamSignals(
           const breaksVwapTrend = config.vwapFilterEnabled && !isNaN(curVwap) && curC.open < curVwap;
           const breaksVwapClimax = config.vwapFilterEnabled && climaxProtection && !isNaN(curVwap) && (curC.open - curVwap) > maxVwapDist;
           const breaksVwap = breaksVwapTrend || breaksVwapClimax;
+          // Evaluate S12 strictly on completed bar (i - 1) so bar1Open entry has zero lookahead
+          const breaksS12 = config.filterS12ConfluenceEnabled ? !passesS12Confluence(i - 1, 'CALL') : false;
 
-          if (breaksVwap) {
-            if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
-            if (breaksVwapClimax && res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
-            res.vwapFilterDetails?.push({
-              barIdx: i,
-              time: curC.time || curC.timestamp,
-              direction: 'CALL',
-              price: curC.open,
-              vwap: curVwap,
-              stage: 'CONFIRMATION_BAR',
-              distance: Number(Math.abs(curC.open - curVwap).toFixed(2)),
-            });
+          if (breaksVwap || breaksS12) {
+            if (breaksVwap) {
+              if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
+              if (breaksVwapClimax && res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
+              res.vwapFilterDetails?.push({
+                barIdx: i,
+                time: curC.time || curC.timestamp,
+                direction: 'CALL',
+                price: curC.open,
+                vwap: curVwap,
+                stage: 'CONFIRMATION_BAR',
+                distance: Number(Math.abs(curC.open - curVwap).toFixed(2)),
+              });
+            } else if (breaksS12 && res.s12FilteredCount !== undefined) {
+              res.s12FilteredCount++;
+            }
           } else {
             res.callSignals[i] = config.visibleBuy !== false;
           }
@@ -731,19 +1351,24 @@ export function computeSamSignals(
           const breaksVwapTrend = config.vwapFilterEnabled && !isNaN(curVwap) && curC.open > curVwap;
           const breaksVwapClimax = config.vwapFilterEnabled && climaxProtection && !isNaN(curVwap) && (curVwap - curC.open) > maxVwapDist;
           const breaksVwap = breaksVwapTrend || breaksVwapClimax;
+          const breaksS12 = config.filterS12ConfluenceEnabled ? !passesS12Confluence(i - 1, 'PUT') : false;
 
-          if (breaksVwap) {
-            if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
-            if (breaksVwapClimax && res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
-            res.vwapFilterDetails?.push({
-              barIdx: i,
-              time: curC.time || curC.timestamp,
-              direction: 'PUT',
-              price: curC.open,
-              vwap: curVwap,
-              stage: 'CONFIRMATION_BAR',
-              distance: Number(Math.abs(curC.open - curVwap).toFixed(2)),
-            });
+          if (breaksVwap || breaksS12) {
+            if (breaksVwap) {
+              if (res.vwapFilteredCount !== undefined) res.vwapFilteredCount++;
+              if (breaksVwapClimax && res.climaxFilteredCount !== undefined) res.climaxFilteredCount++;
+              res.vwapFilterDetails?.push({
+                barIdx: i,
+                time: curC.time || curC.timestamp,
+                direction: 'PUT',
+                price: curC.open,
+                vwap: curVwap,
+                stage: 'CONFIRMATION_BAR',
+                distance: Number(Math.abs(curC.open - curVwap).toFixed(2)),
+              });
+            } else if (breaksS12 && res.s12FilteredCount !== undefined) {
+              res.s12FilteredCount++;
+            }
           } else {
             res.putSignals[i] = config.visibleSell !== false;
           }
@@ -769,8 +1394,15 @@ export function computeSamSignals(
       if (res.baseCallSignals) res.baseCallSignals[i] = rawBuy && passWickBuy && passBar1CloseBuy && passAdxBuy && passPreMarket;
       if (res.basePutSignals) res.basePutSignals[i] = rawSell && passWickSell && passBar1CloseSell && passAdxSell && passPreMarket;
 
-      res.callSignals[i] = rawBuy && passWickBuy && passBar1CloseBuy && passAdxBuy && (config.vwapFilterEnabled ? passVwapBuy : true) && passPreMarket && config.visibleBuy !== false;
-      res.putSignals[i] = rawSell && passWickSell && passBar1CloseSell && passAdxSell && (config.vwapFilterEnabled ? passVwapSell : true) && passPreMarket && config.visibleSell !== false;
+      const preS12Buy = rawBuy && passWickBuy && passBar1CloseBuy && passAdxBuy && (config.vwapFilterEnabled ? passVwapBuy : true) && passPreMarket;
+      const preS12Sell = rawSell && passWickSell && passBar1CloseSell && passAdxSell && (config.vwapFilterEnabled ? passVwapSell : true) && passPreMarket;
+      const passS12Buy = !config.filterS12ConfluenceEnabled || passesS12Confluence(i, 'CALL');
+      const passS12Sell = !config.filterS12ConfluenceEnabled || passesS12Confluence(i, 'PUT');
+      if (preS12Buy && !passS12Buy && res.s12FilteredCount !== undefined) res.s12FilteredCount++;
+      if (preS12Sell && !passS12Sell && res.s12FilteredCount !== undefined) res.s12FilteredCount++;
+
+      res.callSignals[i] = preS12Buy && passS12Buy && config.visibleBuy !== false;
+      res.putSignals[i] = preS12Sell && passS12Sell && config.visibleSell !== false;
     }
   }
 

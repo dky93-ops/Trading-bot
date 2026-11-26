@@ -118,6 +118,223 @@ describe('SAM Signals & Technical Indicators', () => {
     expect(res.bar1FilteredCount).toBeGreaterThan(0);
   });
 
+  it('S12 Confluence Filter allows aligned DI>+5, EMA100/200 & RVOL>=0.70 entries and blocks thin-volume or counter-EMA entries', () => {
+    const buildSeries = (bar1Volume: number, priorTrendBase: number) => {
+      const candles: any[] = [];
+      // 205 warmup bars so EMA100 & EMA200 are fully primed
+      for (let i = 0; i < 205; i++) {
+        const p = priorTrendBase + (i >= 180 ? (i - 180) * 0.2 : 0);
+        candles.push({
+          open: p - 0.5,
+          high: p + 1.5,
+          low: p - 1.5,
+          close: p,
+          volume: 1000,
+          time: 1700000100 + i * 60,
+        });
+      }
+      // Small 5-bar dip to pull buffer1 slightly below buffer2, then sharp bullish breakout
+      const base = candles[candles.length - 1].close;
+      for (let k = 0; k < 5; k++) {
+        const p = base - (k + 1) * 1.2;
+        candles.push({ open: p + 0.5, high: p + 1, low: p - 1, close: p, volume: 1000, time: 1700000100 + (205 + k) * 60 });
+      }
+      // Bar 210 (Setup Bar 0): strong bullish crossover above SMA34/buffer2
+      candles.push({ open: base - 5, high: base + 12, low: base - 5, close: base + 10, volume: 1200, time: 1700000100 + 210 * 60 });
+      // Bar 211 (Confirmation Bar + 1): strong bullish follow-through
+      candles.push({ open: base + 10, high: base + 22, low: base + 9, close: base + 20, volume: bar1Volume, time: 1700000100 + 211 * 60 });
+      return candles;
+    };
+
+    // Case 1: Strong uptrend above EMA100/200, strong +DI spread, healthy RVOL (1.2x >= 0.70) -> PASS
+    const passCandles = buildSeries(1200, 25000);
+    const resPass = computeSamSignals(passCandles, {
+      ...DEFAULT_SAM_CONFIG,
+      vwapFilterEnabled: false,
+      adaptiveRegimeEnabled: false,
+      noTradeBefore915: false,
+      filterS12ConfluenceEnabled: true,
+      s12DiSpreadMin: 5,
+      s12MinRvol: 0.7,
+    });
+    expect(resPass.callSignals[211]).toBe(true);
+    expect(resPass.ema100Values).toBeDefined();
+    expect(resPass.ema200Values).toBeDefined();
+
+    // Case 2: Identical setup, except Bar+1 has thin volume (RVOL = 0.20 < 0.70) -> BLOCKED by S12
+    const lowVolCandles = buildSeries(200, 25000);
+    const resLowVol = computeSamSignals(lowVolCandles, {
+      ...DEFAULT_SAM_CONFIG,
+      vwapFilterEnabled: false,
+      adaptiveRegimeEnabled: false,
+      noTradeBefore915: false,
+      filterS12ConfluenceEnabled: true,
+      s12DiSpreadMin: 5,
+      s12MinRvol: 0.7,
+    });
+    expect(resLowVol.callSignals[211]).toBe(false);
+    expect(resLowVol.s12FilteredCount).toBeGreaterThan(0);
+
+    // Case 3: Counter-macro CALL (price far below EMA200 after long decline) -> BLOCKED by S12
+    const counterMacroCandles = buildSeries(1500, 25000);
+    for (let i = 0; i < 120; i++) {
+      // Make earlier history much higher so EMA200 stays well above Bar 211 close
+      counterMacroCandles[i].open += 500;
+      counterMacroCandles[i].high += 500;
+      counterMacroCandles[i].low += 500;
+      counterMacroCandles[i].close += 500;
+    }
+    const resCounterMacro = computeSamSignals(counterMacroCandles, {
+      ...DEFAULT_SAM_CONFIG,
+      vwapFilterEnabled: false,
+      adaptiveRegimeEnabled: false,
+      noTradeBefore915: false,
+      filterS12ConfluenceEnabled: true,
+      s12DiSpreadMin: 5,
+      s12MinRvol: 0.7,
+    });
+    expect(resCounterMacro.callSignals[211]).toBe(false);
+    expect(resCounterMacro.s12FilteredCount).toBeGreaterThan(0);
+  });
+
+  it('SAM 21/5 Institutional Filters (#1 Afternoon & #2 Combined) fire in exact IST windows with zero lookahead', () => {
+    // Helper to build an IST-shifted timestamp for a given day index and IST hour:minute
+    // Base day 0 = 2025-05-01 00:00 UTC-as-IST -> 1746057600
+    const BASE_DAY_SEC = 1746057600;
+    const makeTime = (dayOffset: number, hour: number, min: number) =>
+      BASE_DAY_SEC + dayOffset * 86400 + (hour * 60 + min) * 60;
+
+    // Build 2 full NSE trading days (Day 0: 09:15-15:29, Day 1: 09:15-15:29)
+    // Day 0 establishes steady uptrend (so 5m ADX >= 30 & 15m Supertrend bullish) with PDH around 25200
+    const candles: Array<{ open: number; high: number; low: number; close: number; volume: number; time: number }> = [];
+    let price = 24800;
+
+    // Day 0: 375 bars (09:15 to 15:29) rising cleanly from 24800 -> ~25175 (PDH ~ 25180)
+    for (let m = 0; m < 375; m++) {
+      const totalMin = 9 * 60 + 15 + m;
+      const hr = Math.floor(totalMin / 60);
+      const mn = totalMin % 60;
+      const open = price;
+      const close = price + 1.0;
+      candles.push({
+        open,
+        high: close + 1.2,
+        low: open - 0.5,
+        close,
+        volume: 1500,
+        time: makeTime(0, hr, mn),
+      });
+      price = close;
+    }
+
+    // Day 1: 375 bars (09:15 to 15:29)
+    // 09:15-09:29: mild pullback near 25165-25170 (below PDH ~25176) to pull 3m buffer1 below buffer2
+    // 09:30-09:32 (3m closing bar at 09:32): huge strong bullish expansion breaking above PDH!
+    // 12:20-12:34: mild dip above PDH (25260 -> 25245) to pull 1m buffer1 below buffer2
+    // 12:35: sharp bullish 1m crossover above PDH with 5m ADX >= 30 -> Afternoon CALL!
+    price = 25170;
+    for (let m = 0; m < 375; m++) {
+      const totalMin = 9 * 60 + 15 + m;
+      const hr = Math.floor(totalMin / 60);
+      const mn = totalMin % 60;
+      let open = price;
+      let close = price;
+      let high = price + 1;
+      let low = price - 1;
+
+      if (totalMin >= 555 && totalMin <= 569) {
+        // 09:15 - 09:29: slight drift down so 3m SAM(21/5) drops below signal
+        open = price;
+        close = price - 1.5;
+        high = open + 0.5;
+        low = close - 0.5;
+      } else if (totalMin >= 570 && totalMin <= 572) {
+        // 09:30 - 09:32: 3m Strong Bar breakout above PDH (~25176)
+        open = price;
+        close = price + 22;
+        high = close + 0.5;
+        low = open - 0.2;
+      } else if (totalMin >= 740 && totalMin <= 754) {
+        // 12:20 - 12:34: gentle pullback while staying well above PDH
+        open = price;
+        close = price - 1.2;
+        high = open + 0.4;
+        low = close - 0.4;
+      } else if (totalMin === 755) {
+        // 12:35 IST (inside 12:30-14:50): sharp bullish 1m SAM(21/5) crossover above PDH
+        open = price;
+        close = price + 25;
+        high = close + 1;
+        low = open - 0.5;
+      } else {
+        // Gentle trend drift up so 5m ADX >= 30 & 15m Supertrend remains bullish
+        open = price;
+        close = price + 0.8;
+        high = close + 0.8;
+        low = open - 0.3;
+      }
+
+      candles.push({
+        open,
+        high,
+        low,
+        close,
+        volume: 1500,
+        time: makeTime(1, hr, mn),
+      });
+      price = close;
+    }
+
+    // 1. Default config has both new filters OFF
+    expect(DEFAULT_SAM_CONFIG.filterSam21AfternoonEnabled).toBe(false);
+    expect(DEFAULT_SAM_CONFIG.filterSam21CombinedEnabled).toBe(false);
+
+    // 2. Filter 1 ON (Fixed40 mode): fires Afternoon CALL inside 12:30-14:50, ZERO morning signals
+    const resAftFixed = computeSamSignals(candles, {
+      ...DEFAULT_SAM_CONFIG,
+      filterSam21AfternoonEnabled: true,
+      sam21AfternoonExitMode: 'fixed40',
+      filterSam21CombinedEnabled: false,
+    });
+    expect(resAftFixed.sam21AfternoonSignalCount).toBeGreaterThan(0);
+    expect(resAftFixed.sam21OpenDriveSignalCount).toBe(0);
+    const aftIdx = resAftFixed.callSignals.findIndex(Boolean);
+    expect(aftIdx).toBeGreaterThanOrEqual(375);
+    expect(resAftFixed.samSignalProfile?.[aftIdx]).toBe('SAM21_AFT_FIXED');
+
+    // 3. Filter 1 ON (Chandelier mode): sets SAM21_AFT_CHAND profile
+    const resAftChand = computeSamSignals(candles, {
+      ...DEFAULT_SAM_CONFIG,
+      filterSam21AfternoonEnabled: true,
+      sam21AfternoonExitMode: 'chandelier',
+      filterSam21CombinedEnabled: false,
+    });
+    expect(resAftChand.samSignalProfile?.[aftIdx]).toBe('SAM21_AFT_CHAND');
+
+    // 4. Filter 2 ON (Morning + Afternoon Combined): fires BOTH 3m OpenDrive Morning AND 1m Afternoon
+    const resCombined = computeSamSignals(candles, {
+      ...DEFAULT_SAM_CONFIG,
+      filterSam21AfternoonEnabled: false,
+      filterSam21CombinedEnabled: true,
+      sam21AfternoonExitMode: 'fixed40',
+    });
+    expect(resCombined.sam21OpenDriveSignalCount).toBeGreaterThan(0);
+    expect(resCombined.sam21AfternoonSignalCount).toBeGreaterThan(0);
+    const openDriveIdx = resCombined.samSignalProfile?.findIndex(p => p === 'SAM21_3M_OPENDRIVE') ?? -1;
+    expect(openDriveIdx).toBeGreaterThanOrEqual(375);
+    expect(resCombined.callSignals[openDriveIdx]).toBe(true);
+    expect(resCombined.atr5mValues?.[openDriveIdx]).toBeGreaterThan(0);
+
+    // 5. Zero-Lookahead Verification: truncating future bars after openDriveIdx produces identical signal at openDriveIdx
+    const truncated = candles.slice(0, openDriveIdx + 1);
+    const resTruncated = computeSamSignals(truncated, {
+      ...DEFAULT_SAM_CONFIG,
+      filterSam21CombinedEnabled: true,
+    });
+    expect(resTruncated.callSignals[openDriveIdx]).toBe(true);
+    expect(resTruncated.samSignalProfile?.[openDriveIdx]).toBe('SAM21_3M_OPENDRIVE');
+  });
+
   describe.skip('Targeted Precision Filters & Independent On/Off Toggles', () => {
     function generateBaseCrossoverCandles() {
       const candles: any[] = [];

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeATR } from '../src/backend/technical-indicators';
+import { computeATR, compute5MinEMA } from '../src/backend/technical-indicators';
 
 describe('computeATR', () => {
   it('should calculate ATR correctly against a known reference series', () => {
@@ -32,3 +32,40 @@ describe('computeATR', () => {
     expect(atr[15]).toBeCloseTo(expectedAtr15, 5);
   });
 });
+
+describe('compute5MinEMA (strictly causal / zero intra-5m lookahead)', () => {
+  it('never leaks future intra-5m candle closes back onto earlier minutes in the same 5m bucket', () => {
+    const baseTime = 1700000100; // aligned to 300s boundary
+    const candlesA = [
+      // Bucket 0 (0..4): closes at 100
+      ...Array.from({ length: 5 }, (_, i) => ({ time: baseTime + i * 60, open: 100, high: 101, low: 99, close: 100 })),
+      // Bucket 1 (5..9): minute 5 is 102, minutes 6..9 stay at 102
+      ...Array.from({ length: 5 }, (_, i) => ({ time: baseTime + (5 + i) * 60, open: 102, high: 103, low: 101, close: 102 })),
+    ];
+
+    // Identical through minute 5, then huge spike on minutes 6..9 within the SAME 5-min bucket
+    const candlesB = candlesA.map((c, idx) =>
+      idx >= 6 ? { ...c, open: 102, high: 500, low: 100, close: 500 } : { ...c }
+    );
+
+    const resA = compute5MinEMA(candlesA, 20);
+    const resB = compute5MinEMA(candlesB, 20);
+
+    // Minutes 0..5 MUST be bit-for-bit identical regardless of what happens at minutes 6..9
+    for (let i = 0; i <= 5; i++) {
+      expect(resA.ema[i]).toBe(resB.ema[i]);
+      expect(resA.slope[i]).toBe(resB.slope[i]);
+    }
+
+    // At minute 5 (first minute of bucket 1), EMA updates live against bucket 0's closing EMA (100)
+    const k = 2 / (20 + 1);
+    const expectedMin5Ema = Number(((102 - 100) * k + 100).toFixed(2));
+    expect(resA.ema[5]).toBe(expectedMin5Ema);
+    expect(resA.slope[5]).toBeGreaterThan(0);
+
+    // At minute 9 of candlesB (close of bucket 1 = 500), EMA matches exact 5m close update
+    const expectedBucket1CloseEma = Number(((500 - 100) * k + 100).toFixed(2));
+    expect(resB.ema[9]).toBe(expectedBucket1CloseEma);
+  });
+});
+

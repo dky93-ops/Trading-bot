@@ -202,8 +202,6 @@ describe('NIFTY MACD + Adaptive SuperTrend Strategy', () => {
       maxTradeDurationMinutes: 60,
       strategies: {
         macdAdaptiveSupertrend: { enabled: true, lotSize: 1 },
-        comboFiltered: { enabled: true, lotSize: 1 },
-        comboUnfiltered: { enabled: true, lotSize: 1 },
       }
     };
 

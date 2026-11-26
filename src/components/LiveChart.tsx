@@ -1,9 +1,19 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { createChart, ColorType, CrosshairMode, ISeriesApi, LineStyle, Time } from 'lightweight-charts';
-import { computeATR, computeT3, computeAlphaTrend, computeADX, computeEMA, computeSMA, computeRSI, computeMFI } from '../backend/technical-indicators';
-import { computeKMeansAdaptiveSuperTrend, computeCMMACD } from '../backend/ml-adaptive-supertrend';
+import { computeATR, computeSMA } from '../backend/technical-indicators';
 import { NiftyMacdAdaptiveSupertrend } from '../backend/nifty-macd-adaptive-supertrend';
 import { computeSamSignals, SamSignalsConfig, DEFAULT_SAM_CONFIG } from '../backend/sam-signals';
+import {
+  NIFTY_LOT_SIZE,
+  CompactOptionSnapshot,
+  OptionDataSource,
+  ResolvedTradeOptionData,
+  resolveTradeFromSnapshots,
+} from '../lib/option-premium-utils';
+import {
+  TradeNotificationEvent,
+  isFreshLiveCandleTime,
+} from '../lib/trade-notifications';
 
 type Trade = {
   id: string;
@@ -22,69 +32,112 @@ type Trade = {
   pnl?: number;
   status: 'OPEN' | 'WIN' | 'LOSS' | 'BE';
   isBreakevenLocked?: boolean;
-  isComboTrade?: boolean;
   strategyFamily?: string;
   riskDist?: number;
   peakPrice?: number;
   trailStage?: number;
   entryBarIdx?: number;
   signalBarIdx?: number;
-  // Option Premium fields (derived from recorded option chain data, 65 qty/lot)
+  samExitProfile?: 'STANDARD' | 'FIXED_EOD' | 'CHANDELIER';
+  samBeTriggerPts?: number;
+  samChandelierDistPts?: number;
+  samIgnoreOppositeExit?: boolean;
+  samNoFixedTp?: boolean;
+  samEodExitMin?: number;
+  timeframeMin?: number;
+  exitSpotBar?: { open: number; high: number; low: number; close: number };
+  // Option Premium fields (strictly from real Option Chain History or Upstox 1m Option Candles, 65 qty/lot)
   optionStrike?: number;
   optionType?: 'CE' | 'PE';
+  optionExpiry?: string;
   optionDelta?: number;
   optionEntryPremium?: number;
   optionExitPremium?: number;
   premiumPnl?: number;
   lotPnl?: number;
+  optionDataSource?: OptionDataSource;
 };
 
-export const LOT_SIZE = 65;
+export const LOT_SIZE = NIFTY_LOT_SIZE;
+
+export function getOptionTradeLookupKey(trade: Pick<Trade, 'id' | 'type' | 'entryTime' | 'entryPrice' | 'exitTime' | 'exitPrice' | 'exitReason' | 'status' | 'timeframeMin'>, timeframeMin = 1): string {
+  const strike = Math.round(trade.entryPrice / 50) * 50;
+  const tf = trade.timeframeMin || timeframeMin || 1;
+  return `${trade.id}|${trade.type}|${strike}|${trade.entryTime}|${trade.exitTime ?? 'OPEN'}|${trade.exitPrice ?? ''}|${trade.exitReason ?? ''}|${trade.status}|${tf}`;
+}
 
 export function decorateTradeWithOptionData(
   trade: Trade,
-  optionSnapshots: Array<{ t: number; spot: number; atm: number; ceLtp: number | null; peLtp: number | null; ceDelta: number; peDelta: number }> = []
+  optionSnapshots: CompactOptionSnapshot[] = [],
+  resolvedOptionMap: Record<string, ResolvedTradeOptionData> = {},
+  timeframeMin: number = 1
 ): Trade {
-  const optType: 'CE' | 'PE' = trade.type === 'LONG' ? 'CE' : 'PE';
-  const strike = Math.round(trade.entryPrice / 50) * 50;
+  const tf = trade.timeframeMin || timeframeMin || 1;
+  const fromSnapshots = resolveTradeFromSnapshots(
+    {
+      id: trade.id,
+      type: trade.type,
+      entryTime: trade.entryTime,
+      entryPrice: trade.entryPrice,
+      exitTime: trade.exitTime,
+      exitPrice: trade.exitPrice,
+      exitReason: trade.exitReason,
+      status: trade.status,
+      pnl: trade.pnl,
+      timeframeMin: tf,
+      exitSpotBar: trade.exitSpotBar,
+    },
+    optionSnapshots,
+    LOT_SIZE
+  );
 
-  // Candle time has +19800 offset, convert to UTC ms
-  const tradeUtcMs = ((trade.entryTime || 0) - 19800) * 1000;
-  let matchingSnap: any = null;
-  if (optionSnapshots && optionSnapshots.length > 0) {
-    let minDiff = Infinity;
-    for (const snap of optionSnapshots) {
-      const diff = Math.abs(snap.t - tradeUtcMs);
-      if (diff < minDiff && diff <= 5 * 60 * 1000) {
-        minDiff = diff;
-        matchingSnap = snap;
-      }
-    }
+  if (fromSnapshots.optionDataSource === 'OPTION_CHAIN_HISTORY') {
+    return {
+      ...trade,
+      timeframeMin: tf,
+      optionStrike: fromSnapshots.optionStrike,
+      optionType: fromSnapshots.optionType,
+      optionExpiry: fromSnapshots.optionExpiry,
+      optionDelta: fromSnapshots.optionDelta,
+      optionEntryPremium: fromSnapshots.optionEntryPremium,
+      optionExitPremium: fromSnapshots.optionExitPremium,
+      premiumPnl: fromSnapshots.premiumPnl,
+      lotPnl: fromSnapshots.lotPnl,
+      optionDataSource: fromSnapshots.optionDataSource,
+    };
   }
 
-  const delta = matchingSnap
-    ? (optType === 'CE' ? Math.abs(matchingSnap.ceDelta || 0.50) : Math.abs(matchingSnap.peDelta || 0.50))
-    : 0.50;
+  const lookupKey = getOptionTradeLookupKey(trade, tf);
+  const resolved = resolvedOptionMap[lookupKey] || resolvedOptionMap[trade.id];
+  if (resolved && resolved.optionDataSource !== 'UNAVAILABLE') {
+    return {
+      ...trade,
+      timeframeMin: tf,
+      optionStrike: resolved.optionStrike,
+      optionType: resolved.optionType,
+      optionExpiry: resolved.optionExpiry,
+      optionDelta: resolved.optionDelta,
+      optionEntryPremium: resolved.optionEntryPremium,
+      optionExitPremium: resolved.optionExitPremium,
+      premiumPnl: resolved.premiumPnl,
+      lotPnl: resolved.lotPnl,
+      optionDataSource: resolved.optionDataSource,
+    };
+  }
 
-  const baselineLtp = optType === 'CE' ? 89.94 : 87.95;
-  const entryPremium = matchingSnap
-    ? (optType === 'CE' ? (matchingSnap.ceLtp ?? baselineLtp) : (matchingSnap.peLtp ?? baselineLtp))
-    : Number((100.00 + (strike - trade.entryPrice) * (optType === 'CE' ? -0.5 : 0.5)).toFixed(2));
-
-  const spotPnl = trade.pnl !== undefined ? trade.pnl : 0;
-  const premiumPnl = trade.pnl !== undefined ? Number((spotPnl * delta).toFixed(2)) : undefined;
-  const exitPremium = (premiumPnl !== undefined) ? Number((entryPremium + premiumPnl).toFixed(2)) : undefined;
-  const lotPnl = (premiumPnl !== undefined) ? Number((premiumPnl * LOT_SIZE).toFixed(2)) : undefined;
-
+  // Never fabricate fake ₹100 / 0.50-delta premiums when real option data is unavailable
   return {
     ...trade,
-    optionStrike: strike,
-    optionType: optType,
-    optionDelta: delta,
-    optionEntryPremium: Number(entryPremium.toFixed(2)),
-    optionExitPremium: exitPremium,
-    premiumPnl,
-    lotPnl,
+    timeframeMin: tf,
+    optionStrike: fromSnapshots.optionStrike,
+    optionType: fromSnapshots.optionType,
+    optionExpiry: fromSnapshots.optionExpiry,
+    optionDelta: fromSnapshots.optionDelta,
+    optionEntryPremium: fromSnapshots.optionEntryPremium,
+    optionExitPremium: undefined,
+    premiumPnl: undefined,
+    lotPnl: undefined,
+    optionDataSource: 'UNAVAILABLE',
   };
 }
 
@@ -130,16 +183,21 @@ function isSessionEndBar(currTime: number, nextTime?: number): boolean {
   return false;
 }
 
-export function LiveChart({ livePrice, instrument }: { livePrice?: number; instrument: string; key?: React.Key }) {
+export function LiveChart({
+  livePrice,
+  instrument,
+  onTradeNotification,
+}: {
+  livePrice?: number;
+  instrument: string;
+  onTradeNotification?: (event: TradeNotificationEvent) => void;
+  key?: React.Key;
+}) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<any>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const dataRef = useRef<any[]>([]);
   const isDisposedRef = useRef<boolean>(false);
-  const t3Lev0Ref = useRef<ISeriesApi<"Line"> | null>(null);
-  const t3Lev5Ref = useRef<ISeriesApi<"Line"> | null>(null);
-  const alphaTrendRef = useRef<ISeriesApi<"Line"> | null>(null);
-  const alphaTrendTriggerRef = useRef<ISeriesApi<"Line"> | null>(null);
   const boxUpperRef = useRef<ISeriesApi<"Line"> | null>(null);
   const boxLowerRef = useRef<ISeriesApi<"Line"> | null>(null);
   const targetLineRef = useRef<ISeriesApi<"Line"> | null>(null);
@@ -152,20 +210,150 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
   const [showVolume, setShowVolume] = useState<boolean>(true);
   const [volumeMetrics, setVolumeMetrics] = useState<{ lastVol: number; volSma: number; rvol: number }>({ lastVol: 0, volSma: 0, rvol: 1.0 });
   const [backtestTrades, setBacktestTrades] = useState<Trade[]>([]);
-  const optionSnapshotsRef = useRef<any[]>([]);
+  const optionSnapshotsRef = useRef<CompactOptionSnapshot[]>([]);
+  const resolvedOptionMapRef = useRef<Record<string, ResolvedTradeOptionData>>({});
+  const inFlightOptionKeysRef = useRef<Set<string>>(new Set());
+  const attemptedOptionKeysRef = useRef<Set<string>>(new Set());
+  const activeResolveCountRef = useRef<number>(0);
+  const isMountedOptionRef = useRef<boolean>(true);
+  const [isResolvingOptionPremiums, setIsResolvingOptionPremiums] = useState<boolean>(false);
+  const [isBackfillingHistory, setIsBackfillingHistory] = useState<boolean>(false);
+
+  // Real-time trade notification tracking refs (seeded silently on initial load/config change)
+  const onTradeNotificationRef = useRef(onTradeNotification);
+  onTradeNotificationRef.current = onTradeNotification;
+  const lastAlertSignatureRef = useRef<string>('');
+  const seenTradeStatusRef = useRef<Map<string, string>>(new Map());
+  const seenPendingKeyRef = useRef<string>('');
+  const lastLiveAnalysisMsRef = useRef<number>(0);
+  const hasActiveLiveTradeOrSetupRef = useRef<boolean>(false);
 
   useEffect(() => {
-    let isMounted = true;
-    fetch('/api/option-chain/premium-lookup')
+    isMountedOptionRef.current = true;
+    return () => {
+      isMountedOptionRef.current = false;
+    };
+  }, []);
+
+  const refreshOptionSnapshots = () => {
+    return fetch('/api/option-chain/premium-lookup')
       .then(r => r.ok ? r.json() : null)
       .then(res => {
-        if (!isMounted || !res || !Array.isArray(res.snapshots)) return;
+        if (!isMountedOptionRef.current || !res || !Array.isArray(res.snapshots)) return;
         optionSnapshotsRef.current = res.snapshots;
-        setBacktestTrades(prev => prev.map(t => decorateTradeWithOptionData(t, res.snapshots)));
+        setBacktestTrades(prev =>
+          prev.map(t =>
+            decorateTradeWithOptionData(t, res.snapshots, resolvedOptionMapRef.current, t.timeframeMin || 1)
+          )
+        );
       })
       .catch(() => {});
-    return () => { isMounted = false; };
+  };
+
+  const handleBackfillHistoricalPremiums = async () => {
+    if (isBackfillingHistory) return;
+    setIsBackfillingHistory(true);
+    try {
+      const res = await fetch('/api/option-chain/backfill', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ maxDays: 15 }),
+      });
+      if (res.ok) {
+        attemptedOptionKeysRef.current.clear();
+        await refreshOptionSnapshots();
+      }
+    } catch (_) {
+      // Ignore network errors cleanly
+    } finally {
+      if (isMountedOptionRef.current) setIsBackfillingHistory(false);
+    }
+  };
+
+  // Load recorded Option Chain History snapshots on mount and refresh every 60s during live sessions
+  useEffect(() => {
+    refreshOptionSnapshots();
+    const interval = setInterval(refreshOptionSnapshots, 60_000);
+    return () => {
+      clearInterval(interval);
+    };
   }, []);
+
+  // Resolve real Upstox 1-min option candle prices for trades outside recorded Option Chain History
+  // IMPORTANT: Never cancel in-flight fetch just because backtestTrades re-rendered on a live tick
+  useEffect(() => {
+    const pendingTrades: Array<{ key: string; trade: Trade }> = [];
+
+    for (const t of backtestTrades) {
+      if (t.optionDataSource === 'OPTION_CHAIN_HISTORY' || t.optionDataSource === 'UPSTOX_OPTION_CANDLE') {
+        continue;
+      }
+      const key = getOptionTradeLookupKey(t, t.timeframeMin || 1);
+      if (inFlightOptionKeysRef.current.has(key) || attemptedOptionKeysRef.current.has(key)) continue;
+      pendingTrades.push({ key, trade: t });
+    }
+
+    if (pendingTrades.length === 0) return;
+
+    const batch = pendingTrades.slice(0, 500);
+    for (const item of batch) {
+      inFlightOptionKeysRef.current.add(item.key);
+      attemptedOptionKeysRef.current.add(item.key);
+    }
+
+    activeResolveCountRef.current += 1;
+    setIsResolvingOptionPremiums(true);
+
+    const payload = batch.map(({ key, trade }) => ({
+      id: key,
+      type: trade.type,
+      entryTime: trade.entryTime,
+      entryPrice: trade.entryPrice,
+      exitTime: trade.exitTime,
+      exitPrice: trade.exitPrice,
+      exitReason: trade.exitReason,
+      status: trade.status,
+      pnl: trade.pnl,
+      timeframeMin: trade.timeframeMin || 1,
+      exitSpotBar: trade.exitSpotBar,
+    }));
+
+    fetch('/api/option-chain/resolve-trades', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trades: payload, timeframeMin: batch[0]?.trade.timeframeMin || 1 }),
+    })
+      .then(r => r.ok ? r.json() : null)
+      .then(res => {
+        if (!isMountedOptionRef.current) return;
+        if (res && res.resolved && typeof res.resolved === 'object') {
+          Object.assign(resolvedOptionMapRef.current, res.resolved);
+          setBacktestTrades(prev =>
+            prev.map(t =>
+              decorateTradeWithOptionData(t, optionSnapshotsRef.current, resolvedOptionMapRef.current, t.timeframeMin || 1)
+            )
+          );
+        } else {
+          for (const item of batch) {
+            attemptedOptionKeysRef.current.delete(item.key);
+          }
+        }
+      })
+      .catch(() => {
+        for (const item of batch) {
+          attemptedOptionKeysRef.current.delete(item.key);
+        }
+      })
+      .finally(() => {
+        for (const item of batch) {
+          inFlightOptionKeysRef.current.delete(item.key);
+        }
+        activeResolveCountRef.current = Math.max(0, activeResolveCountRef.current - 1);
+        if (isMountedOptionRef.current && activeResolveCountRef.current === 0) {
+          setIsResolvingOptionPremiums(false);
+        }
+      });
+  }, [backtestTrades]);
 
   const [pendingSamSetup, setPendingSamSetup] = useState<{
     type: 'CALL' | 'PUT';
@@ -208,94 +396,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
   }, []);
 
   const [strategies, setStrategies] = useState({
-    t3Striped: true,
-    alphaTrend: true,
-    adxBreakout: false,
-    comboUnfiltered: false,
-    comboFiltered: true,
     macdAdaptiveSupertrend: false,
     samSignals: true,
-  });
-
-  // COMBINATION STRATEGY (T3 Striped + AlphaTrend): Filtered & Unfiltered
-  // Special Conditions: One trade at a time & Maximum Time for each trade (30m, 1h, 2h)
-  const [comboConfig, setComboConfig] = useState<{
-    maxTradeDurationMinutes: 30 | 60 | 120;
-    oneTradeAtATime: boolean;
-    slMultiple: number;
-    tp1Multiple: number;
-    tp2Multiple: number;
-  }>(() => {
-    try {
-      const saved = localStorage.getItem(`quant_combo_config_${instrument}`);
-      if (saved) return JSON.parse(saved);
-    } catch (_) {}
-    return {
-      maxTradeDurationMinutes: 60, // 30 mins, 1 hour (60), 2 hours (120)
-      oneTradeAtATime: true,
-      slMultiple: 1.2,
-      tp1Multiple: 1.5,
-      tp2Multiple: 2.5,
-    };
-  });
-
-  // NIFTY-CALIBRATED STRATEGY PARAMETERS
-  // AlphaTrend: KivancOzbilgic PineScript (Uses MFI with Upstox Volume by default; Coeff 1.6; Period 18; Dual TP)
-  const [alphaTrendConfig, setAlphaTrendConfig] = useState<{
-    period: number;
-    coeff: number;
-    useRsi: boolean;
-    candleConfirm: boolean;
-    volumeConfirm: boolean;
-    slMultiple: number;
-    tp1Multiple: number;
-    tp2Multiple: number;
-  }>(() => {
-    try {
-      const saved = localStorage.getItem(`quant_alphatrend_config_${instrument}`);
-      if (saved) return JSON.parse(saved);
-    } catch (_) {}
-    return {
-      period: 18,
-      coeff: 1.6,
-      useRsi: false, // Default to FALSE to utilize real Upstox Volume via MFI!
-      candleConfirm: true,
-      volumeConfirm: true,
-      slMultiple: 1.2,
-      tp1Multiple: 1.6,
-      tp2Multiple: 2.5,
-    };
-  });
-
-  // T3 Striped [Loxx]: Optimized with Volume confirmation and smoothing
-  const [t3Config, setT3Config] = useState<{
-    period: number;
-    hot: number;
-    type: 'T3 New' | 'T3 Original';
-    minRibbonExpansion: number;
-    candleConfirm: boolean;
-    volumeConfirm: boolean;
-    volumeWeighted: boolean;
-    slMultiple: number;
-    tp1Multiple: number;
-    tp2Multiple: number;
-  }>(() => {
-    try {
-      const saved = localStorage.getItem(`quant_t3_config_${instrument}`);
-      if (saved) return JSON.parse(saved);
-    } catch (_) {}
-    return {
-      period: 21,
-      hot: 0.55,
-      type: 'T3 New',
-      minRibbonExpansion: 0.12,
-      candleConfirm: true,
-      volumeConfirm: true,
-      volumeWeighted: false,
-      slMultiple: 1.1,
-      tp1Multiple: 1.4,
-      tp2Multiple: 2.2,
-    };
   });
 
   // BEST SAM SIGNALS Strategy (Pine Script by dy26102001)
@@ -324,6 +426,25 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
           mtfEmaRequireSlope: parsed.mtfEmaRequireSlope ?? false,
           filterDayTrapEnabled: parsed.filterDayTrapEnabled ?? false,
           dayTrapBufferPoints: parsed.dayTrapBufferPoints ?? 10,
+          adaptiveRegimeEnabled: parsed.adaptiveRegimeEnabled ?? true,
+          adaptiveTrendDistancePoints: parsed.adaptiveTrendDistancePoints ?? 20,
+          adaptiveClimaxBandPoints: parsed.adaptiveClimaxBandPoints ?? 50,
+          adaptiveAllowReversionBounce: parsed.adaptiveAllowReversionBounce ?? true,
+          circuitBreakerEnabled: parsed.circuitBreakerEnabled ?? true,
+          circuitBreakerConsecutiveLosses: parsed.circuitBreakerConsecutiveLosses ?? 3,
+          circuitBreakerCooldownMinutes: parsed.circuitBreakerCooldownMinutes ?? 20,
+          antiWhipsawEnabled: parsed.antiWhipsawEnabled ?? false,
+          antiWhipsawMinutes: parsed.antiWhipsawMinutes ?? 10,
+          maxDailyLossEnabled: parsed.maxDailyLossEnabled ?? false,
+          maxDailyLossPoints: parsed.maxDailyLossPoints ?? 75,
+          filterS12ConfluenceEnabled: parsed.filterS12ConfluenceEnabled ?? false,
+          s12DiSpreadMin: parsed.s12DiSpreadMin ?? 5,
+          s12EmaFastPeriod: parsed.s12EmaFastPeriod ?? 100,
+          s12EmaSlowPeriod: parsed.s12EmaSlowPeriod ?? 200,
+          s12MinRvol: parsed.s12MinRvol ?? 0.7,
+          filterSam21AfternoonEnabled: parsed.filterSam21AfternoonEnabled ?? false,
+          sam21AfternoonExitMode: parsed.sam21AfternoonExitMode === 'chandelier' ? 'chandelier' : 'fixed40',
+          filterSam21CombinedEnabled: parsed.filterSam21CombinedEnabled ?? false,
         };
       }
     } catch (_) {}
@@ -344,185 +465,70 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       mtfEmaRequireSlope: false,
       filterDayTrapEnabled: false,
       dayTrapBufferPoints: 10,
+      adaptiveRegimeEnabled: true,
+      adaptiveTrendDistancePoints: 20,
+      adaptiveClimaxBandPoints: 50,
+      adaptiveAllowReversionBounce: true,
+      circuitBreakerEnabled: true,
+      circuitBreakerConsecutiveLosses: 3,
+      circuitBreakerCooldownMinutes: 20,
+      antiWhipsawEnabled: false,
+      antiWhipsawMinutes: 10,
+      maxDailyLossEnabled: false,
+      maxDailyLossPoints: 75,
+      filterS12ConfluenceEnabled: false,
+      s12DiSpreadMin: 5,
+      s12EmaFastPeriod: 100,
+      s12EmaSlowPeriod: 200,
+      s12MinRvol: 0.7,
+      filterSam21AfternoonEnabled: false,
+      sam21AfternoonExitMode: 'fixed40',
+      filterSam21CombinedEnabled: false,
     };
   });
 
-  const [showStrategySettingsModal, setShowStrategySettingsModal] = useState<null | 'ALPHATREND' | 'T3' | 'COMBO' | 'SAM'>(null);
-
-  const [adxBreakoutConfig, setAdxBreakoutConfig] = useState<{
-    adxSmoothPeriod: number;
-    adxPeriod: number;
-    adxLowerLevel: number;
-    profitTargetMultiple: number;
-    profitTarget2Multiple: number;
-    stopLossMultiple: number;
-    boxLookBack: number;
-    enableDirection: number; // 0 = Both, 1 = Long, -1 = Short
-    entryMode: 'BREAKOUT' | 'RETEST' | 'ADAPTIVE';
-  }>({
-    adxSmoothPeriod: 14,
-    adxPeriod: 14,
-    adxLowerLevel: 18,
-    profitTargetMultiple: 1.0,
-    profitTarget2Multiple: 1.85,
-    stopLossMultiple: 0.5,
-    boxLookBack: 20,
-    enableDirection: 0,
-    entryMode: 'BREAKOUT'
-  });
-
-  const [entryMode, setEntryMode] = useState<'BREAKOUT' | 'RETEST' | 'ADAPTIVE'>('BREAKOUT');
-
-  const [showRetestModal, setShowRetestModal] = useState(false);
-  const [retestComparison, setRetestComparison] = useState<{
-    breakoutWins: number;
-    breakoutLosses: number;
-    breakoutTotal: number;
-    breakoutWinRate: number;
-    breakoutNetPnL: number;
-    breakoutAvgRR: number;
-    retestWins: number;
-    retestLosses: number;
-    retestTotal: number;
-    retestWinRate: number;
-    retestNetPnL: number;
-    retestAvgRR: number;
-    falseBreakoutsSaved: number;
-    missedRunaways: number;
-  }>({
-    breakoutWins: 0,
-    breakoutLosses: 0,
-    breakoutTotal: 0,
-    breakoutWinRate: 0,
-    breakoutNetPnL: 0,
-    breakoutAvgRR: 1.1,
-    retestWins: 0,
-    retestLosses: 0,
-    retestTotal: 0,
-    retestWinRate: 0,
-    retestNetPnL: 0,
-    retestAvgRR: 2.3,
-    falseBreakoutsSaved: 0,
-    missedRunaways: 0
-  });
-
-  const DEFAULT_FILTER_SETTINGS = {
-    strictStoploss: true,    // Capped R:R (Max risk <= 0.85x Target & <= 1.2x ATR) prevents single outsized losses
-    breakevenTrail: true,    // Dynamic Breakeven: Lock SL to Entry once price moves >= 50% toward target
-    exhaustionFilter: true,  // Eliminates false breakout climax/exhaustion candles (Range > 2.2x ATR)
-    rsiMomentum: true,       // Momentum sweet-spot (48-72 for Longs, 28-52 for Shorts, avoids overextended traps)
-    trendAlignment: true,    // 50 EMA trend alignment
-    bodyConviction: true,    // Strong candle body (>= 35% of range, opposite rejection wick <= 35%)
-    volumeConfirm: true,     // Volume confirmation (RVOL > 1.0)
-    minBoxWidthAtr: true,    // Box width >= 0.35x ATR (avoids micro-range chop whipsaws)
-    openingRangeBuffer: true, // Avoids opening market whipsaws (before 09:25 IST for Nifty)
-  };
-
-  // Quality & False-Signal Filter Engine
-  // 'SMART': Price action conviction + volume confirmation + EMA trend alignment (high winrate)
-  // 'RAW': Pure breakout without ADX filter (all raw signals)
-  // 'BOOKER_ADX': Rob Booker classic ADX < threshold
-  // 'MOMENTUM_ADX': ADX >= 20 with DI directional momentum
-  const [filterMode, setFilterMode] = useState<'SMART' | 'RAW' | 'BOOKER_ADX' | 'MOMENTUM_ADX'>(() => {
-    try {
-      const saved = localStorage.getItem(`quant_filter_mode_${instrument}`) || localStorage.getItem('quant_filter_mode');
-      if (saved && ['SMART', 'RAW', 'BOOKER_ADX', 'MOMENTUM_ADX'].includes(saved)) {
-        return saved as any;
-      }
-    } catch (_) {}
-    return 'SMART';
-  });
-
-  const [filterSettings, setFilterSettings] = useState(() => {
-    try {
-      const saved = localStorage.getItem(`quant_filter_settings_${instrument}`) || localStorage.getItem('quant_filter_settings');
-      if (saved) {
-        return { ...DEFAULT_FILTER_SETTINGS, ...JSON.parse(saved) };
-      }
-    } catch (_) {}
-    return DEFAULT_FILTER_SETTINGS;
-  });
+  const [showStrategySettingsModal, setShowStrategySettingsModal] = useState<null | 'SAM'>(null);
 
   const [comparisonStats, setComparisonStats] = useState({
-    rawTotal: 0,
-    rawWins: 0,
-    rawLosses: 0,
-    rawWinRate: '0.0',
-    rawNetPnL: 0,
     filteredCount: 0,
-    exhaustionFiltered: 0,
-    rsiFiltered: 0,
     wickFiltered: 0,
     bar1Filtered: 0,
     vwapFiltered: 0,
     minBodyFiltered: 0,
     mtfEmaFiltered: 0,
     dayTrapFiltered: 0,
-    volumeFiltered: 0,
-    trendFiltered: 0,
-    boxFiltered: 0,
-    adxFiltered: 0,
-    openingFiltered: 0,
+    adaptiveRegimeFiltered: 0,
+    circuitBreakerFiltered: 0,
+    antiWhipsawFiltered: 0,
+    s12Filtered: 0,
+    sam21AfternoonSignals: 0,
+    sam21OpenDriveSignals: 0,
+    dailyDrawdownHalted: false,
+    currentRegimeState: 'RANGE' as 'TREND_BULL' | 'TREND_BEAR' | 'RANGE',
+    circuitBreakerActive: false,
     beSavedCount: 0,
-    profitTradesFiltered: 0,
-    lossTradesFiltered: 0,
   });
-
-  const [adxChopFilter, setAdxChopFilter] = useState(() => {
-    try {
-      const saved = localStorage.getItem('quant_adx_chop_filter');
-      if (saved) {
-        return JSON.parse(saved);
-      }
-    } catch (_) {}
-    return {
-      enabled: true,
-      threshold: 20,
-      mode: 'SMART' as 'SMART' | 'CLASSIC' // SMART: Directional Breakout Protected (0 profit trades lost); CLASSIC: Naive ADX < threshold
-    };
-  });
-  const [currentAdx, setCurrentAdx] = useState<{ value: number; isChoppy: boolean; isIgnition?: boolean } | null>(null);
-  const [filteredCount, setFilteredCount] = useState<number>(0);
 
   // Synchronous references so background intervals and async feeds never revert to stale closure defaults
   const strategiesRef = useRef(strategies);
   strategiesRef.current = strategies;
 
-  const adxChopFilterRef = useRef(adxChopFilter);
-  adxChopFilterRef.current = adxChopFilter;
-
-  const adxBreakoutConfigRef = useRef(adxBreakoutConfig);
-  adxBreakoutConfigRef.current = adxBreakoutConfig;
-
-  const filterModeRef = useRef(filterMode);
-  filterModeRef.current = filterMode;
-
-  const filterSettingsRef = useRef(filterSettings);
-  filterSettingsRef.current = filterSettings;
-
-  const alphaTrendConfigRef = useRef(alphaTrendConfig);
-  alphaTrendConfigRef.current = alphaTrendConfig;
-
-  const t3ConfigRef = useRef(t3Config);
-  t3ConfigRef.current = t3Config;
-
-  const comboConfigRef = useRef(comboConfig);
-  comboConfigRef.current = comboConfig;
-
   const samConfigRef = useRef(samConfig);
   samConfigRef.current = samConfig;
 
-  // Persist user modifications so state never flips back
-  useEffect(() => {
-    try {
-      localStorage.setItem(`quant_combo_config_${instrument}`, JSON.stringify(comboConfig));
-    } catch (_) {}
-  }, [comboConfig, instrument]);
-
+  // Persist user modifications so state never flips back, and sync to server live SAM watcher
   useEffect(() => {
     try {
       localStorage.setItem(`quant_sam_config_${instrument}`, JSON.stringify(samConfig));
     } catch (_) {}
+    const syncTimer = setTimeout(() => {
+      fetch('/api/sam-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(samConfig),
+      }).catch(() => {});
+    }, 500);
+    return () => clearTimeout(syncTimer);
   }, [samConfig, instrument]);
 
   useEffect(() => {
@@ -531,59 +537,14 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     } catch (_) {}
   }, [strategies, instrument]);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(`quant_alphatrend_config_${instrument}`, JSON.stringify(alphaTrendConfig));
-    } catch (_) {}
-  }, [alphaTrendConfig, instrument]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(`quant_t3_config_${instrument}`, JSON.stringify(t3Config));
-    } catch (_) {}
-  }, [t3Config, instrument]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(`quant_filter_settings_${instrument}`, JSON.stringify(filterSettings));
-    } catch (_) {}
-  }, [filterSettings, instrument]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(`quant_filter_mode_${instrument}`, filterMode);
-    } catch (_) {}
-  }, [filterMode, instrument]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(`quant_adx_chop_filter_${instrument}`, JSON.stringify(adxChopFilter));
-    } catch (_) {}
-  }, [adxChopFilter, instrument]);
-
-  const updateFilterSetting = (key: keyof typeof DEFAULT_FILTER_SETTINGS, val: boolean) => {
-    const next = { ...filterSettingsRef.current, [key]: val };
-    filterSettingsRef.current = next;
-    setFilterSettings(next);
-    try {
-      localStorage.setItem(`quant_filter_settings_${instrument}`, JSON.stringify(next));
-    } catch (_) {}
-  };
-
   const handleResetFilters = () => {
-    setFilterSettings(DEFAULT_FILTER_SETTINGS);
-    filterSettingsRef.current = DEFAULT_FILTER_SETTINGS;
-    setFilterMode('SMART');
-    filterModeRef.current = 'SMART';
-    setAdxChopFilter({ enabled: true, threshold: 20, mode: 'SMART' });
-    adxChopFilterRef.current = { enabled: true, threshold: 20, mode: 'SMART' };
+    const resetSam = { ...DEFAULT_SAM_CONFIG };
+    setSamConfig(resetSam);
+    samConfigRef.current = resetSam;
     try {
-      localStorage.removeItem(`quant_filter_settings_${instrument}`);
-      localStorage.removeItem(`quant_filter_mode_${instrument}`);
-      localStorage.removeItem(`quant_adx_chop_filter_${instrument}`);
+      localStorage.removeItem(`quant_sam_config_${instrument}`);
     } catch (_) {}
   };
-
 
   useEffect(() => {
     if (!isDisposedRef.current && dataRef.current && dataRef.current.length > 0 && seriesRef.current && chartRef.current) {
@@ -592,20 +553,13 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
           dataRef.current,
           seriesRef.current,
           strategies,
-          adxChopFilter,
-          adxBreakoutConfig,
-          filterMode,
-          filterSettings,
-          alphaTrendConfig,
-          t3Config,
-          comboConfig,
           samConfig
         );
       } catch (e: any) {
         if (e?.message?.includes('disposed')) return;
       }
     }
-  }, [strategies, adxChopFilter, adxBreakoutConfig, filterMode, filterSettings, alphaTrendConfig, t3Config, comboConfig, samConfig]);
+  }, [strategies, samConfig]);
 
   useEffect(() => {
     if (!chartContainerRef.current) return;
@@ -690,10 +644,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     });
     volumeSeriesRef.current = volumeSeries;
 
-    t3Lev0Ref.current = chart.addLineSeries({ color: '#2DD204', lineWidth: 2, title: 'T3 Lev0' });
-    t3Lev5Ref.current = chart.addLineSeries({ color: '#D2042D', lineWidth: 2, title: 'T3 Lev5' });
-    alphaTrendRef.current = chart.addLineSeries({ color: '#0022fc', lineWidth: 3, title: 'AlphaTrend' });
-    alphaTrendTriggerRef.current = chart.addLineSeries({ color: '#fc0400', lineWidth: 3, title: 'Trigger' });
     boxUpperRef.current = chart.addLineSeries({ color: '#f59e0b', lineWidth: 2, lineStyle: LineStyle.Dashed, title: 'Box Upper' });
     boxLowerRef.current = chart.addLineSeries({ color: '#ec4899', lineWidth: 2, lineStyle: LineStyle.Dashed, title: 'Box Lower' });
     targetLineRef.current = chart.addLineSeries({ color: '#10b981', lineWidth: 2, lineStyle: LineStyle.Solid, title: 'Target 1' });
@@ -766,14 +716,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
             applyPriceActionAnalysis(
               unique, 
               candlestickSeries, 
-              strategiesRef.current, 
-              adxChopFilterRef.current,
-              adxBreakoutConfigRef.current,
-              filterModeRef.current,
-              filterSettingsRef.current,
-              alphaTrendConfigRef.current,
-              t3ConfigRef.current,
-              comboConfigRef.current,
+              strategiesRef.current,
               samConfigRef.current
             );
           } catch (err: any) {
@@ -832,10 +775,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       const currentChart = chartRef.current;
       chartRef.current = null;
       seriesRef.current = null;
-      t3Lev0Ref.current = null;
-      t3Lev5Ref.current = null;
-      alphaTrendRef.current = null;
-      alphaTrendTriggerRef.current = null;
       boxUpperRef.current = null;
       boxLowerRef.current = null;
       targetLineRef.current = null;
@@ -889,8 +828,9 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         const boundaryTime = (Math.floor(boundary / 1000) + 19800);
         
         let lastBar = data[data.length - 1] as any;
+        const isNewCandle = boundaryTime > lastBar.time;
         let newBar;
-        if (lastBar.time === boundaryTime || boundaryTime <= lastBar.time) {
+        if (!isNewCandle) {
            newBar = {
              ...lastBar,
              close: livePrice,
@@ -919,6 +859,24 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
             value: newBar.volume || 1,
             color: newBar.close >= newBar.open ? 'rgba(38, 166, 154, 0.45)' : 'rgba(239, 83, 80, 0.45)',
           });
+        }
+
+        // Zero-lag real-time signal evaluation:
+        // 1) Immediately re-evaluate when a candle closes (new candle opens)
+        // 2) Re-evaluate intra-bar every ~1.5s when an active trade or pending setup exists
+        const nowEvalMs = Date.now();
+        if (
+          !isDisposedRef.current &&
+          seriesRef.current &&
+          (isNewCandle || (hasActiveLiveTradeOrSetupRef.current && nowEvalMs - lastLiveAnalysisMsRef.current >= 1500))
+        ) {
+          lastLiveAnalysisMsRef.current = nowEvalMs;
+          applyPriceActionAnalysis(
+            data,
+            seriesRef.current,
+            strategiesRef.current,
+            samConfigRef.current
+          );
         }
       }
     } catch (e: any) {
@@ -953,13 +911,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     candles: any[], 
     series: ISeriesApi<"Candlestick">, 
     activeStrategies = strategiesRef.current,
-    chopFilter = adxChopFilterRef.current,
-    breakoutConfig = adxBreakoutConfigRef.current,
-    activeFilterMode = filterModeRef.current,
-    activeFilterSettings = filterSettingsRef.current,
-    activeAlphaTrendConfig = alphaTrendConfigRef.current,
-    activeT3Config = t3ConfigRef.current,
-    activeComboConfig = comboConfigRef.current,
     activeSamConfig = samConfigRef.current
   ) => {
     if (isDisposedRef.current || !chartRef.current || !seriesRef.current) return;
@@ -1001,73 +952,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
 
     const atr14 = computeATR(highPrices, lowPrices, closePrices, 14);
 
-    // T3 series source: can use Volume-Weighted Typical Price (VWTP) if volumeWeighted is on
-    const t3Source = activeT3Config.volumeWeighted
-      ? candles.map((c, idx) => {
-          const vSma = volSma20[idx] || 1;
-          const volRatio = Math.min(2.5, Math.max(0.4, (c.volume || 1) / vSma));
-          const hlc3 = (c.high + c.low + c.close) / 3;
-          return hlc3 * volRatio + c.close * (1 - volRatio * 0.5);
-        })
-      : closePrices;
-
-    const t3 = computeT3(t3Source, activeT3Config.period, activeT3Config.hot, activeT3Config.type);
-    const alpha = computeAlphaTrend(
-      highPrices, 
-      lowPrices, 
-      closePrices, 
-      volumes, 
-      activeAlphaTrendConfig.period, 
-      activeAlphaTrendConfig.coeff, 
-      activeAlphaTrendConfig.useRsi
-    );
-    const adxData = computeADX(highPrices, lowPrices, closePrices, 14);
-    const ema50 = computeEMA(closePrices, 50);
-    const ema200 = computeEMA(closePrices, 200);
-    const rsi14 = computeRSI(closePrices, 14);
-    const mfi14 = computeMFI(highPrices, lowPrices, closePrices, volumes, 14);
-    
-    // PDF Strategies (NIFTY MACD + ML Adaptive SuperTrend: BEFORE & AFTER)
-    const mlST = computeKMeansAdaptiveSuperTrend(highPrices, lowPrices, closePrices, 10, 3.0, 100, 0.75, 0.50, 0.25);
-    const cmMACD = computeCMMACD(closePrices);
-    
-    const validAdx = adxData.adx.filter(v => !isNaN(v));
-    if (validAdx.length > 0) {
-      const latest = validAdx[validAdx.length - 1];
-      const pDi = adxData.plusDI[adxData.plusDI.length - 1] || 0;
-      const mDi = adxData.minusDI[adxData.minusDI.length - 1] || 0;
-      const diSpread = Math.abs(pDi - mDi);
-      const isIgnition = latest < chopFilter.threshold && diSpread >= 4.0;
-      const isChoppy = chopFilter.mode === 'CLASSIC'
-        ? latest < chopFilter.threshold
-        : (latest < chopFilter.threshold && diSpread < 4.0);
-
-      setCurrentAdx({
-        value: Number(latest.toFixed(1)),
-        isChoppy,
-        isIgnition
-      });
-    }
-
     try {
-      if (!isDisposedRef.current && t3Lev0Ref.current) {
-        t3Lev0Ref.current.setData(mapSeriesData(t3.lev0));
-        t3Lev0Ref.current.applyOptions({ visible: activeStrategies.t3Striped });
-      }
-      if (!isDisposedRef.current && t3Lev5Ref.current) {
-        t3Lev5Ref.current.setData(mapSeriesData(t3.lev5));
-        t3Lev5Ref.current.applyOptions({ visible: activeStrategies.t3Striped });
-      }
-      
-      if (!isDisposedRef.current && alphaTrendRef.current) {
-        alphaTrendRef.current.setData(mapSeriesData(alpha.alphaTrend));
-        alphaTrendRef.current.applyOptions({ visible: activeStrategies.alphaTrend });
-      }
-      if (!isDisposedRef.current && alphaTrendTriggerRef.current) {
-        alphaTrendTriggerRef.current.setData(mapSeriesData(alpha.trigger));
-        alphaTrendTriggerRef.current.applyOptions({ visible: activeStrategies.alphaTrend });
-      }
-      
       if (!isDisposedRef.current && vwapLineRef.current) {
         if (samSignalsResult?.vwapValues && (activeStrategies.samSignals || activeSamConfig?.vwapFilterEnabled)) {
           vwapLineRef.current.setData(mapSeriesData(samSignalsResult.vwapValues));
@@ -1088,125 +973,74 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     }
 
     // -------------------------------------------------------------------------
-    // 1. Raw Baseline Shadow Simulation (No filters) for Comparative Analytics
-    // -------------------------------------------------------------------------
-    const shadowRawTrades: Trade[] = [];
-    const shadowOpenTrades: Trade[] = [];
-    for (let i = 50; i < candles.length; i++) {
-      const c = candles[i];
-      const nextC = candles[i + 1];
-      const isDayEnd = isSessionEndBar(c.time as number, nextC?.time as number);
-      const shadowDate = new Date((c.time as number) * 1000);
-      const isShadowPreMarket = (shadowDate.getUTCHours() * 60 + shadowDate.getUTCMinutes()) < (9 * 60 + 15);
-      const a = atr14[i] || Math.max(c.high - c.low, 1);
-
-      for (let j = shadowOpenTrades.length - 1; j >= 0; j--) {
-        const st = shadowOpenTrades[j];
-        if (st.type === 'LONG') {
-          if (c.low <= st.stoploss) {
-            st.exitPrice = st.stoploss;
-            st.status = 'LOSS';
-            st.pnl = st.exitPrice - st.entryPrice;
-            shadowOpenTrades.splice(j, 1);
-          } else if (c.high >= st.target) {
-            st.exitPrice = st.target;
-            st.status = 'WIN';
-            st.pnl = st.exitPrice - st.entryPrice;
-            shadowOpenTrades.splice(j, 1);
-          } else if (isDayEnd) {
-            st.exitPrice = c.close;
-            st.status = (c.close - st.entryPrice) >= 0 ? 'WIN' : 'LOSS';
-            st.pnl = c.close - st.entryPrice;
-            shadowOpenTrades.splice(j, 1);
-          }
-        } else {
-          if (c.high >= st.stoploss) {
-            st.exitPrice = st.stoploss;
-            st.status = 'LOSS';
-            st.pnl = st.entryPrice - st.exitPrice;
-            shadowOpenTrades.splice(j, 1);
-          } else if (c.low <= st.target) {
-            st.exitPrice = st.target;
-            st.status = 'WIN';
-            st.pnl = st.entryPrice - st.exitPrice;
-            shadowOpenTrades.splice(j, 1);
-          } else if (isDayEnd) {
-            st.exitPrice = c.close;
-            st.status = (st.entryPrice - c.close) >= 0 ? 'WIN' : 'LOSS';
-            st.pnl = st.entryPrice - c.close;
-            shadowOpenTrades.splice(j, 1);
-          }
-        }
-      }
-
-      const openShadowTrade = (type: 'LONG'|'SHORT', sig: string, sl: number, tp: number) => {
-        if (isDayEnd || isShadowPreMarket) return;
-        if (shadowOpenTrades.some(t => t.signal === sig)) return;
-        const entry = c.close;
-        const nt: Trade = {
-          id: `shadow-${c.time}-${sig}`,
-          type,
-          signal: sig,
-          entryTime: c.time as number,
-          entryPrice: entry,
-          stoploss: type === 'LONG' ? entry - sl : entry + sl,
-          target: type === 'LONG' ? entry + tp : entry - tp,
-          status: 'OPEN'
-        };
-        shadowOpenTrades.push(nt);
-        shadowRawTrades.push(nt);
-      };
-
-      if (activeStrategies.t3Striped) {
-        const currVolSma = volSma20[i];
-        const t3VolOk = !activeT3Config.volumeConfirm || !currVolSma || (c.volume >= currVolSma * 0.85);
-        if (t3.lev0[i-1] <= t3.lev5[i-1] && t3.lev0[i] > t3.lev5[i] && t3VolOk) {
-          openShadowTrade('LONG', 'T3L', a * activeT3Config.slMultiple, a * activeT3Config.tp1Multiple);
-        }
-        if (t3.lev0[i-1] >= t3.lev5[i-1] && t3.lev0[i] < t3.lev5[i] && t3VolOk) {
-          openShadowTrade('SHORT', 'T3S', a * activeT3Config.slMultiple, a * activeT3Config.tp1Multiple);
-        }
-      }
-      if (activeStrategies.alphaTrend) {
-        const currVolSma = volSma20[i];
-        const alphaVolOk = !activeAlphaTrendConfig.volumeConfirm || !currVolSma || (c.volume >= currVolSma * 0.85);
-        if (alpha.buySignal[i] && alphaVolOk) {
-          openShadowTrade('LONG', 'AlphaB', a * activeAlphaTrendConfig.slMultiple, a * activeAlphaTrendConfig.tp1Multiple);
-        }
-        if (alpha.sellSignal[i] && alphaVolOk) {
-          openShadowTrade('SHORT', 'AlphaS', a * activeAlphaTrendConfig.slMultiple, a * activeAlphaTrendConfig.tp1Multiple);
-        }
-      }
-    }
-    const rawWins = shadowRawTrades.filter(t => t.status === 'WIN').length;
-    const rawLosses = shadowRawTrades.filter(t => t.status === 'LOSS').length;
-    const rawTotal = rawWins + rawLosses;
-    const rawWinRate = rawTotal > 0 ? ((rawWins / rawTotal) * 100).toFixed(1) : '0.0';
-    const rawNetPnL = shadowRawTrades.reduce((acc, t) => acc + (t.pnl || 0), 0);
-
-    // -------------------------------------------------------------------------
-    // 2. Active Execution Loop with Smart Filter Suite
+    // Active Execution Loop (SAM Signals & MACD Adaptive SuperTrend)
     // -------------------------------------------------------------------------
     const openTrades: Trade[] = [];
-    let suppressedTrades = 0;
-    let chopFiltered = 0;
-    let trendFiltered = 0;
-    let openingFiltered = 0;
-    let wickFiltered = 0;
-    let vwapFiltered = 0;
-    let exhaustionFiltered = 0;
-    let rsiFiltered = 0;
-    let volumeFiltered = 0;
     let beSavedCount = 0;
-    let profitTradesFiltered = 0;
-    let lossTradesFiltered = 0;
 
     let pendingSamSignal: { type: 'LONG' | 'SHORT'; signalBarIdx: number; signalTime: number } | null = null;
+
+    // Adaptive Regime, Directional Circuit Breaker & Daily Drawdown State Trackers
+    let consecutiveLongLosses = 0;
+    let consecutiveShortLosses = 0;
+    let longCooldownUntil = 0;
+    let shortCooldownUntil = 0;
+    let cbFilteredCount = 0;
+    let lastLossTime = 0;
+    let lastLossType: 'LONG' | 'SHORT' | null = null;
+    let antiWhipFilteredCount = 0;
+    let dailyAccumulatedPnl = 0;
+    let dailyDrawdownHalted = false;
+    let currentSessionDateKey = '';
+
+    const onSamTradeClosed = (t: Trade, barTime: number) => {
+      if (t.strategyFamily !== 'SAM_SIGNALS') return;
+      dailyAccumulatedPnl += (t.pnl || 0);
+
+      if (t.status === 'LOSS') {
+        lastLossTime = barTime;
+        lastLossType = t.type;
+        if (t.type === 'LONG') {
+          consecutiveLongLosses++;
+          consecutiveShortLosses = 0;
+          if (activeSamConfig?.circuitBreakerEnabled && consecutiveLongLosses >= (activeSamConfig?.circuitBreakerConsecutiveLosses ?? 3)) {
+            longCooldownUntil = barTime + ((activeSamConfig?.circuitBreakerCooldownMinutes ?? 20) * 60);
+          }
+        } else {
+          consecutiveShortLosses++;
+          consecutiveLongLosses = 0;
+          if (activeSamConfig?.circuitBreakerEnabled && consecutiveShortLosses >= (activeSamConfig?.circuitBreakerConsecutiveLosses ?? 3)) {
+            shortCooldownUntil = barTime + ((activeSamConfig?.circuitBreakerCooldownMinutes ?? 20) * 60);
+          }
+        }
+      } else if (t.status === 'WIN') {
+        if (t.type === 'LONG') consecutiveLongLosses = 0;
+        else consecutiveShortLosses = 0;
+      }
+
+      if (activeSamConfig?.maxDailyLossEnabled && dailyAccumulatedPnl <= -(activeSamConfig?.maxDailyLossPoints ?? 75)) {
+        dailyDrawdownHalted = true;
+      }
+    };
 
     for (let i = 50; i < candles.length; i++) {
        const curr = candles[i];
        const nextCandle = candles[i + 1];
        const isDayEnd = isSessionEndBar(curr.time as number, nextCandle?.time as number);
+
+       // Reset daily metrics at the start of a new trading session
+       const sessionDateStr = new Date((curr.time as number) * 1000).toISOString().split('T')[0];
+       if (sessionDateStr !== currentSessionDateKey) {
+         currentSessionDateKey = sessionDateStr;
+         dailyAccumulatedPnl = 0;
+         dailyDrawdownHalted = false;
+         consecutiveLongLosses = 0;
+         consecutiveShortLosses = 0;
+         longCooldownUntil = 0;
+         shortCooldownUntil = 0;
+         lastLossTime = 0;
+         lastLossType = null;
+       }
        
        // Pre-market session check: strictly no trades before 09:15 AM IST for NSE
        const currDate = new Date((curr.time as number) * 1000);
@@ -1254,7 +1088,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                peakPrice: entry,
                trailStage: 0,
                status: 'OPEN',
-               isComboTrade: false,
                entryBarIdx: i,
                signalBarIdx: pendingSamSignal.signalBarIdx,
              };
@@ -1283,7 +1116,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                peakPrice: entry,
                trailStage: 0,
                status: 'OPEN',
-               isComboTrade: false,
                entryBarIdx: i,
                signalBarIdx: pendingSamSignal.signalBarIdx,
              };
@@ -1296,11 +1128,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
 
        const range = curr.high - curr.low;
        const atr = atr14[i] || Math.max(range, 1);
-       const adxVal = adxData.adx[i];
-       const pDi = adxData.plusDI[i] || 0;
-       const mDi = adxData.minusDI[i] || 0;
-       const currEma50 = ema50[i];
-       const currRsi = rsi14[i];
 
        // --- Manage Open Trades for current bar ---
        for (let j = openTrades.length - 1; j >= 0; j--) {
@@ -1309,6 +1136,179 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
          // 0. BEST SAM SIGNALS Management (Trailing Stop Loss: +20pt -> Entry, +40pt -> Entry + 20pt)
          if (t.strategyFamily === 'SAM_SIGNALS' && t.status === 'OPEN') {
            const isEntryBar = (curr.time as number) === t.entryTime;
+
+           // 0A. Institutional SAM(21/5) Exit Engine (#3 Fixed SL40/BE30/EOD, #5 Chandelier 0.30%/0.40%, #1 3m OpenDrive 2x/3x 5m ATR)
+           if (t.samExitProfile === 'FIXED_EOD' || t.samExitProfile === 'CHANDELIER') {
+             const currBarMin = Math.floor(((((curr.time as number) % 86400) + 86400) % 86400) / 60);
+             const isInstitutionalEod = isDayEnd || currBarMin >= (t.samEodExitMin ?? 925);
+
+             if (!isEntryBar) {
+               if (t.type === 'LONG') {
+                 // 1. Check stop-loss hit first against the active stop entering bar i (strictly causal)
+                 if (curr.low <= t.stoploss) {
+                   t.exitPrice = t.stoploss;
+                   t.exitTime = curr.time as number;
+                   t.pnl = Number((t.exitPrice - t.entryPrice).toFixed(2));
+                   if (t.pnl > 0) {
+                     t.status = 'WIN';
+                     t.exitReason = 'STOPLOSS';
+                   } else if (t.pnl === 0) {
+                     t.status = 'BE';
+                     t.exitReason = 'BREAKEVEN';
+                   } else {
+                     t.status = 'LOSS';
+                     t.exitReason = 'STOPLOSS';
+                   }
+                   t.duration = formatDuration(t.entryTime, t.exitTime);
+                   onSamTradeClosed(t, curr.time as number);
+                   openTrades.splice(j, 1);
+                   markers.push({
+                     time: curr.time,
+                     position: 'aboveBar',
+                     color: t.pnl > 0 ? '#10B981' : t.pnl === 0 ? '#F59E0B' : '#EF4444',
+                     shape: 'circle',
+                     text: t.pnl > 0
+                       ? `close_long (SAM 21/5 +${t.pnl}pt Trail 🎯)`
+                       : t.pnl === 0
+                         ? `close_long (SAM 21/5 BE 🛡️)`
+                         : `close_long (SAM 21/5 SL 🛑)`
+                   });
+                   continue;
+                 }
+
+                 // 2. End-of-day exit (15:25 IST or session end)
+                 if (isInstitutionalEod) {
+                   t.exitPrice = curr.close;
+                   t.exitTime = curr.time as number;
+                   t.exitReason = 'DAY_END';
+                   t.pnl = Number((curr.close - t.entryPrice).toFixed(2));
+                   t.status = t.pnl > 0 ? 'WIN' : t.pnl === 0 ? 'BE' : 'LOSS';
+                   t.duration = formatDuration(t.entryTime, t.exitTime);
+                   onSamTradeClosed(t, curr.time as number);
+                   openTrades.splice(j, 1);
+                   markers.push({
+                     time: curr.time,
+                     position: 'aboveBar',
+                     color: t.pnl >= 0 ? '#10B981' : '#EF4444',
+                     shape: 'circle',
+                     text: `close_long (SAM 21/5 EOD ${t.pnl >= 0 ? '+' : ''}${t.pnl}pt)`
+                   });
+                   continue;
+                 }
+
+                 // 3. Advance peak & trailing/BE stop for subsequent bars
+                 t.peakPrice = Math.max(t.peakPrice || t.entryPrice, curr.high);
+                 if (t.samExitProfile === 'FIXED_EOD' && t.samBeTriggerPts) {
+                   if (t.peakPrice >= t.entryPrice + t.samBeTriggerPts) {
+                     const newSl = Number(t.entryPrice.toFixed(2));
+                     if (newSl > t.stoploss) {
+                       t.stoploss = newSl;
+                       t.isBreakevenLocked = true;
+                       if (t.trailStage !== 1) {
+                         t.trailStage = 1;
+                         beSavedCount++;
+                         markers.push({
+                           time: curr.time,
+                           position: 'belowBar',
+                           color: '#3B82F6',
+                           shape: 'circle',
+                           text: `SL ➔ BE (+${t.samBeTriggerPts}pt)`
+                         });
+                       }
+                     }
+                   }
+                 } else if (t.samExitProfile === 'CHANDELIER' && t.samChandelierDistPts && t.samChandelierDistPts > 0) {
+                   const newSl = Number((t.peakPrice - t.samChandelierDistPts).toFixed(2));
+                   if (newSl > t.stoploss) {
+                     t.stoploss = newSl;
+                     if (newSl >= t.entryPrice) t.isBreakevenLocked = true;
+                   }
+                 }
+               } else {
+                 // SHORT (PUT)
+                 if (curr.high >= t.stoploss) {
+                   t.exitPrice = t.stoploss;
+                   t.exitTime = curr.time as number;
+                   t.pnl = Number((t.entryPrice - t.exitPrice).toFixed(2));
+                   if (t.pnl > 0) {
+                     t.status = 'WIN';
+                     t.exitReason = 'STOPLOSS';
+                   } else if (t.pnl === 0) {
+                     t.status = 'BE';
+                     t.exitReason = 'BREAKEVEN';
+                   } else {
+                     t.status = 'LOSS';
+                     t.exitReason = 'STOPLOSS';
+                   }
+                   t.duration = formatDuration(t.entryTime, t.exitTime);
+                   onSamTradeClosed(t, curr.time as number);
+                   openTrades.splice(j, 1);
+                   markers.push({
+                     time: curr.time,
+                     position: 'belowBar',
+                     color: t.pnl > 0 ? '#10B981' : t.pnl === 0 ? '#F59E0B' : '#EF4444',
+                     shape: 'circle',
+                     text: t.pnl > 0
+                       ? `close_short (SAM 21/5 +${t.pnl}pt Trail 🎯)`
+                       : t.pnl === 0
+                         ? `close_short (SAM 21/5 BE 🛡️)`
+                         : `close_short (SAM 21/5 SL 🛑)`
+                   });
+                   continue;
+                 }
+
+                 if (isInstitutionalEod) {
+                   t.exitPrice = curr.close;
+                   t.exitTime = curr.time as number;
+                   t.exitReason = 'DAY_END';
+                   t.pnl = Number((t.entryPrice - curr.close).toFixed(2));
+                   t.status = t.pnl > 0 ? 'WIN' : t.pnl === 0 ? 'BE' : 'LOSS';
+                   t.duration = formatDuration(t.entryTime, t.exitTime);
+                   onSamTradeClosed(t, curr.time as number);
+                   openTrades.splice(j, 1);
+                   markers.push({
+                     time: curr.time,
+                     position: 'belowBar',
+                     color: t.pnl >= 0 ? '#10B981' : '#EF4444',
+                     shape: 'circle',
+                     text: `close_short (SAM 21/5 EOD ${t.pnl >= 0 ? '+' : ''}${t.pnl}pt)`
+                   });
+                   continue;
+                 }
+
+                 t.peakPrice = Math.min(t.peakPrice || t.entryPrice, curr.low);
+                 if (t.samExitProfile === 'FIXED_EOD' && t.samBeTriggerPts) {
+                   if (t.peakPrice <= t.entryPrice - t.samBeTriggerPts) {
+                     const newSl = Number(t.entryPrice.toFixed(2));
+                     if (newSl < t.stoploss) {
+                       t.stoploss = newSl;
+                       t.isBreakevenLocked = true;
+                       if (t.trailStage !== 1) {
+                         t.trailStage = 1;
+                         beSavedCount++;
+                         markers.push({
+                           time: curr.time,
+                           position: 'aboveBar',
+                           color: '#3B82F6',
+                           shape: 'circle',
+                           text: `SL ➔ BE (+${t.samBeTriggerPts}pt)`
+                         });
+                       }
+                     }
+                   }
+                 } else if (t.samExitProfile === 'CHANDELIER' && t.samChandelierDistPts && t.samChandelierDistPts > 0) {
+                   const newSl = Number((t.peakPrice + t.samChandelierDistPts).toFixed(2));
+                   if (newSl < t.stoploss) {
+                     t.stoploss = newSl;
+                     if (newSl <= t.entryPrice) t.isBreakevenLocked = true;
+                   }
+                 }
+               }
+             }
+             // Prevent generic fallthrough (breakevenTrail / target1Hit / target2) from touching SAM 21/5 institutional trades
+             continue;
+           }
+
            const trailingEnabled = activeSamConfig?.trailingStopEnabled ?? true;
            const step1 = activeSamConfig?.trailStep1Points ?? 20;
            const step2 = activeSamConfig?.trailStep2Points ?? 40;
@@ -1376,6 +1376,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                  t.exitReason = 'STOPLOSS';
                }
                t.duration = formatDuration(t.entryTime, t.exitTime);
+               onSamTradeClosed(t, curr.time as number);
                openTrades.splice(j, 1);
                markers.push({
                  time: curr.time,
@@ -1396,6 +1397,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                t.pnl = Number((t.exitPrice - t.entryPrice).toFixed(2));
                t.status = 'WIN';
                t.duration = formatDuration(t.entryTime, t.exitTime);
+               onSamTradeClosed(t, curr.time as number);
                openTrades.splice(j, 1);
                markers.push({
                  time: curr.time,
@@ -1417,6 +1419,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                t.pnl = Number((curr.close - t.entryPrice).toFixed(2));
                t.status = t.pnl > 0 ? 'WIN' : t.pnl === 0 ? 'BE' : 'LOSS';
                t.duration = formatDuration(t.entryTime, t.exitTime);
+               onSamTradeClosed(t, curr.time as number);
                openTrades.splice(j, 1);
                markers.push({
                  time: curr.time,
@@ -1436,6 +1439,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                t.pnl = Number((curr.close - t.entryPrice).toFixed(2));
                t.status = t.pnl > 0 ? 'WIN' : t.pnl === 0 ? 'BE' : 'LOSS';
                t.duration = formatDuration(t.entryTime, t.exitTime);
+               onSamTradeClosed(t, curr.time as number);
                openTrades.splice(j, 1);
                markers.push({
                  time: curr.time,
@@ -1452,6 +1456,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                t.pnl = Number((curr.close - t.entryPrice).toFixed(2));
                t.status = t.pnl > 0 ? 'WIN' : t.pnl === 0 ? 'BE' : 'LOSS';
                t.duration = formatDuration(t.entryTime, t.exitTime);
+               onSamTradeClosed(t, curr.time as number);
                openTrades.splice(j, 1);
                continue;
              }
@@ -1518,6 +1523,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                  t.exitReason = 'STOPLOSS';
                }
                t.duration = formatDuration(t.entryTime, t.exitTime);
+               onSamTradeClosed(t, curr.time as number);
                openTrades.splice(j, 1);
                markers.push({
                  time: curr.time,
@@ -1538,6 +1544,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                t.pnl = Number((t.entryPrice - t.exitPrice).toFixed(2));
                t.status = 'WIN';
                t.duration = formatDuration(t.entryTime, t.exitTime);
+               onSamTradeClosed(t, curr.time as number);
                openTrades.splice(j, 1);
                markers.push({
                  time: curr.time,
@@ -1559,6 +1566,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                t.pnl = Number((t.entryPrice - curr.close).toFixed(2));
                t.status = t.pnl > 0 ? 'WIN' : t.pnl === 0 ? 'BE' : 'LOSS';
                t.duration = formatDuration(t.entryTime, t.exitTime);
+               onSamTradeClosed(t, curr.time as number);
                openTrades.splice(j, 1);
                markers.push({
                  time: curr.time,
@@ -1578,6 +1586,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                t.pnl = Number((t.entryPrice - curr.close).toFixed(2));
                t.status = t.pnl > 0 ? 'WIN' : t.pnl === 0 ? 'BE' : 'LOSS';
                t.duration = formatDuration(t.entryTime, t.exitTime);
+               onSamTradeClosed(t, curr.time as number);
                openTrades.splice(j, 1);
                markers.push({
                  time: curr.time,
@@ -1594,18 +1603,18 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                t.pnl = Number((t.entryPrice - curr.close).toFixed(2));
                t.status = t.pnl > 0 ? 'WIN' : t.pnl === 0 ? 'BE' : 'LOSS';
                t.duration = formatDuration(t.entryTime, t.exitTime);
+               onSamTradeClosed(t, curr.time as number);
                openTrades.splice(j, 1);
                continue;
              }
            }
+           continue;
          }
 
-         // 1. Special Condition: Maximum Time for Each Trade (Configurable: 30 minutes, 1 hour, 2 hours)
+         // 1. Maximum Time for MACD+ST Trades (60 minutes)
          const elapsedSecs = Math.max(0, (curr.time as number) - t.entryTime);
          const elapsedMins = elapsedSecs / 60;
-         const maxAllowedMins = activeComboConfig?.maxTradeDurationMinutes || 60;
-
-         if (t.isComboTrade && t.status === 'OPEN' && elapsedMins >= maxAllowedMins) {
+         if (t.strategyFamily === 'MACD_ADAPTIVE_SUPERTREND' && t.status === 'OPEN' && elapsedMins >= 60) {
            const isLong = t.type === 'LONG';
            const exitP = curr.close;
            t.exitPrice = exitP;
@@ -1625,81 +1634,15 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
            continue;
          }
 
-         // 2. Opposite Signal / Trend Reversal Exit for Combo Trades
-         if (t.status === 'OPEN' && t.isComboTrade) {
-           const isBearishReversal = alpha.sellSignal[i] || (t3.lev0[i-1] >= t3.lev5[i-1] && t3.lev0[i] < t3.lev5[i]);
-           if (t.type === 'LONG' && isBearishReversal) {
-             t.exitPrice = curr.close;
-             t.exitTime = curr.time as number;
-             t.exitReason = 'OPPOSITE_SIGNAL';
-             t.pnl = Number((curr.close - t.entryPrice).toFixed(2));
-             t.status = t.pnl >= 0 ? 'WIN' : 'LOSS';
-             t.duration = formatDuration(t.entryTime, t.exitTime);
-             openTrades.splice(j, 1);
-             markers.push({
-               time: curr.time,
-               position: 'aboveBar',
-               color: '#EC4899',
-               shape: 'circle',
-               text: `close_long (${t.signal} Rev Exit 🔄)`
-             });
-             continue;
-           }
-
-           const isBullishReversal = alpha.buySignal[i] || (t3.lev0[i-1] <= t3.lev5[i-1] && t3.lev0[i] > t3.lev5[i]);
-           if (t.type === 'SHORT' && isBullishReversal) {
-             t.exitPrice = curr.close;
-             t.exitTime = curr.time as number;
-             t.exitReason = 'OPPOSITE_SIGNAL';
-             t.pnl = Number((t.entryPrice - curr.close).toFixed(2));
-             t.status = t.pnl >= 0 ? 'WIN' : 'LOSS';
-             t.duration = formatDuration(t.entryTime, t.exitTime);
-             openTrades.splice(j, 1);
-             markers.push({
-               time: curr.time,
-               position: 'belowBar',
-               color: '#EC4899',
-               shape: 'circle',
-               text: `close_short (${t.signal} Rev Exit 🔄)`
-             });
-             continue;
-           }
-         }
-
-                  // Dynamic Breakeven trailing for standard strategies (Never applied to combo strategies)
-         if (!t.isComboTrade && activeFilterSettings.breakevenTrail && t.status === 'OPEN' && !t.isBreakevenLocked) {
-           if (t.type === 'LONG') {
-             const halfTarget = t.entryPrice + (t.target - t.entryPrice) * 0.5;
-             if (curr.high >= halfTarget) {
-               t.stoploss = t.entryPrice;
-               t.isBreakevenLocked = true;
-               beSavedCount++;
-             }
-           } else {
-             const halfTarget = t.entryPrice - (t.entryPrice - t.target) * 0.5;
-             if (curr.low <= halfTarget) {
-               t.stoploss = t.entryPrice;
-               t.isBreakevenLocked = true;
-               beSavedCount++;
-             }
-           }
-         }
-
          if (t.type === 'LONG') {
-           // Track highest price reached for dynamic trailing (PDF Section 4)
+           // Track highest price reached
            t.peakPrice = Math.max(t.peakPrice || t.entryPrice, curr.high);
 
            // Check Target 1 Hit
            if (!t.target1Hit && curr.high >= t.target) {
              t.target1Hit = true;
              t.isBreakevenLocked = true;
-             if (t.strategyFamily === 'COMBO_FILTERED') {
-               // PDF Rule: Lock breakeven + buffer, activate dynamic trail
-               t.stoploss = Math.max(t.stoploss, t.entryPrice + 0.05 * atr);
-             } else {
-               // Unfiltered: Immediate Breakeven lock
-               t.stoploss = Math.max(t.stoploss, t.entryPrice);
-             }
+             t.stoploss = Math.max(t.stoploss, t.entryPrice);
              markers.push({
                time: curr.time,
                position: 'aboveBar',
@@ -1709,18 +1652,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
              });
            }
 
-           // PDF Dynamic Trailing SL Mechanics for Filtered Strategy:
-           // "As the price continues to make new highs, the stop loss dynamically trails at 50% of the maximum risk distance behind the peak price, locking in profits while giving the trade room to run."
-           if (t.target1Hit && t.strategyFamily === 'COMBO_FILTERED') {
-             const risk = t.riskDist || (t.entryPrice - t.stoploss) || atr;
-             const dynamicTrailStop = Number((t.peakPrice! - 0.5 * risk).toFixed(2));
-             if (dynamicTrailStop > t.stoploss) {
-               t.stoploss = dynamicTrailStop;
-             }
-           }
-
            if (t.target1Hit) {
-             const t2 = t.target2 || (t.entryPrice + (t.target - t.entryPrice) * (t.strategyFamily === 'COMBO_FILTERED' ? 1.5 : 1.67));
+             const t2 = t.target2 || (t.entryPrice + (t.target - t.entryPrice) * 1.67);
              if (curr.high >= t2) {
                // Target 2 reached! Multi-target exit (50% booked at T1, 50% at T2)
                t.exitPrice = Number(((t.target + t2) / 2).toFixed(2));
@@ -1804,13 +1737,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
            if (!t.target1Hit && curr.low <= t.target) {
              t.target1Hit = true;
              t.isBreakevenLocked = true;
-             if (t.strategyFamily === 'COMBO_FILTERED') {
-               // PDF Rule: Lock breakeven + buffer, activate dynamic trail
-               t.stoploss = Math.min(t.stoploss, t.entryPrice - 0.05 * atr);
-             } else {
-               // Unfiltered: Immediate Breakeven lock
-               t.stoploss = Math.min(t.stoploss, t.entryPrice);
-             }
+             t.stoploss = Math.min(t.stoploss, t.entryPrice);
              markers.push({
                time: curr.time,
                position: 'belowBar',
@@ -1820,18 +1747,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
              });
            }
 
-           // PDF Dynamic Trailing SL Mechanics for Filtered Strategy:
-           // "As the price continues to make new lows, the stop loss dynamically trails at 50% of the maximum risk distance behind the peak price, locking in profits while giving the trade room to run."
-           if (t.target1Hit && t.strategyFamily === 'COMBO_FILTERED') {
-             const risk = t.riskDist || (t.stoploss - t.entryPrice) || atr;
-             const dynamicTrailStop = Number((t.peakPrice! + 0.5 * risk).toFixed(2));
-             if (dynamicTrailStop < t.stoploss) {
-               t.stoploss = dynamicTrailStop;
-             }
-           }
-
            if (t.target1Hit) {
-             const t2 = t.target2 || (t.entryPrice - (t.entryPrice - t.target) * (t.strategyFamily === 'COMBO_FILTERED' ? 1.5 : 1.67));
+             const t2 = t.target2 || (t.entryPrice - (t.entryPrice - t.target) * 1.67);
              if (curr.low <= t2) {
                // Target 2 reached! Multi-target exit (50% booked at T1, 50% at T2)
                t.exitPrice = Number(((t.target + t2) / 2).toFixed(2));
@@ -1910,460 +1827,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
          }
        }
 
-// Function to evaluate whether a trade passes filter checks
-       const checkSignalFilter = (type: 'LONG'|'SHORT'): string | null => {
-         if (activeFilterMode === 'RAW') return null;
-
-         // Booker ADX mode
-         if (activeFilterMode === 'BOOKER_ADX') {
-           if (!isNaN(adxVal) && adxVal < chopFilter.threshold) {
-             chopFiltered++;
-             return 'BOOKER_ADX';
-           }
-           return null;
-         }
-
-         // Momentum ADX mode
-         if (activeFilterMode === 'MOMENTUM_ADX') {
-           if (isNaN(adxVal) || adxVal < 20) {
-             chopFiltered++;
-             return 'MOMENTUM_ADX';
-           }
-           return null;
-         }
-
-         // 1. Opening Range Buffer (09:15 - 09:25 IST)
-         if (activeFilterSettings.openingRangeBuffer) {
-           const d = new Date((curr.time as number) * 1000);
-           const hours = d.getUTCHours();
-           const minutes = d.getUTCMinutes();
-           const istMinutes = hours * 60 + minutes;
-           // If time is before 09:25 IST
-           if (istMinutes < (9 * 60 + 25)) {
-             openingFiltered++;
-             return 'OPENING_BUFFER';
-           }
-         }
-
-         // 2. Trend Alignment with 50 EMA (Long above 50 EMA, Short below 50 EMA)
-         if (activeFilterSettings.trendAlignment && !isNaN(currEma50)) {
-           if (type === 'LONG' && curr.close < currEma50 - (atr * 0.25)) {
-             trendFiltered++;
-             return 'TREND_COUNTER_LONG';
-           }
-           if (type === 'SHORT' && curr.close > currEma50 + (atr * 0.25)) {
-             trendFiltered++;
-             return 'TREND_COUNTER_SHORT';
-           }
-         }
-
-         // 3. Body Conviction & Rejection Wick
-         if (activeFilterSettings.bodyConviction && range > 0) {
-           const upperWick = curr.high - Math.max(curr.open, curr.close);
-           const lowerWick = Math.min(curr.open, curr.close) - curr.low;
-           if (type === 'LONG' && (upperWick / range) > 0.45) {
-             wickFiltered++;
-             return 'UPPER_WICK_REJECTION';
-           }
-           if (type === 'SHORT' && (lowerWick / range) > 0.45) {
-             wickFiltered++;
-             return 'LOWER_WICK_REJECTION';
-           }
-         }
-
-         // 4. Exhaustion Climax Filter
-         if (activeFilterSettings.exhaustionFilter && range > (atr * 2.5)) {
-           exhaustionFiltered++;
-           return 'EXHAUSTION_CLIMAX';
-         }
-
-         // 5. RSI Sweet-Spot
-         if (activeFilterSettings.rsiMomentum && !isNaN(currRsi)) {
-           if (type === 'LONG' && (currRsi < 42 || currRsi > 74)) {
-             rsiFiltered++;
-             return 'RSI_EXHAUSTED';
-           }
-           if (type === 'SHORT' && (currRsi > 58 || currRsi < 26)) {
-             rsiFiltered++;
-             return 'RSI_EXHAUSTED';
-           }
-         }
-
-         // 6. ADX Chop Filter (Smart Directional vs Classic)
-         if (chopFilter.enabled && !isNaN(adxVal)) {
-           const chopMode = chopFilter.mode || 'SMART';
-           if (chopMode === 'SMART') {
-             const diAdvantage = type === 'LONG' ? (pDi - mDi) : (mDi - pDi);
-             // Adverse momentum trap: Firing directly against dominant directional pressure
-             if (diAdvantage < -2.0) {
-               chopFiltered++;
-               return 'ADVERSE_DI_MOMENTUM';
-             }
-             // Flat directionless chop without breakout expansion
-             if (adxVal < chopFilter.threshold && diAdvantage < 3.5) {
-               chopFiltered++;
-               return 'CHOP_NO_EXPANSION';
-             }
-             // Otherwise: adxVal < threshold BUT diAdvantage >= 3.5 is BREAKOUT IGNITION -> PASS!
-           } else {
-             // Classic Naive ADX < threshold
-             if (adxVal < chopFilter.threshold) {
-               chopFiltered++;
-               return 'CLASSIC_ADX_CHOP';
-             }
-           }
-         }
-
-         // 7. Volume Confirmation Filter
-         const currVolSma = volSma20[i];
-         if (activeFilterSettings.volumeConfirm && currVolSma > 0 && curr.volume > 0) {
-           if (curr.volume < currVolSma * 0.85) {
-             volumeFiltered++;
-             return 'LOW_VOLUME_CHOP';
-           }
-         }
-
-         return null;
-       };
-
-       // Helper to check what shadow trade would have done
-       const findShadowOutcome = (sigName: string) => {
-         const match = shadowRawTrades.find(st => st.id === `shadow-${curr.time}-${sigName}`);
-         return match?.status;
-       };
-
-       // --- Strategy Execution (Do NOT open new trades near/at day end or in pre-market session) ---
-       const openTrade = (type: 'LONG'|'SHORT', signalName: string, slPoints: number, tpPoints: number, tp2Points?: number) => {
-         if (isDayEnd || isPreMarket) return;
-         if (openTrades.some(t => t.signal === signalName)) return;
-
-         const filterReason = checkSignalFilter(type);
-         if (filterReason) {
-           suppressedTrades++;
-           const shadowStatus = findShadowOutcome(signalName);
-           if (shadowStatus === 'WIN') profitTradesFiltered++;
-           else if (shadowStatus === 'LOSS') lossTradesFiltered++;
-           return;
-         }
-
-         const entry = curr.close;
-         const sl = type === 'LONG' ? entry - slPoints : entry + slPoints;
-         const target = type === 'LONG' ? entry + tpPoints : entry - tpPoints;
-         const t2Dist = tp2Points !== undefined ? tp2Points : (tpPoints * 1.85);
-         const target2 = type === 'LONG' ? entry + t2Dist : entry - t2Dist;
-
-         const newTrade: Trade = {
-           id: `${curr.time}-${signalName}`,
-           type,
-           signal: signalName,
-           entryTime: curr.time as number,
-           entryPrice: entry,
-           stoploss: sl,
-           target,
-           target2,
-           status: 'OPEN'
-         };
-         openTrades.push(newTrade);
-         allTrades.push(newTrade);
-       };
-
-       // T3 Striped Strategy (Calibrated for Nifty 1m)
-       if (activeStrategies.t3Striped) {
-         const t3_0 = t3.lev0[i];
-         const t3_5 = t3.lev5[i];
-         const prev_t3_0 = t3.lev0[i-1];
-         const prev_t3_5 = t3.lev5[i-1];
-
-         const isCrossOver = prev_t3_0 <= prev_t3_5 && t3_0 > t3_5;
-         const isCrossUnder = prev_t3_0 >= prev_t3_5 && t3_0 < t3_5;
-
-         // Check Ribbon Expansion spread to filter flat ribbon chop
-         const ribbonSpread = Math.abs(t3_0 - t3_5);
-         const minSpread = (activeT3Config.minRibbonExpansion || 0) * atr;
-         const hasSpread = ribbonSpread >= minSpread;
-
-         // Candle Body Conviction Check: Long requires bullish close, Short requires bearish close
-         const candleOkLong = !activeT3Config.candleConfirm || (curr.close >= curr.open && curr.close >= t3_0);
-         const candleOkShort = !activeT3Config.candleConfirm || (curr.close <= curr.open && curr.close <= t3_0);
-
-         // Volume Confirmation Check
-         const currVolSma = volSma20[i];
-         const t3VolOk = !activeT3Config.volumeConfirm || !currVolSma || (curr.volume >= currVolSma * 0.85);
-
-         if (isCrossOver && hasSpread && candleOkLong && t3VolOk) {
-           const reason = checkSignalFilter('LONG');
-           if (!reason) {
-             markers.push({ time: curr.time, position: 'belowBar', color: '#EAB308', shape: 'arrowUp', text: 'T3 L' });
-           }
-           openTrade(
-             'LONG', 
-             'T3L', 
-             atr * activeT3Config.slMultiple, 
-             atr * activeT3Config.tp1Multiple, 
-             atr * activeT3Config.tp2Multiple
-           );
-         }
-         if (isCrossUnder && hasSpread && candleOkShort && t3VolOk) {
-           const reason = checkSignalFilter('SHORT');
-           if (!reason) {
-             markers.push({ time: curr.time, position: 'aboveBar', color: '#D946EF', shape: 'arrowDown', text: 'T3 S' });
-           }
-           openTrade(
-             'SHORT', 
-             'T3S', 
-             atr * activeT3Config.slMultiple, 
-             atr * activeT3Config.tp1Multiple, 
-             atr * activeT3Config.tp2Multiple
-           );
-         }
-       }
-
-       // AlphaTrend Strategy (Calibrated for Nifty 1m)
-       if (activeStrategies.alphaTrend) {
-         // Candle Body Conviction Check: prevents entering on sharp rejection wicks against the signal
-         const candleOkLong = !activeAlphaTrendConfig.candleConfirm || (curr.close >= curr.open);
-         const candleOkShort = !activeAlphaTrendConfig.candleConfirm || (curr.close <= curr.open);
-
-         // Volume Confirmation Check
-         const currVolSma = volSma20[i];
-         const alphaVolOk = !activeAlphaTrendConfig.volumeConfirm || !currVolSma || (curr.volume >= currVolSma * 0.85);
-
-         if (alpha.buySignal[i] && candleOkLong && alphaVolOk) {
-           const reason = checkSignalFilter('LONG');
-           if (!reason) {
-             markers.push({ time: curr.time, position: 'belowBar', color: '#0022fc', shape: 'arrowUp', text: 'BUY' });
-           }
-           openTrade(
-             'LONG', 
-             'AlphaB', 
-             atr * activeAlphaTrendConfig.slMultiple, 
-             atr * activeAlphaTrendConfig.tp1Multiple, 
-             atr * activeAlphaTrendConfig.tp2Multiple
-           );
-         }
-         if (alpha.sellSignal[i] && candleOkShort && alphaVolOk) {
-           const reason = checkSignalFilter('SHORT');
-           if (!reason) {
-             markers.push({ time: curr.time, position: 'aboveBar', color: '#800000', shape: 'arrowDown', text: 'SELL' });
-           }
-           openTrade(
-             'SHORT', 
-             'AlphaS', 
-             atr * activeAlphaTrendConfig.slMultiple, 
-             atr * activeAlphaTrendConfig.tp1Multiple, 
-             atr * activeAlphaTrendConfig.tp2Multiple
-           );
-         }
-       }
-
-       // =====================================================================
-       // COMBINATION STRATEGY (T3 Striped + AlphaTrend)
-       // Two versions: UNFILTERED and FILTERED
-       // Special Conditions:
-       // 1. One trade at a time (strictly enforced)
-       // 2. Maximum time for each trade (30 mins, 1 hour, 2 hours)
-       // Works on 5m timeframe and ALL other timeframes (1m, 3m, 15m, etc.)
-       // =====================================================================
-       const t3_0 = t3.lev0[i];
-       const t3_5 = t3.lev5[i];
-       const prev_t3_0 = t3.lev0[i-1];
-       const prev_t3_5 = t3.lev5[i-1];
-       
-       const t3Bullish = !isNaN(t3_0) && !isNaN(t3_5) && t3_0 > t3_5;
-       const t3Bearish = !isNaN(t3_0) && !isNaN(t3_5) && t3_0 < t3_5;
-       const t3CrossOver = prev_t3_0 <= prev_t3_5 && t3Bullish;
-       const t3CrossUnder = prev_t3_0 >= prev_t3_5 && t3Bearish;
-
-       const atLine = alpha.alphaTrend[i];
-       const atTrig = alpha.trigger[i];
-       const alphaBullish = !isNaN(atLine) && !isNaN(atTrig) && atLine > atTrig;
-       const alphaBearish = !isNaN(atLine) && !isNaN(atTrig) && atLine < atTrig;
-       const alphaBuyCross = alpha.buySignal[i];
-       const alphaSellCross = alpha.sellSignal[i];
-
-       // Combination Trigger Signals:
-       // Bullish Long: AlphaTrend Buy cross while T3 is Bullish OR T3 Crossover while AlphaTrend is Bullish
-       const comboLongTrigger = (alphaBuyCross && t3Bullish) || (t3CrossOver && alphaBullish);
-       // Bearish Short: AlphaTrend Sell cross while T3 is Bearish OR T3 Crossunder while AlphaTrend is Bearish
-       const comboShortTrigger = (alphaSellCross && t3Bearish) || (t3CrossUnder && alphaBearish);
-
-              // 1. Unfiltered Version: "unfiltered"
-       // Evaluated strictly on its own rules without interference from any other strategy
-       if (activeStrategies.comboUnfiltered && !isDayEnd && !isPreMarket) {
-         const hasActiveTrade = (activeComboConfig?.oneTradeAtATime ?? true) && openTrades.some(t => t.status === 'OPEN' && t.strategyFamily === 'COMBO_UNFILTERED');
-         if (!hasActiveTrade) {
-           if (comboLongTrigger) {
-             markers.push({ time: curr.time, position: 'belowBar', color: '#06B6D4', shape: 'arrowUp', text: 'Unfiltered L' });
-             const entry = curr.close;
-             // Pure Technical Pivot SL: Recent Swing Low or AlphaTrend support
-             const recentLow = Math.min(...candles.slice(Math.max(0, i - 4), i + 1).map(c => c.low));
-             const alphaLine = alpha.alphaTrend[i];
-             const rawSL = (!isNaN(alphaLine) && alphaLine < entry) ? Math.min(recentLow, alphaLine) : recentLow;
-             const rawRisk = entry - rawSL;
-             const riskDist = Math.min(2.5 * atr, Math.max(1.0 * atr, rawRisk > 0 ? rawRisk : atr * 1.0));
-             const stoploss = Number((entry - riskDist).toFixed(2));
-             // Unfiltered Momentum Targets: 1:1.5 R:R and 1:2.5 R:R
-             const tp1Points = riskDist * 1.5;
-             const tp2Points = riskDist * 2.5;
-
-             const newTrade: Trade = {
-               id: `${curr.time}-COMBO-UNFILTERED-L`,
-               type: 'LONG',
-               signal: 'Unfiltered Long',
-               strategyFamily: 'COMBO_UNFILTERED',
-               entryTime: curr.time as number,
-               entryPrice: entry,
-               stoploss: stoploss,
-               target: Number((entry + tp1Points).toFixed(2)),
-               target2: Number((entry + tp2Points).toFixed(2)),
-               riskDist: riskDist,
-               peakPrice: entry,
-               status: 'OPEN',
-               isComboTrade: true
-             };
-             openTrades.push(newTrade);
-             allTrades.push(newTrade);
-           } else if (comboShortTrigger) {
-             markers.push({ time: curr.time, position: 'aboveBar', color: '#F43F5E', shape: 'arrowDown', text: 'Unfiltered S' });
-             const entry = curr.close;
-             // Pure Technical Pivot SL: Recent Swing High or AlphaTrend resistance
-             const recentHigh = Math.max(...candles.slice(Math.max(0, i - 4), i + 1).map(c => c.high));
-             const alphaLine = alpha.alphaTrend[i];
-             const rawSL = (!isNaN(alphaLine) && alphaLine > entry) ? Math.max(recentHigh, alphaLine) : recentHigh;
-             const rawRisk = rawSL - entry;
-             const riskDist = Math.min(2.5 * atr, Math.max(1.0 * atr, rawRisk > 0 ? rawRisk : atr * 1.0));
-             const stoploss = Number((entry + riskDist).toFixed(2));
-             // Unfiltered Momentum Targets: 1:1.5 R:R and 1:2.5 R:R
-             const tp1Points = riskDist * 1.5;
-             const tp2Points = riskDist * 2.5;
-
-             const newTrade: Trade = {
-               id: `${curr.time}-COMBO-UNFILTERED-S`,
-               type: 'SHORT',
-               signal: 'Unfiltered Short',
-               strategyFamily: 'COMBO_UNFILTERED',
-               entryTime: curr.time as number,
-               entryPrice: entry,
-               stoploss: stoploss,
-               target: Number((entry - tp1Points).toFixed(2)),
-               target2: Number((entry - tp2Points).toFixed(2)),
-               riskDist: riskDist,
-               peakPrice: entry,
-               status: 'OPEN',
-               isComboTrade: true
-             };
-             openTrades.push(newTrade);
-             allTrades.push(newTrade);
-           }
-         }
-       }
-
-       // 2. Filtered Version: "filtered"
-       // Evaluated SOLELY by its own 5 strategy rules: (1) Confluence Trigger, (2) Upstox Volume confirmation,
-       // (3) Green/Red Candle Conviction, (4) Ribbon Spread Expansion, and (5) 50 EMA trend alignment.
-       // NO outside or other strategy filters apply. Isolated One Trade at a Time without interference.
-       if (activeStrategies.comboFiltered && !isDayEnd && !isPreMarket) {
-         const hasActiveTrade = (activeComboConfig?.oneTradeAtATime ?? true) && openTrades.some(t => t.status === 'OPEN' && t.strategyFamily === 'COMBO_FILTERED');
-         if (!hasActiveTrade) {
-           // Strict Strategy Confirmation Filters:
-           // a) Real Upstox Volume confirmation (>= 0.85x 20-period Vol SMA)
-           const currVolSma = volSma20[i];
-           const volOk = !currVolSma || (curr.volume >= currVolSma * 0.85);
-
-           // b) Confirmation Candle: Green candle for Long (Close >= Open), Red candle for Short (Close <= Open)
-           const candleOkLong = curr.close >= curr.open;
-           const candleOkShort = curr.close <= curr.open;
-
-           // c) Ribbon Spread Expansion: abs(t3_0 - t3_5) >= minRibbonExpansion * ATR (minimum 0.20x ATR)
-           const ribbonSpread = Math.abs(t3_0 - t3_5);
-           const minSpread = Math.max(activeT3Config.minRibbonExpansion || 0.12, 0.20) * atr;
-           const spreadOk = ribbonSpread >= minSpread;
-
-           // d) Trend Alignment (50 EMA)
-           const trendOkLong = isNaN(currEma50) || (curr.close >= currEma50 - 0.25 * atr);
-           const trendOkShort = isNaN(currEma50) || (curr.close <= currEma50 + 0.25 * atr);
-
-           // e) ADX Trend Strength Confirmation (ADX >= 20.0 to eliminate choppy range)
-           const currAdx = adxData.adx[i];
-           const adxOk = isNaN(currAdx) || currAdx >= 20.0;
-
-           // f) Money Flow Index (MFI) Institutional Conviction (Long >= 65, Short <= 35)
-           const currMfi = mfi14[i];
-           const mfiOkLong = isNaN(currMfi) || currMfi >= 65;
-           const mfiOkShort = isNaN(currMfi) || currMfi <= 35;
-
-           // g) Macro 200 EMA Protection (Avoid buying deep below or selling deep above 200 EMA)
-           const currEma200 = ema200[i];
-           const ema200OkLong = isNaN(currEma200) || (curr.close >= currEma200 - 25.0);
-           const ema200OkShort = isNaN(currEma200) || (curr.close <= currEma200 + 25.0);
-
-           if (comboLongTrigger && volOk && candleOkLong && spreadOk && trendOkLong && adxOk && mfiOkLong && ema200OkLong) {
-             markers.push({ time: curr.time, position: 'belowBar', color: '#10B981', shape: 'arrowUp', text: 'Filtered L' });
-             const entry = curr.close;
-             // Structural Stop Loss as per PDF Section 4: Invalidation level with dynamic buffer
-             const recentLow = Math.min(...candles.slice(Math.max(0, i - 4), i + 1).map(c => c.low));
-             const alphaLine = alpha.alphaTrend[i];
-             const rawSL = (!isNaN(alphaLine) && alphaLine < entry) ? Math.min(recentLow, alphaLine) : recentLow;
-             const rawRisk = entry - rawSL;
-             const riskDist = Math.min(2.5 * atr, Math.max(1.2 * atr, rawRisk > 0 ? rawRisk : atr * 1.2));
-             const stoploss = Number((entry - riskDist).toFixed(2));
-             // Dynamic Risk-to-Reward Targets as per PDF Section 4: Spot Target 1: 1:2 R:R (Risk x 2.0); Target 2: 1:3 R:R
-             const tp1Points = riskDist * 2.0;
-             const tp2Points = riskDist * 3.0;
-
-             const newTrade: Trade = {
-               id: `${curr.time}-COMBO-FILTERED-L`,
-               type: 'LONG',
-               signal: 'Filtered Long',
-               strategyFamily: 'COMBO_FILTERED',
-               entryTime: curr.time as number,
-               entryPrice: entry,
-               stoploss: stoploss,
-               target: Number((entry + tp1Points).toFixed(2)),
-               target2: Number((entry + tp2Points).toFixed(2)),
-               riskDist: riskDist,
-               peakPrice: entry,
-               status: 'OPEN',
-               isComboTrade: true
-             };
-             openTrades.push(newTrade);
-             allTrades.push(newTrade);
-           } else if (comboShortTrigger && volOk && candleOkShort && spreadOk && trendOkShort && adxOk && mfiOkShort && ema200OkShort) {
-             markers.push({ time: curr.time, position: 'aboveBar', color: '#E11D48', shape: 'arrowDown', text: 'Filtered S' });
-             const entry = curr.close;
-             // Structural Stop Loss as per PDF Section 4: Invalidation level with dynamic buffer
-             const recentHigh = Math.max(...candles.slice(Math.max(0, i - 4), i + 1).map(c => c.high));
-             const alphaLine = alpha.alphaTrend[i];
-             const rawSL = (!isNaN(alphaLine) && alphaLine > entry) ? Math.max(recentHigh, alphaLine) : recentHigh;
-             const rawRisk = rawSL - entry;
-             const riskDist = Math.min(2.5 * atr, Math.max(1.2 * atr, rawRisk > 0 ? rawRisk : atr * 1.2));
-             const stoploss = Number((entry + riskDist).toFixed(2));
-             // Dynamic Risk-to-Reward Targets as per PDF Section 4: Spot Target 1: 1:2 R:R (Risk x 2.0); Target 2: 1:3 R:R
-             const tp1Points = riskDist * 2.0;
-             const tp2Points = riskDist * 3.0;
-
-             const newTrade: Trade = {
-               id: `${curr.time}-COMBO-FILTERED-S`,
-               type: 'SHORT',
-               signal: 'Filtered Short',
-               strategyFamily: 'COMBO_FILTERED',
-               entryTime: curr.time as number,
-               entryPrice: entry,
-               stoploss: stoploss,
-               target: Number((entry - tp1Points).toFixed(2)),
-               target2: Number((entry - tp2Points).toFixed(2)),
-               riskDist: riskDist,
-               peakPrice: entry,
-               status: 'OPEN',
-               isComboTrade: true
-             };
-             openTrades.push(newTrade);
-             allTrades.push(newTrade);
-           }
-         }
-       }
-
-        // 3. NIFTY MACD + Adaptive SuperTrend Strategy
+        // 1. NIFTY MACD + Adaptive SuperTrend Strategy
         // Evaluated SOLELY by its own rules: MACD crossover + Adaptive SuperTrend trend.
         // NO outside or other strategy filters apply. Isolated One Trade at a Time without interference.
         if (activeStrategies.macdAdaptiveSupertrend && !isDayEnd && !isPreMarket && i >= 35) {
@@ -2417,7 +1881,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                 riskDist: riskDist,
                 peakPrice: entry,
                 status: 'OPEN',
-                isComboTrade: true,
               };
               openTrades.push(newTrade);
               allTrades.push(newTrade);
@@ -2440,7 +1903,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                 riskDist: riskDist,
                 peakPrice: entry,
                 status: 'OPEN',
-                isComboTrade: true,
               };
               openTrades.push(newTrade);
               allTrades.push(newTrade);
@@ -2556,81 +2018,244 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
           }
 
           if (!hasActiveTrade) {
-            if (entryTiming === 'bar1Open') {
+            const samProfile = samSignalsResult.samSignalProfile?.[i] || 'STANDARD';
+            const isInstitutionalSam21 = samProfile !== 'STANDARD';
+
+            // Daily Drawdown Halt Check
+            if (activeSamConfig?.maxDailyLossEnabled && dailyDrawdownHalted) {
+              if (samSignalsResult.callSignals[i] || samSignalsResult.putSignals[i]) {
+                markers.push({
+                  time: curr.time,
+                  position: samSignalsResult.callSignals[i] ? 'belowBar' : 'aboveBar',
+                  color: '#9CA3AF',
+                  shape: 'circle',
+                  text: `SAM ${samSignalsResult.callSignals[i] ? 'CALL' : 'PUT'} (Halted: Daily Max Loss Hit 🛑)`
+                });
+              }
+            } else if (isInstitutionalSam21 && (samSignalsResult.callSignals[i] || samSignalsResult.putSignals[i])) {
+              // Institutional SAM(21/5) immediate entry at signal bar close (zero-lookahead)
+              const isCall = samSignalsResult.callSignals[i];
+              const entry = curr.close;
+              const atr5mVal = samSignalsResult.atr5mValues?.[i];
+              const fallbackAtr5m = !isNaN(atr) && atr > 0 ? atr * Math.sqrt(5) : 15;
+              const effAtr5m = atr5mVal && !isNaN(atr5mVal) && atr5mVal > 0 ? atr5mVal : fallbackAtr5m;
+
+              let profSlDist = 40;
+              let exitProfile: 'FIXED_EOD' | 'CHANDELIER' = 'FIXED_EOD';
+              let beTriggerPts: number | undefined = 30;
+              let chandelierDistPts: number | undefined = undefined;
+              let labelSuffix = 'AFT [#3 SL40/BE30]';
+
+              if (samProfile === 'SAM21_AFT_CHAND') {
+                profSlDist = Number((entry * 0.003).toFixed(2));
+                exitProfile = 'CHANDELIER';
+                beTriggerPts = undefined;
+                chandelierDistPts = Number((entry * 0.004).toFixed(2));
+                labelSuffix = 'AFT [#5 Chand 0.3/0.4%]';
+              } else if (samProfile === 'SAM21_3M_OPENDRIVE') {
+                profSlDist = Number((2.0 * effAtr5m).toFixed(2));
+                exitProfile = 'CHANDELIER';
+                beTriggerPts = undefined;
+                chandelierDistPts = Number((3.0 * effAtr5m).toFixed(2));
+                labelSuffix = '3m OPEN [#1 2x/3x ATR]';
+              }
+
+              const stoploss = Number((isCall ? entry - profSlDist : entry + profSlDist).toFixed(2));
+              const signalLabel = `SAM 21/5 ${isCall ? 'CALL' : 'PUT'} ${labelSuffix}`;
+
+              markers.push({
+                time: curr.time,
+                position: isCall ? 'belowBar' : 'aboveBar',
+                color: isCall ? (activeSamConfig?.colorBuy || '#2196f3') : (activeSamConfig?.colorSell || '#ff5252'),
+                shape: isCall ? 'arrowUp' : 'arrowDown',
+                text: signalLabel,
+              });
+
+              const newTrade: Trade = {
+                id: `${curr.time}-SAM21-${isCall ? 'CALL' : 'PUT'}`,
+                type: isCall ? 'LONG' : 'SHORT',
+                signal: signalLabel,
+                strategyFamily: 'SAM_SIGNALS',
+                entryTime: curr.time as number,
+                entryPrice: entry,
+                stoploss,
+                target: isCall ? Number((entry + profSlDist * 3).toFixed(2)) : Number((entry - profSlDist * 3).toFixed(2)),
+                riskDist: profSlDist,
+                peakPrice: entry,
+                trailStage: 0,
+                status: 'OPEN',
+                entryBarIdx: i,
+                signalBarIdx: i,
+                samExitProfile: exitProfile,
+                samBeTriggerPts: beTriggerPts,
+                samChandelierDistPts: chandelierDistPts,
+                samIgnoreOppositeExit: true,
+                samNoFixedTp: true,
+                samEodExitMin: 925, // 15:25 IST
+              };
+              openTrades.push(newTrade);
+              allTrades.push(newTrade);
+            } else if (entryTiming === 'bar1Open') {
               // Signal detected on candle i. Entry executes on next candle open (Bar + 1).
               if (samSignalsResult.callSignals[i]) {
-                pendingSamSignal = { type: 'LONG', signalBarIdx: i, signalTime: curr.time as number };
+                const isCb = activeSamConfig?.circuitBreakerEnabled && (curr.time as number) < longCooldownUntil;
+                const isWhip = activeSamConfig?.antiWhipsawEnabled && lastLossType === 'SHORT' && ((curr.time as number) - lastLossTime) < ((activeSamConfig?.antiWhipsawMinutes ?? 10) * 60);
+                if (isCb) {
+                  cbFilteredCount++;
+                  markers.push({
+                    time: curr.time,
+                    position: 'belowBar',
+                    color: '#F59E0B',
+                    shape: 'circle',
+                    text: 'SAM CALL (Filtered: Circuit Breaker Long Cooldown ⏸️)'
+                  });
+                } else if (isWhip) {
+                  antiWhipFilteredCount++;
+                  markers.push({
+                    time: curr.time,
+                    position: 'belowBar',
+                    color: '#8B5CF6',
+                    shape: 'circle',
+                    text: 'SAM CALL (Filtered: Anti-Whipsaw Protection 🛡️)'
+                  });
+                } else {
+                  pendingSamSignal = { type: 'LONG', signalBarIdx: i, signalTime: curr.time as number };
+                }
               } else if (samSignalsResult.putSignals[i]) {
-                pendingSamSignal = { type: 'SHORT', signalBarIdx: i, signalTime: curr.time as number };
+                const isCb = activeSamConfig?.circuitBreakerEnabled && (curr.time as number) < shortCooldownUntil;
+                const isWhip = activeSamConfig?.antiWhipsawEnabled && lastLossType === 'LONG' && ((curr.time as number) - lastLossTime) < ((activeSamConfig?.antiWhipsawMinutes ?? 10) * 60);
+                if (isCb) {
+                  cbFilteredCount++;
+                  markers.push({
+                    time: curr.time,
+                    position: 'aboveBar',
+                    color: '#F59E0B',
+                    shape: 'circle',
+                    text: 'SAM PUT (Filtered: Circuit Breaker Short Cooldown ⏸️)'
+                  });
+                } else if (isWhip) {
+                  antiWhipFilteredCount++;
+                  markers.push({
+                    time: curr.time,
+                    position: 'aboveBar',
+                    color: '#8B5CF6',
+                    shape: 'circle',
+                    text: 'SAM PUT (Filtered: Anti-Whipsaw Protection 🛡️)'
+                  });
+                } else {
+                  pendingSamSignal = { type: 'SHORT', signalBarIdx: i, signalTime: curr.time as number };
+                }
               }
             } else {
               // bar1Close (Post-Adverse Filter Confirmed Entry) or bar0Close:
               // For bar1Close: Entry executes at the close of candle i (which is Bar + 1 close).
               // Stoploss & Target are calculated precisely from this Bar + 1 entry close price!
               if (samSignalsResult.callSignals[i]) {
-                markers.push({
-                  time: curr.time,
-                  position: 'belowBar',
-                  color: activeSamConfig?.colorBuy || '#2196f3',
-                  shape: 'arrowUp',
-                  text: entryTiming === 'bar1Close' ? 'SAM CALL (Entry: Bar+1 Close)' : 'SAM CALL'
-                });
-                const entry = curr.close;
-                const stoploss = Number((entry - slPts).toFixed(2));
-                const target = Number((entry + tpPts).toFixed(2));
-                const target2 = Number((entry + (tpPts * 2)).toFixed(2));
-                const newTrade: Trade = {
-                  id: `${curr.time}-SAM-CALL`,
-                  type: 'LONG',
-                  signal: entryTiming === 'bar1Close' ? 'SAM CALL (Bar+1 Close)' : 'SAM CALL',
-                  strategyFamily: 'SAM_SIGNALS',
-                  entryTime: curr.time as number,
-                  entryPrice: entry,
-                  stoploss: stoploss,
-                  target: target,
-                  target2: target2,
-                  riskDist: slPts,
-                  peakPrice: entry,
-                  trailStage: 0,
-                  status: 'OPEN',
-                  isComboTrade: false,
-                  entryBarIdx: i,
-                  signalBarIdx: entryTiming === 'bar1Close' ? i - 1 : i,
-                };
-                openTrades.push(newTrade);
-                allTrades.push(newTrade);
+                const isCb = activeSamConfig?.circuitBreakerEnabled && (curr.time as number) < longCooldownUntil;
+                const isWhip = activeSamConfig?.antiWhipsawEnabled && lastLossType === 'SHORT' && ((curr.time as number) - lastLossTime) < ((activeSamConfig?.antiWhipsawMinutes ?? 10) * 60);
+                if (isCb) {
+                  cbFilteredCount++;
+                  markers.push({
+                    time: curr.time,
+                    position: 'belowBar',
+                    color: '#F59E0B',
+                    shape: 'circle',
+                    text: 'SAM CALL (Filtered: Circuit Breaker Long Cooldown ⏸️)'
+                  });
+                } else if (isWhip) {
+                  antiWhipFilteredCount++;
+                  markers.push({
+                    time: curr.time,
+                    position: 'belowBar',
+                    color: '#8B5CF6',
+                    shape: 'circle',
+                    text: 'SAM CALL (Filtered: Anti-Whipsaw Protection 🛡️)'
+                  });
+                } else {
+                  markers.push({
+                    time: curr.time,
+                    position: 'belowBar',
+                    color: activeSamConfig?.colorBuy || '#2196f3',
+                    shape: 'arrowUp',
+                    text: entryTiming === 'bar1Close' ? 'SAM CALL (Entry: Bar+1 Close)' : 'SAM CALL'
+                  });
+                  const entry = curr.close;
+                  const stoploss = Number((entry - slPts).toFixed(2));
+                  const target = Number((entry + tpPts).toFixed(2));
+                  const target2 = Number((entry + (tpPts * 2)).toFixed(2));
+                  const newTrade: Trade = {
+                    id: `${curr.time}-SAM-CALL`,
+                    type: 'LONG',
+                    signal: entryTiming === 'bar1Close' ? 'SAM CALL (Bar+1 Close)' : 'SAM CALL',
+                    strategyFamily: 'SAM_SIGNALS',
+                    entryTime: curr.time as number,
+                    entryPrice: entry,
+                    stoploss: stoploss,
+                    target: target,
+                    target2: target2,
+                    riskDist: slPts,
+                    peakPrice: entry,
+                    trailStage: 0,
+                    status: 'OPEN',
+                    entryBarIdx: i,
+                    signalBarIdx: entryTiming === 'bar1Close' ? i - 1 : i,
+                  };
+                  openTrades.push(newTrade);
+                  allTrades.push(newTrade);
+                }
               } else if (samSignalsResult.putSignals[i]) {
-                markers.push({
-                  time: curr.time,
-                  position: 'aboveBar',
-                  color: activeSamConfig?.colorSell || '#ff5252',
-                  shape: 'arrowDown',
-                  text: entryTiming === 'bar1Close' ? 'SAM PUT (Entry: Bar+1 Close)' : 'SAM PUT'
-                });
-                const entry = curr.close;
-                const stoploss = Number((entry + slPts).toFixed(2));
-                const target = Number((entry - tpPts).toFixed(2));
-                const target2 = Number((entry - (tpPts * 2)).toFixed(2));
-                const newTrade: Trade = {
-                  id: `${curr.time}-SAM-PUT`,
-                  type: 'SHORT',
-                  signal: entryTiming === 'bar1Close' ? 'SAM PUT (Bar+1 Close)' : 'SAM PUT',
-                  strategyFamily: 'SAM_SIGNALS',
-                  entryTime: curr.time as number,
-                  entryPrice: entry,
-                  stoploss: stoploss,
-                  target: target,
-                  target2: target2,
-                  riskDist: slPts,
-                  peakPrice: entry,
-                  trailStage: 0,
-                  status: 'OPEN',
-                  isComboTrade: false,
-                  entryBarIdx: i,
-                  signalBarIdx: entryTiming === 'bar1Close' ? i - 1 : i,
-                };
-                openTrades.push(newTrade);
-                allTrades.push(newTrade);
+                const isCb = activeSamConfig?.circuitBreakerEnabled && (curr.time as number) < shortCooldownUntil;
+                const isWhip = activeSamConfig?.antiWhipsawEnabled && lastLossType === 'LONG' && ((curr.time as number) - lastLossTime) < ((activeSamConfig?.antiWhipsawMinutes ?? 10) * 60);
+                if (isCb) {
+                  cbFilteredCount++;
+                  markers.push({
+                    time: curr.time,
+                    position: 'aboveBar',
+                    color: '#F59E0B',
+                    shape: 'circle',
+                    text: 'SAM PUT (Filtered: Circuit Breaker Short Cooldown ⏸️)'
+                  });
+                } else if (isWhip) {
+                  antiWhipFilteredCount++;
+                  markers.push({
+                    time: curr.time,
+                    position: 'aboveBar',
+                    color: '#8B5CF6',
+                    shape: 'circle',
+                    text: 'SAM PUT (Filtered: Anti-Whipsaw Protection 🛡️)'
+                  });
+                } else {
+                  markers.push({
+                    time: curr.time,
+                    position: 'aboveBar',
+                    color: activeSamConfig?.colorSell || '#ff5252',
+                    shape: 'arrowDown',
+                    text: entryTiming === 'bar1Close' ? 'SAM PUT (Entry: Bar+1 Close)' : 'SAM PUT'
+                  });
+                  const entry = curr.close;
+                  const stoploss = Number((entry + slPts).toFixed(2));
+                  const target = Number((entry - tpPts).toFixed(2));
+                  const target2 = Number((entry - (tpPts * 2)).toFixed(2));
+                  const newTrade: Trade = {
+                    id: `${curr.time}-SAM-PUT`,
+                    type: 'SHORT',
+                    signal: entryTiming === 'bar1Close' ? 'SAM PUT (Bar+1 Close)' : 'SAM PUT',
+                    strategyFamily: 'SAM_SIGNALS',
+                    entryTime: curr.time as number,
+                    entryPrice: entry,
+                    stoploss: stoploss,
+                    target: target,
+                    target2: target2,
+                    riskDist: slPts,
+                    peakPrice: entry,
+                    trailStage: 0,
+                    status: 'OPEN',
+                    entryBarIdx: i,
+                    signalBarIdx: entryTiming === 'bar1Close' ? i - 1 : i,
+                  };
+                  openTrades.push(newTrade);
+                  allTrades.push(newTrade);
+                }
               }
             }
           }
@@ -2638,6 +2263,19 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
      }
 
     // Candidate indicators: If a candidate setup formed on the latest closed candle, track pending confirmation state
+    let nextPendingSetup: {
+      type: 'CALL' | 'PUT';
+      time?: number;
+      setupBarTime: number;
+      setupBarClose: number;
+      currentBar1Price: number;
+      estEntry: number;
+      estSL: number;
+      estTP: number;
+      estTP2: number;
+      formingTime?: number;
+    } | null = null;
+
     if (activeStrategies.samSignals && (activeSamConfig?.entryTiming ?? 'bar1Close') === 'bar1Close') {
       const lastIdx = candles.length - 1;
       const lastC = candles[lastIdx];
@@ -2646,7 +2284,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       const slPts = activeSamConfig?.stopLossPoints ?? 20;
       const tpPts = activeSamConfig?.targetPoints ?? 60;
       if (lastC && !hasActiveTrade && samSignalsResult.candidateCallSignals?.[lastIdx] && !samSignalsResult.callSignals[lastIdx]) {
-        setPendingSamSetup({
+        nextPendingSetup = {
           type: 'CALL',
           time: lastC.time as number,
           setupBarTime: lastC.time as number,
@@ -2657,9 +2295,9 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
           estTP: Number((currentPrice + tpPts).toFixed(2)),
           estTP2: Number((currentPrice + (tpPts * 2)).toFixed(2)),
           formingTime: (lastC.time as number) + (timeframe * 60),
-        });
+        };
       } else if (lastC && !hasActiveTrade && samSignalsResult.candidatePutSignals?.[lastIdx] && !samSignalsResult.putSignals[lastIdx]) {
-        setPendingSamSetup({
+        nextPendingSetup = {
           type: 'PUT',
           time: lastC.time as number,
           setupBarTime: lastC.time as number,
@@ -2670,13 +2308,10 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
           estTP: Number((currentPrice - tpPts).toFixed(2)),
           estTP2: Number((currentPrice - (tpPts * 2)).toFixed(2)),
           formingTime: (lastC.time as number) + (timeframe * 60),
-        });
-      } else {
-        setPendingSamSetup(null);
+        };
       }
-    } else {
-      setPendingSamSetup(null);
     }
+    setPendingSamSetup(nextPendingSetup);
 
     // Failsafe: If a pending signal occurred on the very last candle for bar1Open, show status indicator
     if (pendingSamSignal && activeStrategies.samSignals) {
@@ -2717,33 +2352,26 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     openTrades.length = 0;
 
     setComparisonStats({
-      rawTotal,
-      rawWins,
-      rawLosses,
-      rawWinRate,
-      rawNetPnL,
       filteredCount: activeStrategies.samSignals
-        ? (samSignalsResult.wickFilteredCount || 0) + (samSignalsResult.bar1FilteredCount || 0) + (samSignalsResult.vwapFilteredCount || 0) + (samSignalsResult.minBodyFilteredCount || 0) + (samSignalsResult.mtfEmaFilteredCount || 0) + (samSignalsResult.dayTrapFilteredCount || 0)
-        : suppressedTrades,
-      exhaustionFiltered,
-      rsiFiltered,
-      wickFiltered: activeStrategies.samSignals ? (samSignalsResult.wickFilteredCount || 0) : wickFiltered,
+        ? (samSignalsResult.wickFilteredCount || 0) + (samSignalsResult.bar1FilteredCount || 0) + (samSignalsResult.vwapFilteredCount || 0) + (samSignalsResult.minBodyFilteredCount || 0) + (samSignalsResult.mtfEmaFilteredCount || 0) + (samSignalsResult.dayTrapFilteredCount || 0) + (samSignalsResult.adaptiveFilteredCount || 0) + (samSignalsResult.s12FilteredCount || 0) + cbFilteredCount + antiWhipFilteredCount
+        : 0,
+      wickFiltered: activeStrategies.samSignals ? (samSignalsResult.wickFilteredCount || 0) : 0,
       bar1Filtered: activeStrategies.samSignals ? (samSignalsResult.bar1FilteredCount || 0) : 0,
-      vwapFiltered: activeStrategies.samSignals ? (samSignalsResult.vwapFilteredCount || 0) : vwapFiltered,
+      vwapFiltered: activeStrategies.samSignals ? (samSignalsResult.vwapFilteredCount || 0) : 0,
       minBodyFiltered: activeStrategies.samSignals ? (samSignalsResult.minBodyFilteredCount || 0) : 0,
       mtfEmaFiltered: activeStrategies.samSignals ? (samSignalsResult.mtfEmaFilteredCount || 0) : 0,
       dayTrapFiltered: activeStrategies.samSignals ? (samSignalsResult.dayTrapFilteredCount || 0) : 0,
-      volumeFiltered,
-      trendFiltered,
-      boxFiltered: 0,
-      adxFiltered: chopFiltered,
-      openingFiltered,
+      adaptiveRegimeFiltered: activeStrategies.samSignals ? (samSignalsResult.adaptiveFilteredCount || 0) : 0,
+      circuitBreakerFiltered: activeStrategies.samSignals ? cbFilteredCount : 0,
+      antiWhipsawFiltered: activeStrategies.samSignals ? antiWhipFilteredCount : 0,
+      s12Filtered: activeStrategies.samSignals ? (samSignalsResult.s12FilteredCount || 0) : 0,
+      sam21AfternoonSignals: activeStrategies.samSignals ? (samSignalsResult.sam21AfternoonSignalCount || 0) : 0,
+      sam21OpenDriveSignals: activeStrategies.samSignals ? (samSignalsResult.sam21OpenDriveSignalCount || 0) : 0,
+      dailyDrawdownHalted,
+      currentRegimeState: samSignalsResult.regimeState?.[candles.length - 1] || 'RANGE',
+      circuitBreakerActive: (longCooldownUntil > (candles[candles.length - 1]?.time as number)) || (shortCooldownUntil > (candles[candles.length - 1]?.time as number)),
       beSavedCount,
-      profitTradesFiltered,
-      lossTradesFiltered,
     });
-
-    setFilteredCount(suppressedTrades);
     if (!isDisposedRef.current && series) {
       try {
         markers.sort((a, b) => Number(a.time) - Number(b.time));
@@ -2752,8 +2380,131 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         if (e?.message?.includes('disposed')) return;
       }
     }
-    const decoratedTrades = allTrades.map(t => decorateTradeWithOptionData(t, optionSnapshotsRef.current));
+    const candleByTime = new Map<number, { open: number; high: number; low: number; close: number }>();
+    for (const c of candles) {
+      candleByTime.set(Number(c.time), { open: c.open, high: c.high, low: c.low, close: c.close });
+    }
+    const decoratedTrades = allTrades.map(t => {
+      const exitSpotBar = t.exitTime ? candleByTime.get(t.exitTime) : undefined;
+      return decorateTradeWithOptionData(
+        { ...t, timeframeMin: timeframe, exitSpotBar },
+        optionSnapshotsRef.current,
+        resolvedOptionMapRef.current,
+        timeframe
+      );
+    });
     setBacktestTrades([...decoratedTrades].reverse());
+
+    hasActiveLiveTradeOrSetupRef.current =
+      decoratedTrades.some(t => t.status === 'OPEN') || Boolean(nextPendingSetup);
+
+    // Real-time trade transition detection (strictly silent on initial load or config/timeframe change)
+    const alertSignature = `${instrument}|${timeframe}|${JSON.stringify(activeStrategies)}|${JSON.stringify(activeSamConfig)}`;
+    if (lastAlertSignatureRef.current !== alertSignature) {
+      lastAlertSignatureRef.current = alertSignature;
+      const seeded = new Map<string, string>();
+      for (const t of decoratedTrades) {
+        seeded.set(t.id, t.status);
+      }
+      seenTradeStatusRef.current = seeded;
+      seenPendingKeyRef.current = nextPendingSetup
+        ? `PENDING:SAM:${nextPendingSetup.setupBarTime}:${nextPendingSetup.type}`
+        : '';
+    } else {
+      const maxAgeMin = Math.max(timeframe * 2, 5);
+      const nowMs = Date.now();
+
+      const dispatchLiveNotification = (ev: TradeNotificationEvent) => {
+        onTradeNotificationRef.current?.(ev);
+        fetch('/api/notifications/emit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(ev),
+        }).catch(() => {});
+      };
+
+      for (const t of decoratedTrades) {
+        const prevStatus = seenTradeStatusRef.current.get(t.id);
+        const dir: 'CALL' | 'PUT' = t.type === 'LONG' ? 'CALL' : 'PUT';
+        const optType: 'CE' | 'PE' = dir === 'CALL' ? 'CE' : 'PE';
+        const stratKey = t.strategyFamily === 'SAM_SIGNALS' ? 'SAM' : (t.strategyFamily || 'CHART');
+
+        if (!prevStatus) {
+          seenTradeStatusRef.current.set(t.id, t.status);
+          if (isFreshLiveCandleTime(t.entryTime, nowMs, maxAgeMin)) {
+            dispatchLiveNotification({
+              id: `OPEN:${stratKey}:${t.entryTime}:${dir}`,
+              kind: 'TRADE_OPENED',
+              direction: dir,
+              signal: t.signal || `${stratKey} ${dir}`,
+              source: 'LIVE_CHART',
+              timestamp: nowMs,
+              candleTimeSec: t.entryTime,
+              entryPrice: Number(t.entryPrice.toFixed(2)),
+              stoploss: Number.isFinite(t.stoploss) ? Number(t.stoploss.toFixed(2)) : undefined,
+              target: Number.isFinite(t.target) ? Number(t.target.toFixed(2)) : undefined,
+              status: 'OPEN',
+              optionStrike: t.optionStrike ?? Math.round(t.entryPrice / 50) * 50,
+              optionType: t.optionType ?? optType,
+              optionEntryPremium: t.optionEntryPremium,
+              message: `${timeframe}m Candle Close Confirmation`,
+            });
+          }
+        } else if (prevStatus === 'OPEN' && t.status !== 'OPEN') {
+          seenTradeStatusRef.current.set(t.id, t.status);
+          if (isFreshLiveCandleTime(t.exitTime ?? t.entryTime, nowMs, maxAgeMin)) {
+            dispatchLiveNotification({
+              id: `CLOSE:${t.id}:${t.exitTime ?? 'EXIT'}`,
+              kind: 'TRADE_CLOSED',
+              direction: dir,
+              signal: t.signal || `${stratKey} ${dir}`,
+              source: 'LIVE_CHART',
+              timestamp: nowMs,
+              candleTimeSec: t.exitTime ?? t.entryTime,
+              entryPrice: Number(t.entryPrice.toFixed(2)),
+              exitPrice: t.exitPrice !== undefined ? Number(t.exitPrice.toFixed(2)) : undefined,
+              exitReason: t.exitReason || t.status,
+              status: t.status,
+              spotPnl: t.pnl !== undefined ? Number(t.pnl.toFixed(2)) : undefined,
+              optionStrike: t.optionStrike ?? Math.round(t.entryPrice / 50) * 50,
+              optionType: t.optionType ?? optType,
+              optionEntryPremium: t.optionEntryPremium,
+              optionExitPremium: t.optionExitPremium,
+              premiumPnl: t.premiumPnl,
+              lotPnl: t.lotPnl,
+            });
+          }
+        } else if (prevStatus !== t.status) {
+          seenTradeStatusRef.current.set(t.id, t.status);
+        }
+      }
+
+      if (nextPendingSetup) {
+        const pendingKey = `PENDING:SAM:${nextPendingSetup.setupBarTime}:${nextPendingSetup.type}`;
+        if (seenPendingKeyRef.current !== pendingKey) {
+          seenPendingKeyRef.current = pendingKey;
+          if (isFreshLiveCandleTime(nextPendingSetup.setupBarTime, nowMs, maxAgeMin)) {
+            dispatchLiveNotification({
+              id: pendingKey,
+              kind: 'SETUP_PENDING',
+              direction: nextPendingSetup.type,
+              signal: `SAM ${nextPendingSetup.type} Setup (Bar 0 Closed)`,
+              source: 'LIVE_CHART',
+              timestamp: nowMs,
+              candleTimeSec: nextPendingSetup.setupBarTime,
+              entryPrice: Number(nextPendingSetup.estEntry.toFixed(2)),
+              stoploss: nextPendingSetup.estSL,
+              target: nextPendingSetup.estTP,
+              optionStrike: Math.round(nextPendingSetup.estEntry / 50) * 50,
+              optionType: nextPendingSetup.type === 'CALL' ? 'CE' : 'PE',
+              message: `Bar 0 closed at ${nextPendingSetup.setupBarClose.toFixed(2)} • Awaiting Bar+1`,
+            });
+          }
+        }
+      } else {
+        seenPendingKeyRef.current = '';
+      }
+    }
   };
 
   const formatDate = (ts?: number) => {
@@ -2826,8 +2577,16 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
   const dayEndSquareOffs = displayedTrades.filter(t => t.exitReason === 'DAY_END').length;
   const winRate = (wins + losses) > 0 ? ((wins / (wins + losses)) * 100).toFixed(1) : '0.0';
   const totalNetPnL = displayedTrades.reduce((acc, t) => acc + (t.pnl || 0), 0);
-  const totalNetPremPnL = displayedTrades.reduce((acc, t) => acc + (t.premiumPnl || 0), 0);
-  const totalLotPnL = totalNetPremPnL * LOT_SIZE;
+  const realOptionTrades = displayedTrades.filter(
+    t => t.premiumPnl !== undefined && t.optionDataSource && t.optionDataSource !== 'UNAVAILABLE'
+  );
+  const optionDataCoverage = realOptionTrades.length;
+  const totalNetPremPnL = Number(
+    realOptionTrades.reduce((acc, t) => acc + (t.premiumPnl || 0), 0).toFixed(2)
+  );
+  const totalLotPnL = Number(
+    realOptionTrades.reduce((acc, t) => acc + (t.lotPnl || 0), 0).toFixed(2)
+  );
   const profitFactor = (() => {
     const grossProfit = displayedTrades.filter(t => (t.pnl || 0) > 0).reduce((acc, t) => acc + (t.pnl || 0), 0);
     const grossLoss = Math.abs(displayedTrades.filter(t => (t.pnl || 0) < 0).reduce((acc, t) => acc + (t.pnl || 0), 0));
@@ -2854,7 +2613,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
     const headers = [
       'Trade #', 'Date', 'Time', 'Strategy/Signal', 'Type', 'Entry Spot', 'Stoploss Spot', 
       'Target Spot', 'Target 2 Spot', 'Exit Time', 'Duration', 'Exit Reason', 'Status', 
-      'Spot PnL (pts)', 'Option Contract', 'Option Delta', 'Entry Prem (₹)', 'Exit Prem (₹)', 
+      'Spot PnL (pts)', 'Option Contract', 'Option Expiry', 'Option Source', 'Option Delta', 'Entry Prem (₹)', 'Exit Prem (₹)', 
       'Prem PnL (pts)', '1 Lot PnL (65 Qty)'
     ];
 
@@ -2874,6 +2633,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
       t.status || '',
       t.pnl !== undefined ? t.pnl.toFixed(2) : '',
       t.optionStrike ? `"${t.optionStrike} ${t.optionType}"` : '',
+      t.optionExpiry || '',
+      t.optionDataSource || 'UNAVAILABLE',
       t.optionDelta !== undefined ? t.optionDelta.toFixed(2) : '',
       t.optionEntryPremium !== undefined ? t.optionEntryPremium.toFixed(2) : '',
       t.optionExitPremium !== undefined ? t.optionExitPremium.toFixed(2) : '',
@@ -2968,215 +2729,22 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
         <div className="bg-[#0A0F1C] border-b border-[#1F2937] px-3 sm:px-4 py-2 sm:py-2.5 text-xs font-medium text-gray-300 shrink-0 w-full">
 
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-2.5 w-full">
-              {/* Primary Strategy Controls Strip (T3 Striped + AlphaTrend + Settings Button + ADX Filter) */}
+              {/* Active Strategy Controls Strip (SAM Signals + MACD Adaptive SuperTrend + Settings) */}
               <div className="flex items-center gap-2 sm:gap-2.5 overflow-x-auto pb-1 sm:pb-0 touch-pan-x whitespace-nowrap scrollbar-thin w-full lg:w-auto">
-                {/* T3 Striped [Loxx] Strategy Control with Quick Tuners */}
+                {/* MACD + Adaptive SuperTrend Toggle */}
                 <div className="flex items-center gap-2 bg-[#111827] px-2.5 sm:px-3 py-1.5 rounded-lg border border-[#1F2937] shrink-0">
-                  <label className="flex items-center gap-1.5 cursor-pointer text-white font-semibold">
+                  <label className="flex items-center gap-1.5 cursor-pointer text-white font-semibold" title="NIFTY MACD + Adaptive SuperTrend Strategy">
                     <input 
                       type="checkbox" 
-                      checked={strategies.t3Striped} 
-                      onChange={e => setStrategies(s => ({...s, t3Striped: e.target.checked}))} 
-                      className="accent-brand-blue cursor-pointer" 
+                      checked={strategies.macdAdaptiveSupertrend} 
+                      onChange={e => setStrategies(s => ({...s, macdAdaptiveSupertrend: e.target.checked}))} 
+                      className="accent-purple-400 cursor-pointer" 
                     />
                     <span className="flex items-center gap-1.5 whitespace-nowrap">
-                      <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                      <span>T3 Striped</span>
+                      <span className="w-2 h-2 rounded-full bg-purple-400"></span>
+                      <span className="text-purple-300">MACD + ST</span>
                     </span>
                   </label>
-                  <div className="h-3 w-px bg-gray-700"></div>
-                  <div className="flex items-center gap-1 text-gray-400 text-xs">
-                    <span>Len:</span>
-                    <select
-                      value={t3Config.period}
-                      onChange={e => setT3Config(c => ({ ...c, period: Number(e.target.value) }))}
-                      disabled={!strategies.t3Striped}
-                      className="bg-[#0A0F1C] border border-[#374151] rounded px-1.5 py-0.5 text-xs text-amber-300 font-mono focus:outline-none disabled:opacity-40 cursor-pointer"
-                      title="Smoothing period: 21 is calibrated for Nifty 1m to eliminate 14-period jitter"
-                    >
-                      <option value={14}>14 (Noisy)</option>
-                      <option value={18}>18</option>
-                      <option value={21}>21 (Nifty Opt ⭐)</option>
-                      <option value={24}>24 (Smooth)</option>
-                    </select>
-                  </div>
-                  <div className="flex items-center gap-1 text-gray-400 text-xs">
-                    <span>Hot:</span>
-                    <select
-                      value={t3Config.hot}
-                      onChange={e => setT3Config(c => ({ ...c, hot: Number(e.target.value) }))}
-                      disabled={!strategies.t3Striped}
-                      className="bg-[#0A0F1C] border border-[#374151] rounded px-1.5 py-0.5 text-xs text-cyan-300 font-mono focus:outline-none disabled:opacity-40 cursor-pointer"
-                      title="Tillson volume factor: 0.55 prevents excessive overshoot whipsaws on 1m bars"
-                    >
-                      <option value={0.50}>0.50</option>
-                      <option value={0.55}>0.55 (Nifty Opt ⭐)</option>
-                      <option value={0.60}>0.60</option>
-                      <option value={0.70}>0.70 (Aggressive)</option>
-                    </select>
-                  </div>
-                  <button
-                    onClick={() => setT3Config(c => ({ ...c, volumeConfirm: !c.volumeConfirm }))}
-                    disabled={!strategies.t3Striped}
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
-                      t3Config.volumeConfirm
-                        ? 'bg-emerald-950/60 border-emerald-500/50 text-emerald-300'
-                        : 'bg-[#0A0F1C] border-gray-700 text-gray-500'
-                    }`}
-                    title={t3Config.volumeConfirm ? "T3 Volume confirmation ACTIVE (>= 0.85x Vol SMA required for cross)" : "T3 Volume confirmation disabled"}
-                  >
-                    Vol
-                  </button>
-                  <button
-                    onClick={() => setShowStrategySettingsModal('T3')}
-                    className="px-1.5 py-0.5 rounded text-[11px] bg-[#1F2937] hover:bg-[#374151] text-gray-300 hover:text-white transition-colors flex items-center gap-1 cursor-pointer"
-                    title="Configure advanced T3 parameters (Ribbon filter, TP1/TP2, SL)"
-                  >
-                    <span>⚙️</span>
-                  </button>
-                </div>
-
-                {/* AlphaTrend Strategy Control with Quick Tuners */}
-                <div className="flex items-center gap-2 bg-[#111827] px-2.5 sm:px-3 py-1.5 rounded-lg border border-[#1F2937] shrink-0">
-                  <label className="flex items-center gap-1.5 cursor-pointer text-white font-semibold">
-                    <input 
-                      type="checkbox" 
-                      checked={strategies.alphaTrend} 
-                      onChange={e => setStrategies(s => ({...s, alphaTrend: e.target.checked}))} 
-                      className="accent-brand-blue cursor-pointer" 
-                    />
-                    <span className="flex items-center gap-1.5 whitespace-nowrap">
-                      <span className="w-2 h-2 rounded-full bg-blue-500"></span>
-                      <span>AlphaTrend</span>
-                    </span>
-                  </label>
-                  <div className="h-3 w-px bg-gray-700"></div>
-                  <div className="flex items-center gap-1 text-gray-400 text-xs">
-                    <span>Coeff:</span>
-                    <select
-                      value={alphaTrendConfig.coeff}
-                      onChange={e => setAlphaTrendConfig(c => ({ ...c, coeff: Number(e.target.value) }))}
-                      disabled={!strategies.alphaTrend}
-                      className="bg-[#0A0F1C] border border-[#374151] rounded px-1.5 py-0.5 text-xs text-emerald-400 font-mono focus:outline-none disabled:opacity-40 cursor-pointer"
-                      title="ATR Multiplier: 1.6 prevents 1-min micro-wick whipsaws while catching real breakout trends"
-                    >
-                      <option value={1.0}>1.0 (Old / Tight ⚠️)</option>
-                      <option value={1.4}>1.4</option>
-                      <option value={1.6}>1.6 (Nifty Opt ⭐)</option>
-                      <option value={1.8}>1.8 (Conservative)</option>
-                      <option value={2.0}>2.0 (Strict)</option>
-                    </select>
-                  </div>
-                  <div className="flex items-center gap-1 text-gray-400 text-xs">
-                    <span>Len:</span>
-                    <select
-                      value={alphaTrendConfig.period}
-                      onChange={e => setAlphaTrendConfig(c => ({ ...c, period: Number(e.target.value) }))}
-                      disabled={!strategies.alphaTrend}
-                      className="bg-[#0A0F1C] border border-[#374151] rounded px-1.5 py-0.5 text-xs text-purple-300 font-mono focus:outline-none disabled:opacity-40 cursor-pointer"
-                      title="AlphaTrend period: 18 aligns with Nifty 1m sub-cycle structure"
-                    >
-                      <option value={14}>14 (Standard)</option>
-                      <option value={16}>16</option>
-                      <option value={18}>18 (Nifty Opt ⭐)</option>
-                      <option value={20}>20</option>
-                    </select>
-                  </div>
-                  <button
-                    onClick={() => setAlphaTrendConfig(c => ({ ...c, useRsi: !c.useRsi }))}
-                    disabled={!strategies.alphaTrend}
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
-                      !alphaTrendConfig.useRsi
-                        ? 'bg-blue-950/70 border-blue-500/60 text-blue-300'
-                        : 'bg-[#0A0F1C] border-gray-700 text-gray-400'
-                    }`}
-                    title={!alphaTrendConfig.useRsi ? "MFI Upstox Volume Mode ACTIVE (Click to toggle RSI)" : "RSI Mode (Click for Upstox Volume MFI)"}
-                  >
-                    {!alphaTrendConfig.useRsi ? "MFI(Vol)" : "RSI"}
-                  </button>
-                  <button
-                    onClick={() => setShowStrategySettingsModal('ALPHATREND')}
-                    className="px-1.5 py-0.5 rounded text-[11px] bg-[#1F2937] hover:bg-[#374151] text-gray-300 hover:text-white transition-colors flex items-center gap-1 cursor-pointer"
-                    title="Configure advanced AlphaTrend parameters (RSI/MFI mode, Candle confirm, TP1/TP2, SL)"
-                  >
-                    <span>⚙️</span>
-                  </button>
-                </div>
-
-                {/* COMBO STRATEGY (T3 Striped + AlphaTrend): Filtered & Unfiltered Controls */}
-                <div className="flex items-center gap-2 bg-[#111827] px-2.5 sm:px-3 py-1.5 rounded-lg border border-[#1F2937] shrink-0">
-                  <div className="flex items-center gap-2.5">
-                    {/* Filtered Combo Toggle */}
-                    <label className="flex items-center gap-1.5 cursor-pointer text-white font-semibold" title="T3 Striped + AlphaTrend Filtered (Volume, Candle, Spread & 50 EMA Confirmed)">
-                      <input 
-                        type="checkbox" 
-                        checked={strategies.comboFiltered} 
-                        onChange={e => setStrategies(s => ({...s, comboFiltered: e.target.checked}))} 
-                        className="accent-emerald-400 cursor-pointer" 
-                      />
-                      <span className="flex items-center gap-1.5 whitespace-nowrap">
-                        <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                        <span className="text-emerald-400">Filtered</span>
-                      </span>
-                    </label>
-
-                    <div className="h-3 w-px bg-gray-700"></div>
-
-                    {/* Unfiltered Combo Toggle */}
-                    <label className="flex items-center gap-1.5 cursor-pointer text-white font-semibold" title="T3 Striped + AlphaTrend Unfiltered (Raw Confluence)">
-                      <input 
-                        type="checkbox" 
-                        checked={strategies.comboUnfiltered} 
-                        onChange={e => setStrategies(s => ({...s, comboUnfiltered: e.target.checked}))} 
-                        className="accent-cyan-400 cursor-pointer" 
-                      />
-                      <span className="flex items-center gap-1.5 whitespace-nowrap">
-                        <span className="w-2 h-2 rounded-full bg-cyan-400"></span>
-                        <span className="text-cyan-300">Unfiltered</span>
-                      </span>
-                    </label>
-
-                    <div className="h-3 w-px bg-gray-700"></div>
-
-                    {/* MACD + Adaptive SuperTrend Toggle */}
-                    <label className="flex items-center gap-1.5 cursor-pointer text-white font-semibold" title="NIFTY MACD + Adaptive SuperTrend Strategy">
-                      <input 
-                        type="checkbox" 
-                        checked={strategies.macdAdaptiveSupertrend} 
-                        onChange={e => setStrategies(s => ({...s, macdAdaptiveSupertrend: e.target.checked}))} 
-                        className="accent-purple-400 cursor-pointer" 
-                      />
-                      <span className="flex items-center gap-1.5 whitespace-nowrap">
-                        <span className="w-2 h-2 rounded-full bg-purple-400"></span>
-                        <span className="text-purple-300">MACD + ST</span>
-                      </span>
-                    </label>
-                  </div>
-
-                  <div className="h-3 w-px bg-gray-700"></div>
-
-                  {/* Max Time for Trade Selector (30 mins, 1 hour, 2 hours) */}
-                  <div className="flex items-center gap-1 text-gray-400 text-xs">
-                    <span title="Maximum allowed time for each trade before auto time exit (30m, 1h, 2h)">⏱️ Max:</span>
-                    <select
-                      value={comboConfig.maxTradeDurationMinutes}
-                      onChange={e => setComboConfig(c => ({ ...c, maxTradeDurationMinutes: Number(e.target.value) as 30 | 60 | 120 }))}
-                      className="bg-[#0A0F1C] border border-[#374151] rounded px-1.5 py-0.5 text-xs text-amber-300 font-mono focus:outline-none cursor-pointer font-bold"
-                      title="Select maximum trade duration (Special Condition: 30 minutes, 1 hour, or 2 hours)"
-                    >
-                      <option value={30}>30m</option>
-                      <option value={60}>1h</option>
-                      <option value={120}>2h</option>
-                    </select>
-                  </div>
-
-                  <button
-                    onClick={() => setShowStrategySettingsModal('COMBO')}
-                    className="px-1.5 py-0.5 rounded text-[11px] bg-[#1F2937] hover:bg-[#374151] text-amber-300 hover:text-white transition-colors flex items-center gap-1 cursor-pointer font-medium"
-                    title="Configure Combo Strategy (Max Time: 30m/1h/2h, 1-Trade Rule, Targets, SL)"
-                  >
-                    <span>⚙️ Combo</span>
-                  </button>
                 </div>
 
                 {/* BEST SAM SIGNALS Strategy Control (dy26102001) */}
@@ -3348,6 +2916,52 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     {samConfig.filterDayTrapEnabled ? `DayTrap:ON` : `DayTrap:OFF`}
                   </button>
 
+                  <div className="h-3 w-px bg-gray-700"></div>
+
+                  {/* Quick S12 Confluence Filter toggle */}
+                  <button
+                    onClick={() => setSamConfig(c => ({ ...c, filterS12ConfluenceEnabled: !c.filterS12ConfluenceEnabled }))}
+                    disabled={!strategies.samSignals}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
+                      samConfig.filterS12ConfluenceEnabled
+                        ? 'bg-sky-950/70 border-sky-400/60 text-sky-300 shadow-sm'
+                        : 'bg-[#0A0F1C] border-gray-700 text-gray-500 hover:text-gray-300'
+                    }`}
+                    title={`S12 Confluence Filter: DI Spread > +${samConfig.s12DiSpreadMin ?? 5} + EMA ${samConfig.s12EmaFastPeriod ?? 100}/${samConfig.s12EmaSlowPeriod ?? 200} Alignment + RVOL >= ${samConfig.s12MinRvol ?? 0.7}`}
+                  >
+                    {samConfig.filterS12ConfluenceEnabled ? `S12:ON` : `S12:OFF`}
+                  </button>
+
+                  <div className="h-3 w-px bg-gray-700"></div>
+
+                  {/* Quick SAM 21/5 Afternoon (#3/#5) toggle */}
+                  <button
+                    onClick={() => setSamConfig(c => ({ ...c, filterSam21AfternoonEnabled: !c.filterSam21AfternoonEnabled }))}
+                    disabled={!strategies.samSignals}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
+                      samConfig.filterSam21AfternoonEnabled
+                        ? 'bg-emerald-950/70 border-emerald-400/60 text-emerald-300 shadow-sm'
+                        : 'bg-[#0A0F1C] border-gray-700 text-gray-500 hover:text-gray-300'
+                    }`}
+                    title="1m SAM(21/5) Afternoon Breakout (12:30–14:50 IST): PDH/PDL + 5m ADX >= 30 & DI Spread > 5 (#3 Fixed SL40/BE30/EOD or #5 Chandelier)"
+                  >
+                    {samConfig.filterSam21AfternoonEnabled ? `21/5 Aft:ON` : `21/5 Aft:OFF`}
+                  </button>
+
+                  {/* Quick SAM 21/5 Morning+Afternoon Combined (#1 + #3/#5) toggle */}
+                  <button
+                    onClick={() => setSamConfig(c => ({ ...c, filterSam21CombinedEnabled: !c.filterSam21CombinedEnabled }))}
+                    disabled={!strategies.samSignals}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
+                      samConfig.filterSam21CombinedEnabled
+                        ? 'bg-amber-950/70 border-amber-400/60 text-amber-300 shadow-sm'
+                        : 'bg-[#0A0F1C] border-gray-700 text-gray-500 hover:text-gray-300'
+                    }`}
+                    title="SAM(21/5) Morning + Afternoon Combined: 3m OpenDrive (09:20–10:30, PF 2.24) + 1m Afternoon (12:30–14:50, PF 1.83–1.91)"
+                  >
+                    {samConfig.filterSam21CombinedEnabled ? `21/5 Comb:ON` : `21/5 Comb:OFF`}
+                  </button>
+
                   <button
                     onClick={() => setShowStrategySettingsModal('SAM')}
                     className="px-1.5 py-0.5 rounded text-[11px] bg-[#1F2937] hover:bg-[#374151] text-blue-300 hover:text-white transition-colors flex items-center gap-1 cursor-pointer font-medium"
@@ -3359,93 +2973,14 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
 
                 {/* Dedicated Settings Button - ALWAYS Visible in vertical and horizontal modes */}
                 <button
-                  onClick={() => setShowStrategySettingsModal('ALPHATREND')}
+                  onClick={() => setShowStrategySettingsModal('SAM')}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-950/60 hover:bg-blue-900/80 border border-blue-600/40 text-blue-300 hover:text-white font-semibold text-xs transition-colors shrink-0 shadow-sm cursor-pointer whitespace-nowrap"
-                  title="Open Nifty Strategy Calibration & Settings"
+                  title="Open SAM Strategy Calibration & Settings"
                 >
                   <span className="text-sm">⚙️</span>
                   <span>Settings</span>
                 </button>
-
-                {/* ADX Chop Filter Control with Smart Directional Mode */}
-                <div className="flex items-center gap-2 sm:gap-3 bg-[#111827] px-2.5 sm:px-3 py-1.5 rounded-lg border border-[#1F2937] shrink-0">
-                  <label className="flex items-center gap-1.5 cursor-pointer text-white font-semibold whitespace-nowrap">
-                    <input 
-                      type="checkbox" 
-                      checked={adxChopFilter.enabled} 
-                      onChange={e => setAdxChopFilter(f => ({ ...f, enabled: e.target.checked }))} 
-                      className="accent-amber-400 cursor-pointer" 
-                    />
-                    <span className="flex items-center gap-1.5">
-                      <span className="w-2 h-2 rounded-full bg-amber-400"></span>
-                      <span>ADX Chop Filter</span>
-                    </span>
-                  </label>
-                  <span className="text-gray-600">|</span>
-                  <div className="flex items-center gap-1 text-gray-400 text-xs">
-                    <span>Mode:</span>
-                    <select
-                      value={adxChopFilter.mode}
-                      onChange={e => setAdxChopFilter(f => ({ ...f, mode: e.target.value as 'SMART' | 'CLASSIC' }))}
-                      disabled={!adxChopFilter.enabled}
-                      className="bg-[#0A0F1C] border border-[#374151] rounded px-1.5 py-0.5 text-xs text-emerald-400 font-medium focus:outline-none disabled:opacity-40 cursor-pointer"
-                    >
-                      <option value="SMART">🛡️ Smart</option>
-                      <option value="CLASSIC">🐢 Classic</option>
-                    </select>
-                  </div>
-                  <span className="text-gray-600">|</span>
-                  <div className="flex items-center gap-1 text-gray-400 text-xs">
-                    <span>&lt;</span>
-                    <select 
-                      value={adxChopFilter.threshold} 
-                      onChange={e => setAdxChopFilter(f => ({ ...f, threshold: Number(e.target.value) }))}
-                      disabled={!adxChopFilter.enabled}
-                      className="bg-[#0A0F1C] border border-[#374151] rounded px-1.5 py-0.5 text-xs text-amber-400 font-mono focus:outline-none disabled:opacity-40 cursor-pointer"
-                    >
-                      <option value={15}>15 (Mild)</option>
-                      <option value={18}>18 (Opt)</option>
-                      <option value={20}>20 (Std)</option>
-                      <option value={22}>22 (Cons)</option>
-                      <option value={25}>25 (Strict)</option>
-                    </select>
-                  </div>
-                </div>
               </div>
-
-              {/* Real-time ADX Status Badge */}
-              {currentAdx && (
-                <div className="flex items-center gap-2 shrink-0 flex-wrap">
-                  <div className={`px-2.5 py-1 rounded text-[11px] font-mono font-bold flex items-center gap-1.5 border ${
-                    currentAdx.isIgnition
-                      ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 shadow-sm'
-                      : currentAdx.isChoppy && adxChopFilter.enabled
-                      ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
-                      : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                  }`}>
-                    <span className={`w-2 h-2 rounded-full ${
-                      currentAdx.isIgnition 
-                        ? 'bg-emerald-400' 
-                        : currentAdx.isChoppy && adxChopFilter.enabled 
-                        ? 'bg-amber-400 animate-pulse' 
-                        : 'bg-emerald-400'
-                    }`}></span>
-                    <span>ADX: {currentAdx.value}</span>
-                    <span className="text-gray-400 font-normal">
-                      {currentAdx.isIgnition 
-                        ? '(🔥 Breakout Expansion - Active)' 
-                        : currentAdx.isChoppy && adxChopFilter.enabled 
-                        ? '(⚠️ Chop - Filtered)' 
-                        : '(📈 Trending - Active)'}
-                    </span>
-                  </div>
-                  {adxChopFilter.enabled && filteredCount > 0 && (
-                    <span className="text-[11px] font-mono text-amber-400/90 bg-amber-400/10 px-2 py-0.5 rounded border border-amber-400/20">
-                      {filteredCount} Filtered ({comparisonStats.profitTradesFiltered} Win / {comparisonStats.lossTradesFiltered} Loss)
-                    </span>
-                  )}
-                </div>
-              )}
             </div>
         </div>
       
@@ -3464,7 +2999,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
               <h3 className="text-sm font-bold text-white flex items-center gap-2">
                 <span>{`Backtest Dashboard (${instrument} ${timeframe}m)`}</span>
                 <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">
-                  {filterMode}
+                  SAM Zero-Repaint
                 </span>
               </h3>
 
@@ -3507,15 +3042,21 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                 onClick={() => setIsFiltersOpen(prev => !prev)}
                 className="px-2.5 py-1 text-xs font-semibold rounded bg-[#1F2937] hover:bg-[#374151] text-gray-200 transition-colors flex items-center gap-1.5 border border-[#374151] cursor-pointer"
               >
-                <span>⚙️ Filters ({
-                  (filterSettings.strictStoploss ? 1 : 0) +
-                  (filterSettings.breakevenTrail ? 1 : 0) +
-                  (filterSettings.openingRangeBuffer ? 1 : 0) +
-                  (filterSettings.trendAlignment ? 1 : 0) +
-                  (adxChopFilter.enabled ? 1 : 0) +
-                  (filterSettings.bodyConviction ? 1 : 0) +
-                  (filterSettings.exhaustionFilter ? 1 : 0) +
-                  (filterSettings.rsiMomentum ? 1 : 0)
+                <span>⚙️ SAM Filters ({
+                  (samConfig.adxFilterEnabled ? 1 : 0) +
+                  (samConfig.filterRejectionWickEnabled ? 1 : 0) +
+                  (samConfig.filterBar1AdverseCloseEnabled ? 1 : 0) +
+                  (samConfig.vwapFilterEnabled ? 1 : 0) +
+                  (samConfig.filterMinBodyEnabled ? 1 : 0) +
+                  (samConfig.filterMtfEmaEnabled ? 1 : 0) +
+                  (samConfig.filterDayTrapEnabled ? 1 : 0) +
+                  (samConfig.adaptiveRegimeEnabled ? 1 : 0) +
+                  (samConfig.circuitBreakerEnabled ? 1 : 0) +
+                  (samConfig.antiWhipsawEnabled ? 1 : 0) +
+                  (samConfig.maxDailyLossEnabled ? 1 : 0) +
+                  (samConfig.filterS12ConfluenceEnabled ? 1 : 0) +
+                  (samConfig.filterSam21AfternoonEnabled ? 1 : 0) +
+                  (samConfig.filterSam21CombinedEnabled ? 1 : 0)
                 } Active)</span>
                 <span className="text-[10px]">{isFiltersOpen ? '▲ Hide' : '▼ Show'}</span>
               </button>
@@ -3576,7 +3117,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                 >
                   All ({backtestTrades.length})
                 </button>
-                {availableTradeDates.slice(0, 5).map(d => (
+                {availableTradeDates.map(d => (
                   <button
                     key={d.dateKey}
                     type="button"
@@ -3691,17 +3232,41 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                 {(totalNetPnL >= 0 ? '+' : '') + totalNetPnL.toFixed(1)} pts
               </span>
             </div>
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1.5" title="Net option premium P&L strictly from real Option Chain History / Upstox 1-min option prices (exit premium minus entry premium)">
               <span className="text-cyan-400">Prem Net:</span>
-              <span className={`font-bold ${totalNetPremPnL >= 0 ? 'text-cyan-300' : 'text-red-400'}`}>
-                {(totalNetPremPnL >= 0 ? '+' : '') + totalNetPremPnL.toFixed(2)} pts
-              </span>
+              {isResolvingOptionPremiums && optionDataCoverage < displayedTrades.length ? (
+                <span className="text-amber-300 font-bold animate-pulse">Loading OC...</span>
+              ) : optionDataCoverage === 0 && displayedTrades.length > 0 ? (
+                <span className="text-gray-400 font-semibold">No OC Data</span>
+              ) : (
+                <span className={`font-bold ${totalNetPremPnL >= 0 ? 'text-cyan-300' : 'text-red-400'}`}>
+                  {(totalNetPremPnL >= 0 ? '+' : '') + totalNetPremPnL.toFixed(2)} pts
+                  {optionDataCoverage < displayedTrades.length && (
+                    <span className="ml-1 text-[10px] text-amber-300">({optionDataCoverage}/{displayedTrades.length})</span>
+                  )}
+                </span>
+              )}
             </div>
-            <div className="flex items-center gap-1.5 bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-500/30">
+            <div className="flex items-center gap-1.5 bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-500/30" title="Exact sum of real 1-lot (65 Qty) option P&L across matched trades">
               <span className="text-gray-300">1 Lot Net (65 Qty):</span>
-              <span className={`font-extrabold ${totalLotPnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                {(totalLotPnL >= 0 ? '+₹' : '-₹') + Math.abs(totalLotPnL).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-              </span>
+              {(isResolvingOptionPremiums || isBackfillingHistory) && optionDataCoverage < displayedTrades.length ? (
+                <span className="text-amber-300 font-bold animate-pulse">Loading...</span>
+              ) : optionDataCoverage === 0 && displayedTrades.length > 0 ? (
+                <span className="text-gray-400 font-semibold">No OC Data</span>
+              ) : (
+                <span className={`font-extrabold ${totalLotPnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                  {(totalLotPnL >= 0 ? '+₹' : '-₹') + Math.abs(totalLotPnL).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={handleBackfillHistoricalPremiums}
+                disabled={isBackfillingHistory}
+                title="Extract & save historical 1-minute option premiums from Upstox into PostgreSQL"
+                className="ml-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-cyan-950/80 hover:bg-cyan-900 text-cyan-300 border border-cyan-700/50 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                {isBackfillingHistory ? 'Syncing...' : 'Sync Hist OC'}
+              </button>
             </div>
             <div className="flex items-center gap-1.5">
               <span>Profit Factor:</span>
@@ -3717,118 +3282,51 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                 <span className="text-amber-400 font-bold">{dayEndSquareOffs}</span>
               </div>
             )}
-            {filteredCount > 0 && (
+            {comparisonStats.filteredCount > 0 && (
               <div className="flex items-center gap-1.5 text-amber-400 font-medium col-span-2 sm:col-span-1">
                 <span>Filtered Out:</span>
-                <span className="font-bold">{filteredCount}</span>
+                <span className="font-bold">{comparisonStats.filteredCount}</span>
+              </div>
+            )}
+            {strategies.samSignals && (
+              <div className="flex items-center gap-1.5 text-xs font-mono">
+                <span className="text-gray-400">Regime:</span>
+                <span className={`px-1.5 py-0.2 rounded text-[10px] font-bold border ${
+                  comparisonStats.currentRegimeState === 'TREND_BULL'
+                    ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+                    : comparisonStats.currentRegimeState === 'TREND_BEAR'
+                      ? 'bg-rose-500/10 text-rose-300 border-rose-500/30'
+                      : 'bg-teal-500/10 text-teal-300 border-teal-500/30'
+                }`}>
+                  {comparisonStats.currentRegimeState === 'TREND_BULL'
+                    ? '🟢 Bull Trend'
+                    : comparisonStats.currentRegimeState === 'TREND_BEAR'
+                      ? '🔴 Bear Trend'
+                      : '⚖️ Dynamic Range'}
+                </span>
+              </div>
+            )}
+            {strategies.samSignals && comparisonStats.dailyDrawdownHalted && (
+              <div className="flex items-center gap-1.5 text-xs font-mono">
+                <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse">
+                  🛑 Daily Max Loss Halted
+                </span>
+              </div>
+            )}
+            {strategies.samSignals && !comparisonStats.dailyDrawdownHalted && comparisonStats.circuitBreakerActive && (
+              <div className="flex items-center gap-1.5 text-xs font-mono">
+                <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse">
+                  ⏸️ Circuit Breaker Cooldown
+                </span>
               </div>
             )}
           </div>
 
         </div>
 
-        {/* Strategy Signal Filter Optimizer Controls (Collapsible) */}
-        {isFiltersOpen && (
-          <div className="bg-[#0D1526] border-b border-[#1F2937] px-3.5 sm:px-4 py-3 flex flex-col gap-3">
-            <div className="flex items-center justify-between flex-wrap gap-3">
-              <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
-                <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">Signal Optimization:</span>
-                <div className="flex items-center bg-[#111827] p-1 rounded-lg border border-[#1F2937] gap-1 flex-wrap">
-                  <button
-                    onClick={() => {
-                      setFilterMode('SMART');
-                      filterModeRef.current = 'SMART';
-                    }}
-                    className={`px-3 py-1 rounded text-xs font-bold transition-all flex items-center gap-1.5 ${
-                      filterMode === 'SMART' 
-                        ? 'bg-emerald-500 text-black shadow-sm' 
-                        : 'text-gray-400 hover:text-white'
-                    }`}
-                  >
-                    <span>🛡️ Smart Quality Suite</span>
-                    <span className={`text-[10px] px-1 py-0.2 rounded ${filterMode === 'SMART' ? 'bg-black/20 text-emerald-950 font-extrabold' : 'bg-black/30 text-emerald-300'}`}>High Win-Rate</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      setFilterMode('RAW');
-                      filterModeRef.current = 'RAW';
-                    }}
-                    className={`px-3 py-1 rounded text-xs font-bold transition-all flex items-center gap-1.5 ${
-                      filterMode === 'RAW' 
-                        ? 'bg-brand-blue text-black shadow-sm' 
-                        : 'text-gray-400 hover:text-white'
-                    }`}
-                  >
-                    <span>📊 Raw Signals</span>
-                    <span className={`text-[10px] px-1 py-0.2 rounded ${filterMode === 'RAW' ? 'bg-black/20 text-blue-950 font-extrabold' : 'bg-black/30 text-blue-300'}`}>No Filters</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      setFilterMode('BOOKER_ADX');
-                      filterModeRef.current = 'BOOKER_ADX';
-                    }}
-                    className={`px-3 py-1 rounded text-xs font-bold transition-all flex items-center gap-1.5 ${
-                      filterMode === 'BOOKER_ADX' 
-                        ? 'bg-purple-500 text-white shadow-sm' 
-                        : 'text-gray-400 hover:text-white'
-                    }`}
-                  >
-                    <span>🐢 Classic Booker</span>
-                    <span className={`text-[10px] px-1 py-0.2 rounded ${filterMode === 'BOOKER_ADX' ? 'bg-black/20 text-purple-100 font-extrabold' : 'bg-black/30 text-purple-300'}`}>ADX &lt; {adxChopFilter.threshold}</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      setFilterMode('MOMENTUM_ADX');
-                      filterModeRef.current = 'MOMENTUM_ADX';
-                    }}
-                    className={`px-3 py-1 rounded text-xs font-bold transition-all flex items-center gap-1.5 ${
-                      filterMode === 'MOMENTUM_ADX' 
-                        ? 'bg-amber-500 text-black shadow-sm' 
-                        : 'text-gray-400 hover:text-white'
-                    }`}
-                  >
-                    <span>⚡ Momentum ADX</span>
-                    <span className={`text-[10px] px-1 py-0.2 rounded ${filterMode === 'MOMENTUM_ADX' ? 'bg-black/20 text-amber-950 font-extrabold' : 'bg-black/30 text-amber-300'}`}>ADX &ge; 20</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* Comparative Win Rate and PnL Delta Pill */}
-              {comparisonStats.rawTotal > 0 && (
-                <div className="flex items-center gap-2 sm:gap-3 bg-[#111827] px-3 py-1.5 rounded-lg border border-[#1F2937] text-xs font-mono flex-wrap">
-                  <div className="flex items-center gap-1 text-gray-400">
-                    <span>Raw:</span>
-                    <span className="text-gray-300 font-bold">{comparisonStats.rawWinRate}%</span>
-                    <span className="text-gray-500 text-[11px]">({comparisonStats.rawWins}W/{comparisonStats.rawLosses}L | {(comparisonStats.rawNetPnL >= 0 ? '+' : '') + comparisonStats.rawNetPnL.toFixed(1)} pts)</span>
-                  </div>
-                  <span className="text-gray-600">vs</span>
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <span className="text-emerald-400 font-medium">Protected:</span>
-                    <span className="text-emerald-300 font-bold">{winRate}%</span>
-                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                      Number(winRate) >= Number(comparisonStats.rawWinRate) 
-                        ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' 
-                        : 'bg-red-500/20 text-red-400 border border-red-500/30'
-                    }`}>
-                      {Number(winRate) >= Number(comparisonStats.rawWinRate) ? '+' : ''}
-                      {(Number(winRate) - Number(comparisonStats.rawWinRate)).toFixed(1)}% WR
-                    </span>
-                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                      totalNetPnL >= comparisonStats.rawNetPnL
-                        ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                        : 'bg-red-500/20 text-red-400 border border-red-500/30'
-                    }`}>
-                      {totalNetPnL >= comparisonStats.rawNetPnL ? '+' : ''}
-                      {(totalNetPnL - comparisonStats.rawNetPnL).toFixed(1)} pts Saved
-                    </span>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* SAM Signals 1-Min Empirical Loss Filters (Active when SAM Signals strategy is on) */}
-            {strategies.samSignals && (
-              <div className="flex flex-col gap-2 pt-2 border-t border-blue-900/40 bg-blue-950/20 -mx-3 -mb-3 p-3 rounded-b-lg text-xs">
+        {/* SAM Signals 1-Min Empirical Loss Filters (Collapsible) */}
+        {isFiltersOpen && strategies.samSignals && (
+          <div className="bg-blue-950/20 border-b border-[#1F2937] px-3.5 sm:px-4 py-3 flex flex-col gap-2 text-xs">
                 <div className="flex items-center justify-between flex-wrap gap-2">
                   <div className="flex items-center gap-3 flex-wrap">
                     <span className="text-[11px] font-bold text-blue-300 flex items-center gap-1.5">
@@ -3949,6 +3447,171 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                         Range Guard
                       </span>
                     </label>
+
+                    {/* Filter 7: Dynamic Regime Classification (Dual-Mode VWAP) */}
+                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Dual-Mode Adaptive VWAP: Trend Mode enforces trend alignment; Range Mode enables two-way dip-buying and short bounces without getting chopped. Click to toggle ON/OFF.">
+                      <input
+                        type="checkbox"
+                        checked={samConfig.adaptiveRegimeEnabled ?? true}
+                        onChange={e => setSamConfig(c => ({ ...c, adaptiveRegimeEnabled: e.target.checked }))}
+                        className="accent-teal-400 cursor-pointer"
+                      />
+                      <span className={`font-semibold ${samConfig.adaptiveRegimeEnabled ? 'text-teal-300' : 'text-gray-400'}`}>
+                        Dynamic Regime ({comparisonStats.adaptiveRegimeFiltered})
+                      </span>
+                      <span className={`text-[10px] px-1.5 py-0.2 rounded border font-mono ${
+                        samConfig.adaptiveRegimeEnabled
+                          ? 'bg-teal-500/10 text-teal-300 border-teal-500/20'
+                          : 'bg-gray-800 text-gray-400 border-gray-700'
+                      }`}>
+                        {comparisonStats.currentRegimeState === 'TREND_BULL'
+                          ? '🟢 Bull Trend'
+                          : comparisonStats.currentRegimeState === 'TREND_BEAR'
+                            ? '🔴 Bear Trend'
+                            : '⚖️ Range Mode'}
+                      </span>
+                    </label>
+
+                    {/* Filter 8: Directional Loss Circuit Breaker */}
+                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Circuit Breaker: Freezes directional trades for 20m after 3 consecutive losses in that direction, preventing revenge loops while allowing opposite breakout trades. Click to toggle ON/OFF.">
+                      <input
+                        type="checkbox"
+                        checked={samConfig.circuitBreakerEnabled ?? true}
+                        onChange={e => setSamConfig(c => ({ ...c, circuitBreakerEnabled: e.target.checked }))}
+                        className="accent-amber-400 cursor-pointer"
+                      />
+                      <span className={`font-semibold ${samConfig.circuitBreakerEnabled ? 'text-amber-300' : 'text-gray-400'}`}>
+                        Circuit Breaker ({comparisonStats.circuitBreakerFiltered})
+                      </span>
+                      <span className={`text-[10px] px-1.5 py-0.2 rounded border font-mono ${
+                        comparisonStats.circuitBreakerActive
+                          ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 animate-pulse'
+                          : 'bg-amber-500/10 text-amber-300 border-amber-500/20'
+                      }`}>
+                        {comparisonStats.circuitBreakerActive ? '⏸️ Cooling' : `${samConfig.circuitBreakerConsecutiveLosses ?? 3}L Cooldown`}
+                      </span>
+                    </label>
+
+                    {/* Filter 9: Anti-Whipsaw Protection */}
+                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Anti-Whipsaw: Suppresses immediate reverse flipping within 10 minutes of a losing trade. Click to toggle ON/OFF.">
+                      <input
+                        type="checkbox"
+                        checked={samConfig.antiWhipsawEnabled ?? false}
+                        onChange={e => setSamConfig(c => ({ ...c, antiWhipsawEnabled: e.target.checked }))}
+                        className="accent-violet-400 cursor-pointer"
+                      />
+                      <span className={`font-semibold ${samConfig.antiWhipsawEnabled ? 'text-violet-300' : 'text-gray-400'}`}>
+                        Anti-Whipsaw ({comparisonStats.antiWhipsawFiltered})
+                      </span>
+                      <span className={`text-[10px] px-1.5 py-0.2 rounded border font-mono ${
+                        samConfig.antiWhipsawEnabled
+                          ? 'bg-violet-500/10 text-violet-300 border-violet-500/20'
+                          : 'bg-gray-800 text-gray-400 border-gray-700'
+                      }`}>
+                        {samConfig.antiWhipsawMinutes ?? 10}m Window
+                      </span>
+                    </label>
+
+                    {/* Filter 10: Daily Drawdown Guard */}
+                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Daily Drawdown Guard: Stops taking new trades if accumulated daily loss hits limit (e.g. -75 pts). Click to toggle ON/OFF.">
+                      <input
+                        type="checkbox"
+                        checked={samConfig.maxDailyLossEnabled ?? false}
+                        onChange={e => setSamConfig(c => ({ ...c, maxDailyLossEnabled: e.target.checked }))}
+                        className="accent-red-400 cursor-pointer"
+                      />
+                      <span className={`font-semibold ${samConfig.maxDailyLossEnabled ? 'text-red-300' : 'text-gray-400'}`}>
+                        Daily Drawdown Guard
+                      </span>
+                      <span className={`text-[10px] px-1.5 py-0.2 rounded border font-mono ${
+                        comparisonStats.dailyDrawdownHalted
+                          ? 'bg-red-500/20 text-red-300 border-red-500/40 animate-pulse'
+                          : 'bg-red-500/10 text-red-300 border-red-500/20'
+                      }`}>
+                        {comparisonStats.dailyDrawdownHalted ? '🛑 Halted' : `${samConfig.maxDailyLossPoints ?? 75}pt Max`}
+                      </span>
+                    </label>
+
+                    {/* Filter 11: S12 Confluence Filter */}
+                    <label
+                      className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white"
+                      title={`S12 Confluence Filter (Zero-Lookahead): Requires DI Spread > +${samConfig.s12DiSpreadMin ?? 5}, Close aligned with both EMA ${samConfig.s12EmaFastPeriod ?? 100} & EMA ${samConfig.s12EmaSlowPeriod ?? 200}, and Bar+1 RVOL >= ${samConfig.s12MinRvol ?? 0.7}.`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={samConfig.filterS12ConfluenceEnabled ?? false}
+                        onChange={e => setSamConfig(c => ({ ...c, filterS12ConfluenceEnabled: e.target.checked }))}
+                        className="accent-sky-400 cursor-pointer"
+                      />
+                      <span className={`font-semibold ${samConfig.filterS12ConfluenceEnabled ? 'text-sky-300' : 'text-gray-400'}`}>
+                        S12 Confluence ({comparisonStats.s12Filtered})
+                      </span>
+                      <span className={`text-[10px] px-1.5 py-0.2 rounded border font-mono ${
+                        samConfig.filterS12ConfluenceEnabled
+                          ? 'bg-sky-500/10 text-sky-300 border-sky-500/25'
+                          : 'bg-gray-800 text-gray-400 border-gray-700'
+                      }`}>
+                        DI&gt;+{samConfig.s12DiSpreadMin ?? 5} • EMA{samConfig.s12EmaFastPeriod ?? 100}/{samConfig.s12EmaSlowPeriod ?? 200} • RVOL&ge;{samConfig.s12MinRvol ?? 0.7}
+                      </span>
+                    </label>
+
+                    {/* Filter 12 (Rec #1): 1-Min SAM 21/5 Afternoon Breakout (#3 Fixed or #5 Chandelier) */}
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <label
+                        className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white"
+                        title="Recommendation #1 — 1-Min SAM(21/5) Afternoon Breakout (12:30–14:50 IST): PDH/PDL Breakout + Causal 5m ADX >= 30 & DI Spread > 5. Switch between #3 Fixed (SL 40 / BE +30 / EOD, PF 1.91) and #5 Chandelier (SL 0.30% / Trail 0.40% / EOD, PF 1.83)."
+                      >
+                        <input
+                          type="checkbox"
+                          checked={samConfig.filterSam21AfternoonEnabled ?? false}
+                          onChange={e => setSamConfig(c => ({ ...c, filterSam21AfternoonEnabled: e.target.checked }))}
+                          className="accent-emerald-400 cursor-pointer"
+                        />
+                        <span className={`font-semibold ${samConfig.filterSam21AfternoonEnabled ? 'text-emerald-300' : 'text-gray-400'}`}>
+                          SAM 21/5 1m Afternoon ({comparisonStats.sam21AfternoonSignals})
+                        </span>
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => setSamConfig(c => ({
+                          ...c,
+                          sam21AfternoonExitMode: c.sam21AfternoonExitMode === 'chandelier' ? 'fixed40' : 'chandelier'
+                        }))}
+                        className={`text-[10px] px-1.5 py-0.2 rounded border font-mono cursor-pointer transition-colors ${
+                          samConfig.filterSam21AfternoonEnabled || samConfig.filterSam21CombinedEnabled
+                            ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/35 hover:bg-emerald-500/25'
+                            : 'bg-gray-800 text-gray-400 border-gray-700 hover:text-gray-200'
+                        }`}
+                        title="Click to switch Afternoon Exit Mode between #3 Fixed (SL40/BE+30/EOD) and #5 Chandelier (0.30%/0.40%/EOD)"
+                      >
+                        {samConfig.sam21AfternoonExitMode === 'chandelier'
+                          ? '#5 Chand 0.3%/0.4% • 12:30–14:50'
+                          : '#3 SL40/BE30/EOD • 12:30–14:50'}
+                      </button>
+                    </div>
+
+                    {/* Filter 13 (Rec #2): Morning + Afternoon Combined (3m OpenDrive + 1m Afternoon) */}
+                    <label
+                      className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white"
+                      title="Recommendation #2 — Morning + Afternoon Combined (SAM 21/5): Runs #1 (3m SAM 21/5 OpenDrive 09:20–10:30, PDH/PDL + StrongBar + 15m Supertrend, 2x/3x 5m ATR, PF 2.24) in the morning + #3/#5 (1m SAM 21/5 Afternoon 12:30–14:50, PF 1.83–1.91) in the afternoon."
+                    >
+                      <input
+                        type="checkbox"
+                        checked={samConfig.filterSam21CombinedEnabled ?? false}
+                        onChange={e => setSamConfig(c => ({ ...c, filterSam21CombinedEnabled: e.target.checked }))}
+                        className="accent-amber-400 cursor-pointer"
+                      />
+                      <span className={`font-semibold ${samConfig.filterSam21CombinedEnabled ? 'text-amber-300' : 'text-gray-400'}`}>
+                        SAM 21/5 Combined ({comparisonStats.sam21OpenDriveSignals + comparisonStats.sam21AfternoonSignals})
+                      </span>
+                      <span className={`text-[10px] px-1.5 py-0.2 rounded border font-mono ${
+                        samConfig.filterSam21CombinedEnabled
+                          ? 'bg-amber-500/15 text-amber-300 border-amber-500/35'
+                          : 'bg-gray-800 text-gray-400 border-gray-700'
+                      }`}>
+                        3m OpenDrive 09:20–10:30 + 1m Aft
+                      </span>
+                    </label>
                   </div>
 
                   <button
@@ -3958,111 +3621,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     <span>Configure SAM Filters ⚙️</span>
                   </button>
                 </div>
-              </div>
-            )}
-
-            {/* Granular Loss Elimination & Risk Management Settings (Active in SMART mode) */}
-            {filterMode === 'SMART' && (
-              <div className="flex flex-col gap-2 pt-2 border-t border-[#1F2937]/70 text-xs">
-                <div className="flex items-center justify-between flex-wrap gap-2">
-                  <div className="flex items-center gap-4 flex-wrap">
-                    <span className="text-[11px] font-bold text-amber-300">🛡️ Loss Protection:</span>
-                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Limits stoploss risk distance so that 1 loss does not wipe out multiple wins">
-                      <input
-                        type="checkbox"
-                        checked={filterSettings.strictStoploss}
-                        onChange={e => updateFilterSetting('strictStoploss', e.target.checked)}
-                        className="accent-amber-400 cursor-pointer"
-                      />
-                      <span className="font-semibold text-amber-300">Strict Capped SL</span>
-                    </label>
-                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Locks stoploss to breakeven once price moves 50% toward target">
-                      <input
-                        type="checkbox"
-                        checked={filterSettings.breakevenTrail}
-                        onChange={e => updateFilterSetting('breakevenTrail', e.target.checked)}
-                        className="accent-cyan-400 cursor-pointer"
-                      />
-                      <span className="text-cyan-300 font-semibold">BE Lock @ 50% TP ({comparisonStats.beSavedCount} saved)</span>
-                    </label>
-                    <label className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white" title="Avoids taking trades during opening market buffer (before 09:25 IST for Nifty) when spreads and volatility whipsaws are highest">
-                      <input
-                        type="checkbox"
-                        checked={filterSettings.openingRangeBuffer}
-                        onChange={e => updateFilterSetting('openingRangeBuffer', e.target.checked)}
-                        className="accent-yellow-400 cursor-pointer"
-                      />
-                      <span className="text-yellow-300 font-semibold">Opening Range Buffer ({comparisonStats.openingFiltered})</span>
-                    </label>
-                  </div>
-                  <div className="text-[11px] font-mono flex items-center gap-2">
-                    <span className="text-emerald-400 font-bold bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
-                      Profit Filtered: {comparisonStats.profitTradesFiltered} (0 Lost!)
-                    </span>
-                    <span className="text-red-400 font-bold bg-red-500/10 px-2 py-0.5 rounded border border-red-500/20">
-                      Loss Filtered: {comparisonStats.lossTradesFiltered}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-3.5 flex-wrap pt-1 text-[11px] text-gray-300">
-                  <span className="font-semibold text-gray-400">Quality Filters:</span>
-                  <label className="flex items-center gap-1 cursor-pointer hover:text-white" title="Aligns trade direction with 50 EMA trend (Long above 50 EMA, Short below 50 EMA) - stops false longs in downtrends">
-                    <input
-                      type="checkbox"
-                      checked={filterSettings.trendAlignment}
-                      onChange={e => updateFilterSetting('trendAlignment', e.target.checked)}
-                      className="accent-emerald-500 cursor-pointer"
-                    />
-                    <span className="font-bold text-emerald-400">50 EMA Trend ({comparisonStats.trendFiltered})</span>
-                  </label>
-                  <label className="flex items-center gap-1 cursor-pointer hover:text-white" title="Smart chop filter preserves breakouts (+DI advantage) and rejects adverse momentum traps">
-                    <input
-                      type="checkbox"
-                      checked={adxChopFilter.enabled}
-                      onChange={e => {
-                        const val = e.target.checked;
-                        const next = { ...adxChopFilterRef.current, enabled: val };
-                        adxChopFilterRef.current = next;
-                        setAdxChopFilter(next);
-                        try {
-                          localStorage.setItem(`quant_adx_chop_filter_${instrument}`, JSON.stringify(next));
-                        } catch (_) {}
-                      }}
-                      className="accent-emerald-500 cursor-pointer"
-                    />
-                    <span>Smart Chop ({comparisonStats.adxFiltered})</span>
-                  </label>
-                  <label className="flex items-center gap-1 cursor-pointer hover:text-white" title="Filters bars with heavy opposing rejection wicks (>45%)">
-                    <input
-                      type="checkbox"
-                      checked={filterSettings.bodyConviction}
-                      onChange={e => updateFilterSetting('bodyConviction', e.target.checked)}
-                      className="accent-emerald-500 cursor-pointer"
-                    />
-                    <span>Rejection Wick Filter ({comparisonStats.wickFiltered})</span>
-                  </label>
-                  <label className="flex items-center gap-1 cursor-pointer hover:text-white" title="Eliminates exhaustion/climax bars (Range > 2.5x ATR) that lead to immediate reversal">
-                    <input
-                      type="checkbox"
-                      checked={filterSettings.exhaustionFilter}
-                      onChange={e => updateFilterSetting('exhaustionFilter', e.target.checked)}
-                      className="accent-emerald-500 cursor-pointer"
-                    />
-                    <span>Exhaustion Climax ({comparisonStats.exhaustionFiltered})</span>
-                  </label>
-                  <label className="flex items-center gap-1 cursor-pointer hover:text-white" title="Requires RSI between 42-74 for Longs, 26-58 for Shorts to avoid extreme exhaustion">
-                    <input
-                      type="checkbox"
-                      checked={filterSettings.rsiMomentum}
-                      onChange={e => updateFilterSetting('rsiMomentum', e.target.checked)}
-                      className="accent-emerald-500 cursor-pointer"
-                    />
-                    <span>RSI Sweet-Spot ({comparisonStats.rsiFiltered})</span>
-                  </label>
-                </div>
-              </div>
-            )}
           </div>
         )}
 
@@ -4231,11 +3789,11 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     </div>
                     <div className="flex flex-col">
                       <span className="text-emerald-400/80 text-[10px]">Target 1</span>
-                      <span className="text-emerald-400 font-medium">{t.target.toFixed(2)}</span>
+                      <span className="text-emerald-400 font-medium">{t.samNoFixedTp ? 'EOD Trail' : t.target.toFixed(2)}</span>
                     </div>
                     <div className="flex flex-col">
                       <span className="text-purple-400/80 text-[10px]">Target 2</span>
-                      <span className="text-purple-300 font-medium">{t.target2 ? t.target2.toFixed(2) : '-'}</span>
+                      <span className="text-purple-300 font-medium">{t.samNoFixedTp ? '-' : (t.target2 ? t.target2.toFixed(2) : '-')}</span>
                     </div>
                   </div>
 
@@ -4243,7 +3801,11 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                   <div className="flex items-center justify-between text-[11px] font-mono bg-cyan-950/20 px-2 py-1.5 rounded border border-cyan-500/20">
                     <div className="flex items-center gap-1 text-cyan-200">
                       <span className="text-gray-400 text-[10px]">Prem:</span>
-                      <span>₹{t.optionEntryPremium?.toFixed(1) || '-'} {t.optionExitPremium !== undefined ? `→ ₹${t.optionExitPremium.toFixed(1)}` : ''}</span>
+                      {t.optionEntryPremium !== undefined ? (
+                        <span>₹{t.optionEntryPremium.toFixed(2)} {t.optionExitPremium !== undefined ? `→ ₹${t.optionExitPremium.toFixed(2)}` : ''}</span>
+                      ) : (
+                        <span className="text-gray-500">No OC Data</span>
+                      )}
                     </div>
                     <div className="flex items-center gap-1.5">
                       <span className="text-[10px] text-gray-400">1 Lot (65 Qty):</span>
@@ -4399,8 +3961,8 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     </td>
                     <td className="py-2 px-3 text-right font-mono whitespace-nowrap text-gray-200">{t.entryPrice.toFixed(2)}</td>
                     <td className="py-2 px-3 text-right font-mono text-red-400 whitespace-nowrap">{t.stoploss.toFixed(2)}</td>
-                    <td className="py-2 px-3 text-right font-mono text-emerald-400 whitespace-nowrap">{t.target.toFixed(2)}</td>
-                    <td className="py-2 px-3 text-right font-mono text-purple-300 whitespace-nowrap">{t.target2 ? t.target2.toFixed(2) : '-'}</td>
+                    <td className="py-2 px-3 text-right font-mono text-emerald-400 whitespace-nowrap">{t.samNoFixedTp ? 'EOD Trail' : t.target.toFixed(2)}</td>
+                    <td className="py-2 px-3 text-right font-mono text-purple-300 whitespace-nowrap">{t.samNoFixedTp ? '-' : (t.target2 ? t.target2.toFixed(2) : '-')}</td>
                     <td className="py-2 px-3 font-mono whitespace-nowrap">
                       {t.exitTime ? (
                         <div>
@@ -4473,11 +4035,32 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                     </td>
                     <td className="py-2 px-3 whitespace-nowrap font-mono">
                       {t.optionStrike ? (
-                        <div className="flex items-center gap-1">
+                        <div
+                          className="flex items-center gap-1.5"
+                          title={
+                            t.optionDataSource === 'OPTION_CHAIN_HISTORY'
+                              ? `Recorded Option Chain History${t.optionExpiry ? ` • Exp ${t.optionExpiry}` : ''}`
+                              : t.optionDataSource === 'UPSTOX_OPTION_CANDLE'
+                                ? `Real Upstox 1-Min Option Candle${t.optionExpiry ? ` • Exp ${t.optionExpiry}` : ''}`
+                                : 'No recorded option chain or historical option candle data for this timestamp'
+                          }
+                        >
                           <span className="px-1.5 py-0.5 rounded text-[11px] font-bold bg-cyan-950/60 text-cyan-300 border border-cyan-800/60">
                             {t.optionStrike} {t.optionType}
                           </span>
-                          <span className="text-[10px] text-gray-400 font-mono">(Δ {t.optionDelta?.toFixed(2) || '0.50'})</span>
+                          {t.optionExpiry && (
+                            <span className="text-[10px] text-gray-400 font-mono">{t.optionExpiry.slice(5)}</span>
+                          )}
+                          {t.optionDataSource === 'OPTION_CHAIN_HISTORY' ? (
+                            <span className="text-[9px] px-1 py-0.2 rounded bg-emerald-950/70 text-emerald-300 border border-emerald-700/50">OC</span>
+                          ) : t.optionDataSource === 'UPSTOX_OPTION_CANDLE' ? (
+                            <span className="text-[9px] px-1 py-0.2 rounded bg-blue-950/70 text-blue-300 border border-blue-700/50">1m Opt</span>
+                          ) : (
+                            <span className="text-[9px] px-1 py-0.2 rounded bg-gray-800 text-gray-400 border border-gray-700">No Data</span>
+                          )}
+                          {t.optionDelta !== undefined && (
+                            <span className="text-[10px] text-gray-500 font-mono">(Δ {t.optionDelta.toFixed(2)})</span>
+                          )}
                         </div>
                       ) : (
                         <span className="text-gray-500">-</span>
@@ -4491,11 +4074,13 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                           <span>{t.premiumPnl > 0 ? '+' : ''}{t.premiumPnl.toFixed(2)} pts</span>
                           {t.optionEntryPremium !== undefined && (
                             <span className="text-[10px] text-gray-400 font-mono">
-                              ₹{t.optionEntryPremium.toFixed(1)} {t.optionExitPremium !== undefined ? `→ ₹${t.optionExitPremium.toFixed(1)}` : ''}
+                              ₹{t.optionEntryPremium.toFixed(2)} {t.optionExitPremium !== undefined ? `→ ₹${t.optionExitPremium.toFixed(2)}` : ''}
                             </span>
                           )}
                         </div>
-                      ) : '-'}
+                      ) : (
+                        <span className="text-[10px] text-gray-500">No OC Data</span>
+                      )}
                     </td>
                     <td className={`py-2 px-3 text-right font-mono whitespace-nowrap font-bold ${
                       t.lotPnl === undefined ? 'text-gray-500' : t.lotPnl > 0 ? 'text-emerald-400' : t.lotPnl < 0 ? 'text-red-400' : 'text-gray-300'
@@ -4547,39 +4132,6 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
             {/* Tabs */}
             <div className="flex border-b border-[#1F2937] bg-[#0A0F1C]/40 px-6">
               <button
-                onClick={() => setShowStrategySettingsModal('ALPHATREND')}
-                className={`py-3 px-4 text-xs font-semibold border-b-2 transition-colors flex items-center gap-2 cursor-pointer ${
-                  showStrategySettingsModal === 'ALPHATREND'
-                    ? 'border-blue-500 text-blue-400'
-                    : 'border-transparent text-gray-400 hover:text-gray-200'
-                }`}
-              >
-                <span className="w-2 h-2 rounded-full bg-blue-500"></span>
-                AlphaTrend Strategy
-              </button>
-              <button
-                onClick={() => setShowStrategySettingsModal('T3')}
-                className={`py-3 px-4 text-xs font-semibold border-b-2 transition-colors flex items-center gap-2 cursor-pointer ${
-                  showStrategySettingsModal === 'T3'
-                    ? 'border-emerald-500 text-emerald-400'
-                    : 'border-transparent text-gray-400 hover:text-gray-200'
-                }`}
-              >
-                <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                T3 Striped [Loxx]
-              </button>
-              <button
-                onClick={() => setShowStrategySettingsModal('COMBO')}
-                className={`py-3 px-4 text-xs font-semibold border-b-2 transition-colors flex items-center gap-2 cursor-pointer ${
-                  showStrategySettingsModal === 'COMBO'
-                    ? 'border-amber-500 text-amber-400'
-                    : 'border-transparent text-gray-400 hover:text-gray-200'
-                }`}
-              >
-                <span className="w-2 h-2 rounded-full bg-amber-400"></span>
-                Combo Strategy (Filtered &amp; Unfiltered)
-              </button>
-              <button
                 onClick={() => setShowStrategySettingsModal('SAM')}
                 className={`py-3 px-4 text-xs font-semibold border-b-2 transition-colors flex items-center gap-2 cursor-pointer ${
                   showStrategySettingsModal === 'SAM'
@@ -4594,480 +4146,7 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
 
             {/* Content Body */}
             <div className="p-6 overflow-y-auto space-y-6 flex-1 text-xs">
-              {showStrategySettingsModal === 'ALPHATREND' ? (
-                <div className="space-y-5">
-                  {/* Diagnosis Notice */}
-                  <div className="p-3.5 rounded-xl bg-blue-950/30 border border-blue-800/40 text-blue-200 space-y-1.5">
-                    <div className="font-semibold flex items-center gap-1.5 text-blue-300">
-                      <span>💡</span>
-                      <span>Why AlphaTrend Win Rate dropped on 1-min &amp; How to fix it:</span>
-                    </div>
-                    <p className="text-gray-300 text-[11px] leading-relaxed">
-                      On strong trend days (yesterday), uncalibrated parameters (Coeff 1.0) stay in trend. But on choppy or rotational days (today), 
-                      a 1.0 multiplier makes the band only 16-20 points wide—causing normal 1-minute wicks to repeatedly flip buy/sell signals back and forth. 
-                      Setting <strong className="text-emerald-300">Coeff to 1.6</strong> and <strong className="text-emerald-300">Period to 18</strong> with <strong className="text-emerald-300">Target 1 at 1.6x ATR</strong> locks in quick profits at +16-20 points, activates Breakeven protection, and eliminates over 70% of false losing stops!
-                    </p>
-                  </div>
-
-                  {/* Grid of Inputs */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">AlphaTrend Coeff (Band Width)</label>
-                        <span className="font-mono text-emerald-400 font-bold">{alphaTrendConfig.coeff.toFixed(1)}x ATR</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0.8"
-                        max="2.5"
-                        step="0.1"
-                        value={alphaTrendConfig.coeff}
-                        onChange={e => setAlphaTrendConfig(c => ({ ...c, coeff: Number(e.target.value) }))}
-                        className="w-full accent-emerald-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">
-                        1.0 = Tight (Whipsaw prone). 1.6 = Calibrated for Nifty 1m. 2.0 = Strict trend only.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">Smoothing Period</label>
-                        <span className="font-mono text-purple-300 font-bold">{alphaTrendConfig.period} bars</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="10"
-                        max="30"
-                        step="1"
-                        value={alphaTrendConfig.period}
-                        onChange={e => setAlphaTrendConfig(c => ({ ...c, period: Number(e.target.value) }))}
-                        className="w-full accent-purple-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">
-                        Period 18 smooths ATR and momentum cycles over typical 18-minute intraday micro-swings.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">Target 1 (Lock Profit &amp; BE)</label>
-                        <span className="font-mono text-emerald-400 font-bold">{alphaTrendConfig.tp1Multiple.toFixed(1)}x ATR</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="1.0"
-                        max="3.0"
-                        step="0.1"
-                        value={alphaTrendConfig.tp1Multiple}
-                        onChange={e => setAlphaTrendConfig(c => ({ ...c, tp1Multiple: Number(e.target.value) }))}
-                        className="w-full accent-emerald-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">
-                        1.6x ATR (~18-22 pts on Nifty). Locks initial profit and shifts stop loss to breakeven!
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">Target 2 (Runner)</label>
-                        <span className="font-mono text-purple-400 font-bold">{alphaTrendConfig.tp2Multiple.toFixed(1)}x ATR</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="2.0"
-                        max="5.0"
-                        step="0.1"
-                        value={alphaTrendConfig.tp2Multiple}
-                        onChange={e => setAlphaTrendConfig(c => ({ ...c, tp2Multiple: Number(e.target.value) }))}
-                        className="w-full accent-purple-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">
-                        2.5x ATR (~30-40 pts). Lets remaining position run when directional momentum explodes.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">Strict Stop Loss</label>
-                        <span className="font-mono text-red-400 font-bold">{alphaTrendConfig.slMultiple.toFixed(1)}x ATR</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0.8"
-                        max="2.0"
-                        step="0.1"
-                        value={alphaTrendConfig.slMultiple}
-                        onChange={e => setAlphaTrendConfig(c => ({ ...c, slMultiple: Number(e.target.value) }))}
-                        className="w-full accent-red-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">
-                        1.2x ATR keeps risk tightly capped (~14-16 pts max risk on Nifty 1m).
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-3 flex flex-col justify-center">
-                      <label className="flex items-center gap-2 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={alphaTrendConfig.candleConfirm}
-                          onChange={e => setAlphaTrendConfig(c => ({ ...c, candleConfirm: e.target.checked }))}
-                          className="accent-brand-blue cursor-pointer"
-                        />
-                        <span className="text-gray-300 font-medium">Candle Conviction Filter</span>
-                      </label>
-                      <p className="text-[10px] text-gray-500">
-                        Ensures signal candle closes green for BUY, and red for SELL. Prevents entering into violent counter-trend rejection wicks.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">Momentum Engine Source</label>
-                        <span className="font-mono text-cyan-300 font-bold">{!alphaTrendConfig.useRsi ? "MFI (Upstox Volume)" : "RSI (Price-Only)"}</span>
-                      </div>
-                      <select
-                        value={alphaTrendConfig.useRsi ? 'RSI' : 'MFI'}
-                        onChange={e => setAlphaTrendConfig(c => ({ ...c, useRsi: e.target.value === 'RSI' }))}
-                        className="w-full bg-[#111827] border border-[#374151] rounded px-2.5 py-1.5 text-xs text-white cursor-pointer focus:outline-none"
-                      >
-                        <option value="MFI">MFI with Upstox Volume (Kivanc PineScript Original ⭐)</option>
-                        <option value="RSI">RSI (Price-Only, Disregard Volume)</option>
-                      </select>
-                      <p className="text-[10px] text-gray-500">
-                        PineScript original AlphaTrend utilizes MFI (Money Flow Index) calculated from real Upstox candle volume to establish true institutional support/resistance levels.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-3 flex flex-col justify-center">
-                      <label className="flex items-center gap-2 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={alphaTrendConfig.volumeConfirm}
-                          onChange={e => setAlphaTrendConfig(c => ({ ...c, volumeConfirm: e.target.checked }))}
-                          className="accent-brand-blue cursor-pointer"
-                        />
-                        <span className="text-gray-300 font-medium">Volume Breakout Filter (&ge; 0.85x Vol SMA)</span>
-                      </label>
-                      <p className="text-[10px] text-gray-500">
-                        Requires breakout candle to carry institutional volume &ge; 85% of 20 SMA. Eliminates low-volume traps and fake breakouts.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              ) : showStrategySettingsModal === 'T3' ? (
-                <div className="space-y-5">
-                  {/* T3 Diagnosis Notice */}
-                  <div className="p-3.5 rounded-xl bg-emerald-950/30 border border-emerald-800/40 text-emerald-200 space-y-1.5">
-                    <div className="font-semibold flex items-center gap-1.5 text-emerald-300">
-                      <span>💡</span>
-                      <span>Why T3 Striped gave more losing trades &amp; How this fixes it:</span>
-                    </div>
-                    <p className="text-gray-300 text-[11px] leading-relaxed">
-                      T3 default settings (Period 14, Hot 0.70) are overly sensitive to 1-minute noise. In sideways consolidation, 
-                      the ribbon tangles flat and crosses every 2-3 bars without any follow-through. 
-                      Increasing <strong className="text-emerald-300">Period to 21</strong>, lowering <strong className="text-emerald-300">Hot to 0.55</strong>, and requiring a <strong className="text-emerald-300">Ribbon Spread of &ge; 0.12x ATR</strong> filters out entries during tangled chop, letting you enter only when the ribbon actually expands with momentum!
-                    </p>
-                  </div>
-
-                  {/* Grid of Inputs */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">T3 Period Length</label>
-                        <span className="font-mono text-amber-300 font-bold">{t3Config.period} bars</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="12"
-                        max="32"
-                        step="1"
-                        value={t3Config.period}
-                        onChange={e => setT3Config(c => ({ ...c, period: Number(e.target.value) }))}
-                        className="w-full accent-amber-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">
-                        Period 21 filters 1-minute high-frequency ticks while preserving fast reaction to genuine moves.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">Hot Factor (Tillson Volume Factor)</label>
-                        <span className="font-mono text-cyan-300 font-bold">{t3Config.hot.toFixed(2)}</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0.30"
-                        max="0.80"
-                        step="0.05"
-                        value={t3Config.hot}
-                        onChange={e => setT3Config(c => ({ ...c, hot: Number(e.target.value) }))}
-                        className="w-full accent-cyan-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">
-                        0.55 prevents overshoot oscillations that produce premature crosses on 1-min candles.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">Min Ribbon Spread Filter</label>
-                        <span className="font-mono text-emerald-400 font-bold">{(t3Config.minRibbonExpansion || 0).toFixed(2)}x ATR</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0.0"
-                        max="0.25"
-                        step="0.02"
-                        value={t3Config.minRibbonExpansion || 0}
-                        onChange={e => setT3Config(c => ({ ...c, minRibbonExpansion: Number(e.target.value) }))}
-                        className="w-full accent-emerald-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">
-                        Blocks trades when the ribbon is compressed flat. Requires at least 0.12x ATR ribbon expansion.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">Target 1 (Scalp &amp; BE Lock)</label>
-                        <span className="font-mono text-emerald-400 font-bold">{t3Config.tp1Multiple.toFixed(1)}x ATR</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="1.0"
-                        max="2.5"
-                        step="0.1"
-                        value={t3Config.tp1Multiple}
-                        onChange={e => setT3Config(c => ({ ...c, tp1Multiple: Number(e.target.value) }))}
-                        className="w-full accent-emerald-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">
-                        1.4x ATR (~15-18 pts). High-probability quick hit that locks 50% profit and activates Breakeven.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">Target 2 (Runner)</label>
-                        <span className="font-mono text-purple-400 font-bold">{t3Config.tp2Multiple.toFixed(1)}x ATR</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="1.8"
-                        max="4.0"
-                        step="0.1"
-                        value={t3Config.tp2Multiple}
-                        onChange={e => setT3Config(c => ({ ...c, tp2Multiple: Number(e.target.value) }))}
-                        className="w-full accent-purple-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">
-                        2.2x ATR (~26-32 pts). Captures prolonged trend extension.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="font-medium text-gray-300">Strict Stop Loss</label>
-                        <span className="font-mono text-red-400 font-bold">{t3Config.slMultiple.toFixed(1)}x ATR</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0.8"
-                        max="1.8"
-                        step="0.1"
-                        value={t3Config.slMultiple}
-                        onChange={e => setT3Config(c => ({ ...c, slMultiple: Number(e.target.value) }))}
-                        className="w-full accent-red-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">
-                        1.1x ATR ensures strict loss limitation if crossover immediately stalls.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-3 flex flex-col justify-center">
-                      <label className="flex items-center gap-2 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={t3Config.volumeConfirm}
-                          onChange={e => setT3Config(c => ({ ...c, volumeConfirm: e.target.checked }))}
-                          className="accent-emerald-400 cursor-pointer"
-                        />
-                        <span className="text-gray-300 font-medium">Volume Confirmation (&ge; 0.85x Vol SMA)</span>
-                      </label>
-                      <p className="text-[10px] text-gray-500">
-                        Requires T3 ribbon crossover candle to carry volume &ge; 85% of 20 SMA. Eliminates low-volume false ribbon tangles.
-                      </p>
-                    </div>
-
-                    <div className="bg-[#0A0F1C] p-3.5 rounded-xl border border-[#1F2937] space-y-3 flex flex-col justify-center">
-                      <label className="flex items-center gap-2 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={t3Config.volumeWeighted}
-                          onChange={e => setT3Config(c => ({ ...c, volumeWeighted: e.target.checked }))}
-                          className="accent-cyan-400 cursor-pointer"
-                        />
-                        <span className="text-gray-300 font-medium">Volume-Weighted Ribbon (VWTP Source)</span>
-                      </label>
-                      <p className="text-[10px] text-gray-500">
-                        Dynamically weights T3 ribbon input by volume momentum, curving faster on institutional volume bursts and flattening in quiet lulls.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              ) : showStrategySettingsModal === 'COMBO' ? (
-                <div className="space-y-5">
-                  <div className="p-3.5 rounded-xl bg-amber-950/30 border border-amber-800/40 text-amber-200 space-y-1.5">
-                    <div className="font-semibold flex items-center gap-1.5 text-amber-300">
-                      <span>⚡</span>
-                      <span>Combined Strategy: T3 Striped Ribbon + AlphaTrend</span>
-                    </div>
-                    <p className="text-gray-300 text-[11px] leading-relaxed">
-                      Merges two elite trading systems: Kivanc Ozbilgic's <strong>AlphaTrend</strong> (institutional trend support/resistance via Upstox volume MFI) and Loxx's <strong>T3 Striped Trend Ribbon</strong> (zero-lag Tilson moving average bands). 
-                      Supports both <strong>Filtered</strong> (institutional confirmation suite) and <strong>Unfiltered</strong> (raw confluence momentum) versions.
-                    </p>
-                  </div>
-
-                  {/* Special Conditions: Max Trade Time & One Trade At A Time */}
-                  <div className="p-3.5 rounded-xl bg-[#111827] border border-[#1F2937] space-y-4">
-                    <div className="font-semibold text-white flex items-center gap-1.5">
-                      <span className="text-amber-400">⏱️</span>
-                      <span>Special Conditions (Rules &amp; Limits)</span>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      {/* Maximum Time of Trade */}
-                      <div className="space-y-1.5">
-                        <label className="font-medium text-gray-300 block">
-                          Maximum Time for Each Trade
-                        </label>
-                        <div className="grid grid-cols-3 gap-2">
-                          {[
-                            { value: 30, label: '30 Minutes' },
-                            { value: 60, label: '1 Hour' },
-                            { value: 120, label: '2 Hours' }
-                          ].map(opt => (
-                            <button
-                              key={opt.value}
-                              type="button"
-                              onClick={() => setComboConfig(c => ({ ...c, maxTradeDurationMinutes: opt.value as 30 | 60 | 120 }))}
-                              className={`py-2 px-2.5 rounded-lg border text-center transition-all cursor-pointer ${
-                                comboConfig.maxTradeDurationMinutes === opt.value
-                                  ? 'bg-amber-500/20 border-amber-500 text-amber-300 font-bold shadow-sm'
-                                  : 'bg-[#0A0F1C] border-[#1F2937] text-gray-400 hover:text-gray-200'
-                              }`}
-                            >
-                              <div className="text-xs">{opt.label}</div>
-                            </button>
-                          ))}
-                        </div>
-                        <p className="text-[10px] text-gray-500 mt-1">
-                          If trade has not reached Target or Stoploss within this elapsed time, it automatically squares off.
-                        </p>
-                      </div>
-
-                      {/* One Trade At A Time */}
-                      <div className="space-y-1.5">
-                        <label className="font-medium text-gray-300 block">
-                          Execution Constraint
-                        </label>
-                        <div className="p-2.5 rounded-lg bg-[#0A0F1C] border border-[#1F2937]">
-                          <label className="flex items-center gap-2 cursor-pointer">
-                            <input
-                              type="checkbox"
-                              checked={comboConfig.oneTradeAtATime}
-                              onChange={e => setComboConfig(c => ({ ...c, oneTradeAtATime: e.target.checked }))}
-                              className="accent-amber-400 cursor-pointer"
-                            />
-                            <span className="text-gray-200 font-semibold text-xs">One Trade at a Time</span>
-                          </label>
-                          <p className="text-[10px] text-gray-400 mt-1">
-                            Strict risk control: Never opens overlapping trades. Waits until current active trade closes before seeking new setups.
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Target & Risk Parameters */}
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                    <div className="space-y-1 bg-[#111827] p-3 rounded-lg border border-[#1F2937]">
-                      <div className="flex justify-between items-center text-gray-400">
-                        <label className="font-medium text-gray-300">Stop Loss Risk</label>
-                        <span className="font-mono text-red-400 font-bold">{comboConfig.slMultiple.toFixed(1)}x ATR</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0.8"
-                        max="2.5"
-                        step="0.1"
-                        value={comboConfig.slMultiple}
-                        onChange={e => setComboConfig(c => ({ ...c, slMultiple: Number(e.target.value) }))}
-                        className="w-full accent-red-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">Structural SL beyond invalidation candle</p>
-                    </div>
-
-                    <div className="space-y-1 bg-[#111827] p-3 rounded-lg border border-[#1F2937]">
-                      <div className="flex justify-between items-center text-gray-400">
-                        <label className="font-medium text-gray-300">Target 1 (TP1)</label>
-                        <span className="font-mono text-emerald-400 font-bold">{comboConfig.tp1Multiple.toFixed(1)}x ATR</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="1.0"
-                        max="3.0"
-                        step="0.1"
-                        value={comboConfig.tp1Multiple}
-                        onChange={e => setComboConfig(c => ({ ...c, tp1Multiple: Number(e.target.value) }))}
-                        className="w-full accent-emerald-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">Secures 50% &amp; moves SL to Breakeven</p>
-                    </div>
-
-                    <div className="space-y-1 bg-[#111827] p-3 rounded-lg border border-[#1F2937]">
-                      <div className="flex justify-between items-center text-gray-400">
-                        <label className="font-medium text-gray-300">Target 2 (Runner)</label>
-                        <span className="font-mono text-purple-400 font-bold">{comboConfig.tp2Multiple.toFixed(1)}x ATR</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="1.8"
-                        max="4.5"
-                        step="0.1"
-                        value={comboConfig.tp2Multiple}
-                        onChange={e => setComboConfig(c => ({ ...c, tp2Multiple: Number(e.target.value) }))}
-                        className="w-full accent-purple-400 cursor-pointer"
-                      />
-                      <p className="text-[10px] text-gray-500">Full target runner with dynamic trail</p>
-                    </div>
-                  </div>
-
-                  {/* Versions Comparison Box */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div className="p-3 rounded-lg bg-[#0A0F1C] border border-cyan-500/20">
-                      <div className="flex items-center gap-1.5 text-cyan-300 font-semibold mb-1">
-                        <span className="w-2 h-2 rounded-full bg-cyan-400"></span>
-                        <span>Unfiltered Version</span>
-                      </div>
-                      <p className="text-[11px] text-gray-300 leading-relaxed">
-                        Fires immediately when AlphaTrend momentum cross and T3 Ribbon direction agree. Ideal for high-momentum runaway trending sessions where waiting for pullbacks causes missed entries.
-                      </p>
-                    </div>
-                    <div className="p-3 rounded-lg bg-[#0A0F1C] border border-emerald-500/20">
-                      <div className="flex items-center gap-1.5 text-emerald-400 font-semibold mb-1">
-                        <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                        <span>Filtered Version</span>
-                      </div>
-                      <p className="text-[11px] text-gray-300 leading-relaxed">
-                        Requires Upstox Volume &ge; 0.85x Vol SMA, Green/Red candle confirmation, Ribbon spread expansion &gt; 0.12x ATR, and 50 EMA trend alignment. Prevents fake-outs in choppy consolidation ranges.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              ) : showStrategySettingsModal === 'SAM' ? (
+              {showStrategySettingsModal === 'SAM' ? (
                 <div className="space-y-5">
                   {/* Description Box */}
                   <div className="p-3.5 rounded-xl bg-blue-950/30 border border-blue-800/40 text-blue-200 space-y-1.5">
@@ -6016,6 +5095,460 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
                           </p>
                         </div>
                       </div>
+
+                      {/* Filter 7: Dynamic Regime Classification (Dual-Mode Adaptive VWAP) */}
+                      <div className={`p-3.5 rounded-lg border transition-all ${
+                        samConfig.adaptiveRegimeEnabled
+                          ? 'bg-teal-950/20 border-teal-500/40 shadow-sm'
+                          : 'bg-[#111827] border-[#1F2937]'
+                      }`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={samConfig.adaptiveRegimeEnabled ?? true}
+                              onChange={e => setSamConfig(c => ({ ...c, adaptiveRegimeEnabled: e.target.checked }))}
+                              className="accent-teal-400 w-4 h-4 cursor-pointer"
+                            />
+                            <span className="text-xs font-bold text-white">7. Dynamic Regime Classification (Dual-Mode VWAP)</span>
+                          </label>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            samConfig.adaptiveRegimeEnabled
+                              ? 'bg-teal-500/20 text-teal-300 border border-teal-500/30'
+                              : 'bg-gray-800 text-gray-400'
+                          }`}>
+                            {samConfig.adaptiveRegimeEnabled ? 'ACTIVE (DUAL-MODE)' : 'OFF (STATIC VWAP)'}
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-gray-300 mb-2">
+                          Solves the static filter paradox where static VWAP turns trend days into wins but kills range days by blocking dip-buys:
+                        </p>
+
+                        <div className="text-[10px] space-y-1 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800/80 font-mono mb-3 text-gray-300">
+                          <p className="text-teal-300">• Trend Mode (|Price - VWAP| &gt; {samConfig.adaptiveTrendDistancePoints ?? 20}pt + slope): Strict trend alignment (no counter-trend)</p>
+                          <p className="text-cyan-300">• Range Mode: Two-way mean reversion allowed (enables winning dip-buys &amp; top-fades)</p>
+                          <p className="text-amber-300">• Climax Band Guard (&gt;{samConfig.adaptiveClimaxBandPoints ?? 50}pt): Blocks chasing overextended tops/bottoms</p>
+                          <p className="text-emerald-300">• Panic/Euphoria Reversion: Permits exhaustion bounce trades at the outer climax band</p>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800">
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">Trend Mode Threshold:</label>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min={10}
+                                max={50}
+                                step={1}
+                                value={samConfig.adaptiveTrendDistancePoints ?? 20}
+                                onChange={e => setSamConfig(c => ({ ...c, adaptiveTrendDistancePoints: Math.max(5, Number(e.target.value) || 20) }))}
+                                className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                              />
+                              <span className="text-[10px] text-gray-400">pts</span>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">Climax Exhaustion Band:</label>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min={30}
+                                max={100}
+                                step={5}
+                                value={samConfig.adaptiveClimaxBandPoints ?? 50}
+                                onChange={e => setSamConfig(c => ({ ...c, adaptiveClimaxBandPoints: Math.max(20, Number(e.target.value) || 50) }))}
+                                className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                              />
+                              <span className="text-[10px] text-gray-400">pts</span>
+                            </div>
+                          </div>
+
+                          <div className="col-span-1 sm:col-span-2 flex items-center justify-between pt-1 border-t border-gray-800">
+                            <span className="text-[10px] text-gray-300">Allow Exhaustion Counter-Bounces at Climax:</span>
+                            <input
+                              type="checkbox"
+                              checked={samConfig.adaptiveAllowReversionBounce ?? true}
+                              onChange={e => setSamConfig(c => ({ ...c, adaptiveAllowReversionBounce: e.target.checked }))}
+                              className="accent-teal-400 cursor-pointer"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="p-2 rounded bg-teal-900/10 border border-teal-800/30 text-[10px] space-y-0.5">
+                          <div className="flex justify-between text-gray-300">
+                            <span>Adaptive Regime Filtered:</span>
+                            <span className="font-bold text-teal-300 font-mono">{comparisonStats.adaptiveRegimeFiltered} Blocked</span>
+                          </div>
+                          <p className="text-teal-300/90 pt-1 font-sans text-[10px]">
+                            💎 Preserves high-probability trend trades while unlocking profitable mean-reversion swings on range days.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Filter 8: Directional Loss Circuit Breaker & Anti-Whipsaw */}
+                      <div className={`p-3.5 rounded-lg border transition-all ${
+                        samConfig.circuitBreakerEnabled || samConfig.antiWhipsawEnabled
+                          ? 'bg-amber-950/20 border-amber-500/40 shadow-sm'
+                          : 'bg-[#111827] border-[#1F2937]'
+                      }`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={samConfig.circuitBreakerEnabled ?? true}
+                              onChange={e => setSamConfig(c => ({ ...c, circuitBreakerEnabled: e.target.checked }))}
+                              className="accent-amber-400 w-4 h-4 cursor-pointer"
+                            />
+                            <span className="text-xs font-bold text-white">8. Directional Circuit Breaker &amp; Anti-Whipsaw</span>
+                          </label>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            samConfig.circuitBreakerEnabled
+                              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                              : 'bg-gray-800 text-gray-400'
+                          }`}>
+                            {samConfig.circuitBreakerEnabled ? 'CIRCUIT BREAKER ON' : 'OFF'}
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-gray-300 mb-2">
+                          Halts directional bleeding when market order flow is trending against signals:
+                        </p>
+
+                        <div className="text-[10px] space-y-1 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800/80 font-mono mb-3 text-gray-300">
+                          <p className="text-amber-300">• Cooldown: After {samConfig.circuitBreakerConsecutiveLosses ?? 3} consecutive losses in one direction, freeze that direction for {samConfig.circuitBreakerCooldownMinutes ?? 20} min</p>
+                          <p className="text-emerald-300">• Opposite Trades Allowed: Does not lock out opposite trades if the market breaks out</p>
+                          <p className="text-violet-300">• Anti-Whipsaw: Suppresses rapid direction reversal within {samConfig.antiWhipsawMinutes ?? 10} min after a loss</p>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800">
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">Max Consecutive Losses:</label>
+                            <input
+                              type="number"
+                              min={2}
+                              max={5}
+                              step={1}
+                              value={samConfig.circuitBreakerConsecutiveLosses ?? 3}
+                              onChange={e => setSamConfig(c => ({ ...c, circuitBreakerConsecutiveLosses: Math.max(2, Number(e.target.value) || 3) }))}
+                              className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                            />
+                          </div>
+
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">Cooldown Duration:</label>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min={5}
+                                max={60}
+                                step={5}
+                                value={samConfig.circuitBreakerCooldownMinutes ?? 20}
+                                onChange={e => setSamConfig(c => ({ ...c, circuitBreakerCooldownMinutes: Math.max(5, Number(e.target.value) || 20) }))}
+                                className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                              />
+                              <span className="text-[10px] text-gray-400">min</span>
+                            </div>
+                          </div>
+
+                          <div className="col-span-1 sm:col-span-2 flex items-center justify-between pt-1 border-t border-gray-800">
+                            <label className="flex items-center gap-2 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={samConfig.antiWhipsawEnabled ?? false}
+                                onChange={e => setSamConfig(c => ({ ...c, antiWhipsawEnabled: e.target.checked }))}
+                                className="accent-violet-400 cursor-pointer"
+                              />
+                              <span className="text-[10px] text-gray-300">Enable Anti-Whipsaw Reversal Guard</span>
+                            </label>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min={5}
+                                max={30}
+                                step={1}
+                                value={samConfig.antiWhipsawMinutes ?? 10}
+                                onChange={e => setSamConfig(c => ({ ...c, antiWhipsawMinutes: Math.max(3, Number(e.target.value) || 10) }))}
+                                className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                              />
+                              <span className="text-[10px] text-gray-400">min</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="p-2 rounded bg-amber-900/10 border border-amber-800/30 text-[10px] space-y-0.5">
+                          <div className="flex justify-between text-gray-300">
+                            <span>Circuit Breaker / Whipsaw Blocked:</span>
+                            <span className="font-bold text-amber-300 font-mono">{comparisonStats.circuitBreakerFiltered} CB • {comparisonStats.antiWhipsawFiltered} Whipsaw</span>
+                          </div>
+                          <p className="text-amber-300/90 pt-1 font-sans text-[10px]">
+                            🛑 Prevents fighting stubborn directional trends and kills revenge-trading chop loops.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Filter 9: Volatility-Adaptive Daily Drawdown Guard */}
+                      <div className={`p-3.5 rounded-lg border transition-all ${
+                        samConfig.maxDailyLossEnabled
+                          ? 'bg-rose-950/20 border-rose-500/40 shadow-sm'
+                          : 'bg-[#111827] border-[#1F2937]'
+                      }`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={samConfig.maxDailyLossEnabled ?? false}
+                              onChange={e => setSamConfig(c => ({ ...c, maxDailyLossEnabled: e.target.checked }))}
+                              className="accent-rose-400 w-4 h-4 cursor-pointer"
+                            />
+                            <span className="text-xs font-bold text-white">9. Daily Drawdown Guard</span>
+                          </label>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            samConfig.maxDailyLossEnabled
+                              ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                              : 'bg-gray-800 text-gray-400'
+                          }`}>
+                            {samConfig.maxDailyLossEnabled ? (comparisonStats.dailyDrawdownHalted ? 'HALTED TODAY' : 'GUARD ACTIVE') : 'OFF'}
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-gray-300 mb-2">
+                          Caps maximum loss per day to protect capital on rare severe market outlier days:
+                        </p>
+
+                        <div className="flex items-center justify-between gap-2 mb-3 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800">
+                          <label className="text-[10px] text-gray-400">Max Daily Loss Limit:</label>
+                          <div className="flex items-center gap-1.5">
+                            <input
+                              type="number"
+                              min={40}
+                              max={150}
+                              step={5}
+                              value={samConfig.maxDailyLossPoints ?? 75}
+                              onChange={e => setSamConfig(c => ({ ...c, maxDailyLossPoints: Math.max(30, Number(e.target.value) || 75) }))}
+                              className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                            />
+                            <span className="text-[10px] text-gray-400">pts (Nifty Spot)</span>
+                          </div>
+                        </div>
+
+                        <div className="p-2 rounded bg-rose-900/10 border border-rose-800/30 text-[10px] space-y-0.5">
+                          <div className="flex justify-between text-gray-300">
+                            <span>Status Today:</span>
+                            <span className={`font-bold font-mono ${comparisonStats.dailyDrawdownHalted ? 'text-rose-400 animate-pulse' : 'text-emerald-300'}`}>
+                              {comparisonStats.dailyDrawdownHalted ? 'HALTED FOR TODAY' : 'NORMAL TRADING'}
+                            </span>
+                          </div>
+                          <p className="text-rose-300/90 pt-1 font-sans text-[10px]">
+                            🛡️ Guarantees no single bad session can ever cause catastrophic portfolio drawdown.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Filter 10: S12 Confluence Filter (DI Spread + EMA 100/200 + RVOL) */}
+                      <div className={`p-3.5 rounded-lg border transition-all ${
+                        samConfig.filterS12ConfluenceEnabled
+                          ? 'bg-sky-950/20 border-sky-500/40 shadow-sm'
+                          : 'bg-[#111827] border-[#1F2937]'
+                      }`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={samConfig.filterS12ConfluenceEnabled ?? false}
+                              onChange={e => setSamConfig(c => ({ ...c, filterS12ConfluenceEnabled: e.target.checked }))}
+                              className="accent-sky-400 w-4 h-4 cursor-pointer"
+                            />
+                            <span className="text-xs font-bold text-white">10. S12 Confluence Filter (Zero-Lookahead)</span>
+                          </label>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            samConfig.filterS12ConfluenceEnabled
+                              ? 'bg-sky-500/20 text-sky-300 border border-sky-500/30'
+                              : 'bg-gray-800 text-gray-400'
+                          }`}>
+                            {samConfig.filterS12ConfluenceEnabled ? 'FILTER ACTIVE' : 'OFF'}
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-gray-300 mb-2">
+                          Requires directional momentum, macro trend alignment, and volume participation strictly at Bar+1 close:
+                        </p>
+
+                        <div className="text-[10px] space-y-1 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800/80 font-mono mb-3 text-gray-300">
+                          <p className="text-sky-300">• DI Spread: +DI - (-DI) &gt; +{samConfig.s12DiSpreadMin ?? 5} (CALL) | -DI - (+DI) &gt; +{samConfig.s12DiSpreadMin ?? 5} (PUT)</p>
+                          <p className="text-emerald-300">• Macro Alignment: Close above EMA {samConfig.s12EmaFastPeriod ?? 100} &amp; EMA {samConfig.s12EmaSlowPeriod ?? 200} (CALL), below both (PUT)</p>
+                          <p className="text-amber-300">• Volume Participation: Bar+1 Volume &ge; {(samConfig.s12MinRvol ?? 0.7).toFixed(2)}x 20-bar Average Volume</p>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2.5 mb-3 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800">
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">Min DI Spread:</label>
+                            <input
+                              type="number"
+                              min={0}
+                              max={25}
+                              step={1}
+                              value={samConfig.s12DiSpreadMin ?? 5}
+                              onChange={e => setSamConfig(c => ({ ...c, s12DiSpreadMin: Math.max(0, Number(e.target.value) || 0) }))}
+                              className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                            />
+                          </div>
+
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">Min RVOL:</label>
+                            <input
+                              type="number"
+                              min={0}
+                              max={3}
+                              step={0.05}
+                              value={samConfig.s12MinRvol ?? 0.7}
+                              onChange={e => setSamConfig(c => ({ ...c, s12MinRvol: Math.max(0, Number(e.target.value) || 0) }))}
+                              className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                            />
+                          </div>
+
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">Fast Macro EMA:</label>
+                            <input
+                              type="number"
+                              min={20}
+                              max={200}
+                              step={10}
+                              value={samConfig.s12EmaFastPeriod ?? 100}
+                              onChange={e => setSamConfig(c => ({ ...c, s12EmaFastPeriod: Math.max(10, Number(e.target.value) || 100) }))}
+                              className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                            />
+                          </div>
+
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[10px] text-gray-400">Slow Macro EMA:</label>
+                            <input
+                              type="number"
+                              min={50}
+                              max={400}
+                              step={10}
+                              value={samConfig.s12EmaSlowPeriod ?? 200}
+                              onChange={e => setSamConfig(c => ({ ...c, s12EmaSlowPeriod: Math.max(20, Number(e.target.value) || 200) }))}
+                              className="w-16 bg-[#111827] border border-[#374151] rounded px-2 py-0.5 text-xs text-white font-mono text-center"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="p-2 rounded bg-sky-900/10 border border-sky-800/30 text-[10px] space-y-0.5">
+                          <div className="flex justify-between text-gray-300">
+                            <span>S12 Low-Confluence Blocked:</span>
+                            <span className="font-bold text-sky-300 font-mono">{comparisonStats.s12Filtered} Blocked</span>
+                          </div>
+                          <p className="text-sky-300/90 pt-1 font-sans text-[10px]">
+                            Filters counter-DI whipsaws, counter-EMA100/200 fades, and thin-volume dead-zone crossovers.
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Filter 11 (Rec #1): 1-Min SAM(21/5) Afternoon Breakout (#3 Fixed or #5 Chandelier) */}
+                      <div className={`p-3.5 rounded-lg border transition-all ${
+                        samConfig.filterSam21AfternoonEnabled
+                          ? 'bg-emerald-950/20 border-emerald-500/40 shadow-sm'
+                          : 'bg-[#111827] border-[#1F2937]'
+                      }`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={samConfig.filterSam21AfternoonEnabled ?? false}
+                              onChange={e => setSamConfig(c => ({ ...c, filterSam21AfternoonEnabled: e.target.checked }))}
+                              className="accent-emerald-400 w-4 h-4 cursor-pointer"
+                            />
+                            <span className="text-xs font-bold text-white">11. SAM 21/5 — 1m Afternoon Breakout (Rec #1)</span>
+                          </label>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            samConfig.filterSam21AfternoonEnabled
+                              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                              : 'bg-gray-800 text-gray-400'
+                          }`}>
+                            {samConfig.filterSam21AfternoonEnabled ? 'ACTIVE' : 'OFF'}
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-gray-300 mb-2">
+                          4-Year verified 1-Min SAM(21/5) institutional breakout (12:30–14:50 IST) with PDH/PDL breakout + causal 5m ADX(14) &ge; 30 &amp; DI spread &gt; 5. Auto-exit opposite disabled; holds trend to EOD (15:25 IST).
+                        </p>
+
+                        <div className="grid grid-cols-2 gap-2 mb-2.5">
+                          <button
+                            type="button"
+                            onClick={() => setSamConfig(c => ({ ...c, sam21AfternoonExitMode: 'fixed40' }))}
+                            className={`p-2 rounded-md border text-left transition-all cursor-pointer ${
+                              (samConfig.sam21AfternoonExitMode ?? 'fixed40') === 'fixed40'
+                                ? 'bg-emerald-500/15 border-emerald-400/60 text-emerald-200'
+                                : 'bg-[#0A0F1C] border-gray-800 text-gray-400 hover:text-gray-200'
+                            }`}
+                          >
+                            <div className="text-[11px] font-bold">#3 Fixed SL40 / BE+30 / EOD</div>
+                            <div className="text-[10px] font-mono opacity-80">PF 1.91 • OOS 1.77 • 5/5 Green Yrs</div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSamConfig(c => ({ ...c, sam21AfternoonExitMode: 'chandelier' }))}
+                            className={`p-2 rounded-md border text-left transition-all cursor-pointer ${
+                              samConfig.sam21AfternoonExitMode === 'chandelier'
+                                ? 'bg-emerald-500/15 border-emerald-400/60 text-emerald-200'
+                                : 'bg-[#0A0F1C] border-gray-800 text-gray-400 hover:text-gray-200'
+                            }`}
+                          >
+                            <div className="text-[11px] font-bold">#5 Chandelier 0.30% / 0.40%</div>
+                            <div className="text-[10px] font-mono opacity-80">PF 1.83 • WR 56.2% • 17.4x Ret/DD</div>
+                          </button>
+                        </div>
+
+                        <div className="p-2 rounded bg-emerald-900/10 border border-emerald-800/30 text-[10px] flex justify-between text-gray-300">
+                          <span>1m SAM(21/5) Afternoon Signals on Chart:</span>
+                          <span className="font-bold text-emerald-300 font-mono">{comparisonStats.sam21AfternoonSignals} Signals</span>
+                        </div>
+                      </div>
+
+                      {/* Filter 12 (Rec #2): Morning + Afternoon Combined (3m OpenDrive + 1m Afternoon) */}
+                      <div className={`p-3.5 rounded-lg border transition-all ${
+                        samConfig.filterSam21CombinedEnabled
+                          ? 'bg-amber-950/20 border-amber-500/40 shadow-sm'
+                          : 'bg-[#111827] border-[#1F2937]'
+                      }`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={samConfig.filterSam21CombinedEnabled ?? false}
+                              onChange={e => setSamConfig(c => ({ ...c, filterSam21CombinedEnabled: e.target.checked }))}
+                              className="accent-amber-400 w-4 h-4 cursor-pointer"
+                            />
+                            <span className="text-xs font-bold text-white">12. SAM 21/5 — Morning + Afternoon Combined (Rec #2)</span>
+                          </label>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            samConfig.filterSam21CombinedEnabled
+                              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                              : 'bg-gray-800 text-gray-400'
+                          }`}>
+                            {samConfig.filterSam21CombinedEnabled ? 'ACTIVE' : 'OFF'}
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-gray-300 mb-2">
+                          Combines two uncorrelated institutional windows (~+9,500 pts over 4 years, PF ~2.0):
+                        </p>
+
+                        <div className="text-[10px] space-y-1 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800/80 font-mono mb-2.5 text-gray-300">
+                          <p className="text-amber-300">• Morning (#1, PF 2.24): 3m SAM(21/5) OpenDrive (09:20–10:30) • PDH/PDL + StrongBar + 15m Supertrend • SL 2x / Trail 3x 5m ATR</p>
+                          <p className="text-emerald-300">• Afternoon (#3/#5, PF 1.83–1.91): 1m SAM(21/5) (12:30–14:50) • PDH/PDL + 5m ADX &ge; 30 &amp; DI &gt; 5 • Uses selected exit mode above</p>
+                        </div>
+
+                        <div className="p-2 rounded bg-amber-900/10 border border-amber-800/30 text-[10px] flex justify-between text-gray-300">
+                          <span>Combined Signals (Morning 3m / Afternoon 1m):</span>
+                          <span className="font-bold text-amber-300 font-mono">
+                            {comparisonStats.sam21OpenDriveSignals} Morning + {comparisonStats.sam21AfternoonSignals} Afternoon
+                          </span>
+                        </div>
+                      </div>
                     </div>
                   </div>
 
@@ -6079,46 +5612,12 @@ export function LiveChart({ livePrice, instrument }: { livePrice?: number; instr
             <div className="px-6 py-4 border-t border-[#1F2937] bg-[#0A0F1C]/80 flex items-center justify-between">
               <button
                 onClick={() => {
-                  if (showStrategySettingsModal === 'ALPHATREND') {
-                    setAlphaTrendConfig({
-                      period: 18,
-                      coeff: 1.6,
-                      useRsi: false, // MFI with Upstox Volume
-                      candleConfirm: true,
-                      volumeConfirm: true,
-                      slMultiple: 1.2,
-                      tp1Multiple: 1.6,
-                      tp2Multiple: 2.5
-                    });
-                  } else if (showStrategySettingsModal === 'T3') {
-                    setT3Config({
-                      period: 21,
-                      hot: 0.55,
-                      type: 'T3 New',
-                      minRibbonExpansion: 0.12,
-                      candleConfirm: true,
-                      volumeConfirm: true,
-                      volumeWeighted: false,
-                      slMultiple: 1.1,
-                      tp1Multiple: 1.4,
-                      tp2Multiple: 2.2
-                    });
-                  } else if (showStrategySettingsModal === 'SAM') {
-                    setSamConfig({ ...DEFAULT_SAM_CONFIG });
-                  } else {
-                    setComboConfig({
-                      maxTradeDurationMinutes: 60,
-                      oneTradeAtATime: true,
-                      slMultiple: 1.2,
-                      tp1Multiple: 1.5,
-                      tp2Multiple: 2.5
-                    });
-                  }
+                  setSamConfig({ ...DEFAULT_SAM_CONFIG });
                 }}
                 className="px-3.5 py-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
               >
                 <span>🎯</span>
-                <span>{showStrategySettingsModal === 'SAM' ? 'Restore Pine Script Defaults (SL 20pts)' : 'Restore Optimal Preset'}</span>
+                <span>Restore Pine Script Defaults (SL 20pts)</span>
               </button>
 
               <button

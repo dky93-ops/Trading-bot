@@ -4,12 +4,23 @@ import { LiveChart } from './components/LiveChart';
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState, useRef, useMemo } from 'react';
+import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 import { Settings, Download, Trash2, Activity, Clock, ShieldAlert, BarChart3, TrendingUp, Power, Server, RefreshCw, Lock, Unlock, CheckCircle2 } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { OptionChainReplay } from './components/OptionChainReplay';
+import {
+  TradeNotificationHeaderControls,
+  TradeToastStack,
+} from './components/TradeNotificationCenter';
+import {
+  TradeNotificationEvent,
+  mergeNotificationIdempotent,
+  playTradeAlertSound,
+  showBrowserTradeNotification,
+  unlockAudioContext,
+} from './lib/trade-notifications';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -31,6 +42,107 @@ export default function App() {
 
   const [settings, setSettings] = useState<any>(null);
   const [chartData, setChartData] = useState<any[]>([]);
+
+  // Real-time trade notification state & preferences
+  const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [notifications, setNotifications] = useState<TradeNotificationEvent[]>([]);
+  const [toasts, setToasts] = useState<TradeNotificationEvent[]>([]);
+  const [unreadCount, setUnreadCount] = useState<number>(0);
+  const [isTestingAlert, setIsTestingAlert] = useState<boolean>(false);
+  const [audioEnabled, setAudioEnabled] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('indian_quant_audio_enabled');
+      return saved === null ? true : saved === 'true';
+    } catch {
+      return true;
+    }
+  });
+  const [pendingAlertsEnabled, setPendingAlertsEnabled] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('indian_quant_pending_alerts');
+      return saved === null ? true : saved === 'true';
+    } catch {
+      return true;
+    }
+  });
+  const [desktopPermission, setDesktopPermission] = useState<NotificationPermission | 'unsupported'>(() => {
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      return Notification.permission;
+    }
+    return 'unsupported';
+  });
+
+  const audioEnabledRef = useRef(audioEnabled);
+  audioEnabledRef.current = audioEnabled;
+  const pendingAlertsEnabledRef = useRef(pendingAlertsEnabled);
+  pendingAlertsEnabledRef.current = pendingAlertsEnabled;
+  const seenNotificationIdsRef = useRef<Set<string>>(new Set());
+  const toastTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  const handleDismissToast = useCallback((id: string) => {
+    const timer = toastTimersRef.current.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      toastTimersRef.current.delete(id);
+    }
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const handleIncomingNotification = useCallback(
+    (event: TradeNotificationEvent) => {
+      if (!event || !event.id) return;
+      if (seenNotificationIdsRef.current.has(event.id)) return;
+      seenNotificationIdsRef.current.add(event.id);
+      if (seenNotificationIdsRef.current.size > 1000) {
+        const oldest = seenNotificationIdsRef.current.values().next().value;
+        if (oldest) seenNotificationIdsRef.current.delete(oldest);
+      }
+
+      setNotifications((prev) => mergeNotificationIdempotent(prev, event, 60).list);
+
+      if (event.kind === 'SETUP_PENDING' && !pendingAlertsEnabledRef.current) {
+        return;
+      }
+
+      setUnreadCount((c) => c + 1);
+      setToasts((prev) => [event, ...prev.filter((t) => t.id !== event.id)].slice(0, 4));
+
+      const existingTimer = toastTimersRef.current.get(event.id);
+      if (existingTimer) clearTimeout(existingTimer);
+      const timer = setTimeout(() => {
+        toastTimersRef.current.delete(event.id);
+        setToasts((prev) => prev.filter((t) => t.id !== event.id));
+      }, 12_000);
+      toastTimersRef.current.set(event.id, timer);
+
+      if (audioEnabledRef.current) {
+        playTradeAlertSound(event);
+      }
+      showBrowserTradeNotification(event);
+    },
+    []
+  );
+
+  // Unlock browser AudioContext on first user interaction so real-time chimes play immediately
+  useEffect(() => {
+    const unlock = () => unlockAudioContext();
+    window.addEventListener('pointerdown', unlock, { passive: true });
+    window.addEventListener('keydown', unlock, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+  }, []);
+
+  // Cleanup any pending toast timers on unmount
+  useEffect(() => {
+    return () => {
+      for (const timer of toastTimersRef.current.values()) {
+        clearTimeout(timer);
+      }
+      toastTimersRef.current.clear();
+    };
+  }, []);
 
   useEffect(() => {
     // Check localStorage first
@@ -62,12 +174,16 @@ export default function App() {
     }
 
     let ws: WebSocket;
-    let reconnectTimeout: NodeJS.Timeout;
+    let reconnectTimeout: ReturnType<typeof setTimeout>;
 
     const connectWs = () => {
       try {
         const wsUrl = window.location.protocol === 'https:' ? `wss://${window.location.host}` : `ws://${window.location.host}`;
         ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          setWsConnected(true);
+        };
 
         ws.onmessage = (event) => {
           try {
@@ -86,6 +202,30 @@ export default function App() {
             } else if (msg.type === 'SETTINGS_UPDATE' && msg.data) {
               setSettings(msg.data);
               localStorage.setItem('indian_quant_settings', JSON.stringify(msg.data));
+            } else if (msg.type === 'TRADE_NOTIFICATION' && msg.data) {
+              handleIncomingNotification(msg.data);
+            } else if (msg.type === 'NOTIFICATIONS_INIT' && Array.isArray(msg.data)) {
+              // Seed server history silently without replaying audio/toast storms
+              const incomingList = msg.data as TradeNotificationEvent[];
+              for (const ev of incomingList) {
+                if (ev?.id) seenNotificationIdsRef.current.add(ev.id);
+              }
+              setNotifications((prev) => {
+                let merged = [...prev];
+                for (let i = incomingList.length - 1; i >= 0; i--) {
+                  merged = mergeNotificationIdempotent(merged, incomingList[i], 60).list;
+                }
+                return merged;
+              });
+            } else if (msg.type === 'NOTIFICATIONS_CLEARED') {
+              seenNotificationIdsRef.current.clear();
+              for (const timer of toastTimersRef.current.values()) {
+                clearTimeout(timer);
+              }
+              toastTimersRef.current.clear();
+              setNotifications([]);
+              setToasts([]);
+              setUnreadCount(0);
             }
           } catch (e) {
             console.warn("WS parse error:", e);
@@ -97,10 +237,12 @@ export default function App() {
         };
 
         ws.onclose = () => {
+          setWsConnected(false);
           reconnectTimeout = setTimeout(connectWs, 2000);
         };
       } catch (e) {
         console.warn("WebSocket connection attempt error:", e);
+        setWsConnected(false);
         reconnectTimeout = setTimeout(connectWs, 2000);
       }
     };
@@ -131,7 +273,63 @@ export default function App() {
         ws.close();
       }
     };
-  }, []);
+  }, [handleIncomingNotification]);
+
+  const handleToggleAudio = () => {
+    setAudioEnabled((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('indian_quant_audio_enabled', String(next));
+      } catch {}
+      return next;
+    });
+  };
+
+  const handleTogglePendingAlerts = () => {
+    setPendingAlertsEnabled((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('indian_quant_pending_alerts', String(next));
+      } catch {}
+      return next;
+    });
+  };
+
+  const handleRequestDesktopPermission = async () => {
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+      setDesktopPermission('unsupported');
+      return;
+    }
+    try {
+      const perm = await Notification.requestPermission();
+      setDesktopPermission(perm);
+    } catch {
+      // ignore permission prompt errors
+    }
+  };
+
+  const handleClearNotifications = async () => {
+    try {
+      await fetch('/api/notifications/clear', { method: 'POST' });
+    } catch {
+      seenNotificationIdsRef.current.clear();
+      setNotifications([]);
+      setToasts([]);
+      setUnreadCount(0);
+    }
+  };
+
+  const handleSendTestNotification = async () => {
+    unlockAudioContext();
+    setIsTestingAlert(true);
+    try {
+      await fetch('/api/notifications/test', { method: 'POST' });
+    } catch (e) {
+      console.warn("Test notification failed:", e);
+    } finally {
+      setIsTestingAlert(false);
+    }
+  };
 
   const saveSettingsToStorageAndServer = async (newSettings: any) => {
     setSettings(newSettings);
@@ -206,14 +404,26 @@ export default function App() {
             </div>
           </div>
           
-          <div className="flex items-center space-x-6">
-            <button className="flex items-center space-x-2 px-3 py-1.5 rounded bg-transparent border border-[#1F2937] text-xs font-bold text-gray-400 hover:text-white transition-colors">
-              <Activity size={14} />
-              <span>AUDIO ON</span>
-            </button>
-          </div>
+          <TradeNotificationHeaderControls
+            notifications={notifications}
+            unreadCount={unreadCount}
+            wsConnected={wsConnected}
+            audioEnabled={audioEnabled}
+            onToggleAudio={handleToggleAudio}
+            desktopPermission={desktopPermission}
+            onRequestDesktopPermission={handleRequestDesktopPermission}
+            pendingAlertsEnabled={pendingAlertsEnabled}
+            onTogglePendingAlerts={handleTogglePendingAlerts}
+            onMarkAllRead={() => setUnreadCount(0)}
+            onClearAll={handleClearNotifications}
+            onSendTestNotification={handleSendTestNotification}
+            isTestingAlert={isTestingAlert}
+          />
         </div>
       </header>
+
+      {/* Real-time Floating Alert Toasts (visible across all tabs) */}
+      <TradeToastStack toasts={toasts} onDismiss={handleDismissToast} />
 
       {/* Main Layout */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex flex-col gap-6">
@@ -349,7 +559,8 @@ export default function App() {
 
         <main className="min-h-[400px]">
           {activeTab === 'dashboard' && (() => {
-            const enabledStrategiesCount = Object.values(settings?.strategies || {}).filter((s: any) => s.enabled).length;
+            const activeStrategyKeys = ['samSignals', 'macdAdaptiveSupertrend'] as const;
+            const enabledStrategiesCount = activeStrategyKeys.filter((k) => settings?.strategies?.[k]?.enabled).length;
             const activeTradesCount = state.signals?.filter((s: any) => s.status === 'ACTIVE').length || 0;
 
             return (
@@ -358,7 +569,7 @@ export default function App() {
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 flex-1">
                   <StatBox title="NET REALIZED P&L" value={`+₹${Math.max(0, state.overallPnL || 0).toLocaleString()}`} sub="Across active strategies" color={state.overallPnL >= 0 ? "green" : "red"} large />
                   <StatBox title="OVERALL WIN RATE" value={`${(state.winRate || 0).toFixed(0)}%`} sub={`${state.winningTrades || 0} wins out of ${state.totalTrades || 0} trades`} color="green" large />
-                  <StatBox title="ACTIVE STRATEGIES" value={`${settings?.isTradingEnabled ? enabledStrategiesCount : 0} / 6`} sub={settings?.isTradingEnabled ? `${enabledStrategiesCount} Modules Enabled` : "Trading Paused"} color={settings?.isTradingEnabled && enabledStrategiesCount > 0 ? "blue" : "gray"} large />
+                  <StatBox title="ACTIVE STRATEGIES" value={`${settings?.isTradingEnabled ? enabledStrategiesCount : 0} / 2`} sub={settings?.isTradingEnabled ? `${enabledStrategiesCount} Modules Enabled` : "Trading Paused"} color={settings?.isTradingEnabled && enabledStrategiesCount > 0 ? "blue" : "gray"} large />
                   <StatBox title="OPEN POSITIONS" value={`${activeTradesCount}`} sub="Active Trades Running" color={activeTradesCount > 0 ? "purple" : "gray"} large />
                 </div>
               </div>
@@ -383,7 +594,8 @@ export default function App() {
                 <LiveChart 
                   key="nifty-chart"
                   livePrice={state.nifty50?.lastPrice} 
-                  instrument="NIFTY" 
+                  instrument="NIFTY"
+                  onTradeNotification={handleIncomingNotification}
                 />
               </div>
             </div>
@@ -395,7 +607,7 @@ export default function App() {
               <div className="p-4 border-b border-[#1F2937] flex justify-between items-center">
                 <div>
                   <h3 className="text-lg font-bold text-white">Execution Signals Log</h3>
-                  <p className="text-xs text-gray-500">Live JSON signal outputs generated by the 5-strategy option buying engine.</p>
+                  <p className="text-xs text-gray-500">Live JSON signal outputs generated by the chart strategy option buying engine.</p>
                 </div>
                 <div className="flex space-x-2">
                   <button
@@ -448,7 +660,7 @@ export default function App() {
                       state.signals.map((sig: any, i: number) => {
                         const stratKey = (sig.strategy_family || sig.strategy || '').toLowerCase();
                         const lots = settings?.strategies?.[stratKey]?.lotSize || 1;
-                        const qty = 75 * lots;
+                        const qty = 65 * lots;
                         
                         let tradePnL = 0;
                         if (sig.status === 'CLOSED') {
@@ -688,40 +900,8 @@ export default function App() {
                     rule: 'Zero Repaint Bar+1 Confirmation'
                   },
                   { 
-                    key: 'comboFiltered', 
-                    name: '2. T3 + AlphaTrend Combo: Filtered Version (FILTERED)', 
-                    desc: 'Filtered confluence of T3 Striped Ribbon and AlphaTrend with Upstox Volume >= 0.85x SMA, candle conviction, ribbon spread expansion (>0.12x ATR), and 50 EMA trend filter. One trade at a time limit.', 
-                    win: '5m / 15m (All Timeframes)', 
-                    rr: '1.5R to 2.5R',
-                    rule: 'Volume + Ribbon Expansion + 50 EMA'
-                  },
-                  { 
-                    key: 'comboUnfiltered', 
-                    name: '3. T3 + AlphaTrend Combo: Unfiltered Version (UNFILTERED)', 
-                    desc: 'Immediate confluence entry whenever AlphaTrend signal and T3 Striped Ribbon direction align simultaneously without volume/candle filters. Enforces one trade at a time and maximum duration exits.', 
-                    win: '5m / 15m (All Timeframes)', 
-                    rr: '1.5R to 2.5R',
-                    rule: 'Immediate Confluence Entry'
-                  },
-                  { 
-                    key: 'alphaTrend', 
-                    name: '4. AlphaTrend Indicator Strategy [Kıvanç Özbilgiç]', 
-                    desc: 'Momentum and volatility trend follower using Upstox Volume MFI (Money Flow Index) or RSI with dynamic ATR trailing support/resistance bands and dual profit targets.', 
-                    win: '5m Primary Timeframe', 
-                    rr: '1.6R to 2.5R',
-                    rule: 'MFI Upstox Volume Trailing Bands'
-                  },
-                  { 
-                    key: 't3Striped', 
-                    name: '5. T3 Striped Ribbon [Loxx]', 
-                    desc: 'Multi-layered Tillson T3 moving average ribbon with hot-factor smoothing (hot=0.55, period=21). Detects fast trend shifts, compression squeezes, and ribbon expansion.', 
-                    win: '5m Primary Timeframe', 
-                    rr: '1.4R to 2.2R',
-                    rule: 'Tillson T3 Multi-Level Ribbon'
-                  },
-                  { 
                     key: 'macdAdaptiveSupertrend', 
-                    name: '6. NIFTY MACD Adaptive SuperTrend v3.1', 
+                    name: '2. NIFTY MACD Adaptive SuperTrend v3.1', 
                     desc: 'Adaptive ATR Multiplier (1.5x - 3.5x) dynamically calibrated via Normalized ADX volatility + MACD Momentum & Zero-Lag DEMA Confluence with volatility-based targets.', 
                     win: '5m / 15m Timeframe', 
                     rr: '1.5R to 2.5R',
@@ -817,7 +997,7 @@ export default function App() {
                   <div className="bg-[#0A0F1C] border border-[#1F2937] rounded-md p-4 space-y-2">
                     <div className="text-brand-blue font-bold uppercase text-[11px]">2. Zero Repaint Candle Execution</div>
                     <p className="text-gray-400 leading-relaxed font-sans text-xs">
-                      All 6 chart strategies (SAM Signals, T3 Ribbon, AlphaTrend, Filtered/Unfiltered Combo, MACD Adaptive SuperTrend) evaluate strictly upon completed candle closes (Bar+1) with zero repainting.
+                      Active chart strategies (SAM Signals, MACD Adaptive SuperTrend) evaluate strictly upon completed candle closes (Bar+1) with zero repainting.
                     </p>
                   </div>
                   <div className="bg-[#0A0F1C] border border-[#1F2937] rounded-md p-4 space-y-2">

@@ -6,6 +6,12 @@ import { createServer } from "http";
 import { WebSocketServer } from "ws";
 import { config } from "dotenv";
 import { UpstoxService } from "./src/backend/upstox-service.js";
+import {
+  OptionPremiumResolver,
+  buildCompactOptionSnapshots,
+  NIFTY_LOT_SIZE,
+  TradeOptionInput,
+} from "./src/backend/option-premium-resolver.js";
 
 config();
 
@@ -14,13 +20,38 @@ async function startServer() {
   const PORT = 3000;
   
   app.use(cors());
-  app.use(express.json());
+  app.use(express.json({ limit: '2mb' }));
   
   const server = createServer(app);
   const wss = new WebSocketServer({ server });
 
   // Initialize Upstox Service (this handles polling, strategies, and signals)
   const upstoxService = new UpstoxService(wss);
+  const optionPremiumResolver = new OptionPremiumResolver({
+    getHistory: () => upstoxService.getOptionChainHistory(),
+    getAccessToken: () => upstoxService.getAccessToken(),
+    getActiveExpiries: (instrumentKey) => upstoxService.getExpiries(instrumentKey),
+    getActiveOptionChain: (instrumentKey, expiryDate) => upstoxService.getOptionChain(instrumentKey, expiryDate),
+  });
+
+  // Automatically backfill missing recent historical option chain snapshots into PostgreSQL on startup
+  setTimeout(() => {
+    optionPremiumResolver
+      .backfillHistoricalOptionChain({
+        maxDays: 10,
+        onSnapshotsCreated: (snaps) => upstoxService.mergeOptionChainSnapshots(snaps),
+      })
+      .then((summary) => {
+        if (summary.snapshotsCreated > 0) {
+          console.log(
+            `[OptionBackfill] Startup backfill complete: ${summary.snapshotsCreated} snapshots across ${summary.extractedDays.join(', ')}`
+          );
+        }
+      })
+      .catch((e) => {
+        console.warn("[OptionBackfill] Startup backfill warning:", e?.message || e);
+      });
+  }, 5000);
   
   // Health Check Endpoint for Koyeb / UptimeRobot keep-alive checks
   let healthCheckCount = 0;
@@ -158,32 +189,189 @@ async function startServer() {
     }
   });
 
+  // Real-Time Trade Notifications API (WebSocket-backed, server-authoritative)
+  app.get("/api/notifications", (_req, res) => {
+    res.json({
+      status: "success",
+      notifications: upstoxService.getNotifications(),
+    });
+  });
+
+  app.post("/api/notifications/emit", (req, res) => {
+    try {
+      const body = req.body;
+      if (!body || typeof body !== 'object') {
+        return res.status(400).json({ error: "Invalid notification payload" });
+      }
+      const id = typeof body.id === 'string' ? body.id.trim() : '';
+      const kind =
+        body.kind === 'TRADE_OPENED' || body.kind === 'TRADE_CLOSED' || body.kind === 'SETUP_PENDING'
+          ? body.kind
+          : null;
+      const direction = body.direction === 'CALL' || body.direction === 'PUT' ? body.direction : null;
+      const signal = typeof body.signal === 'string' ? body.signal.trim().slice(0, 140) : '';
+      const entryPrice = Number(body.entryPrice);
+
+      if (!id || id.length > 160 || !kind || !direction || !signal || !Number.isFinite(entryPrice) || entryPrice <= 0) {
+        return res.status(400).json({ error: "Missing or invalid required trade notification fields" });
+      }
+
+      const source =
+        body.source === 'LIVE_CHART' ||
+        body.source === 'STRATEGY_ENGINE' ||
+        body.source === 'SERVER_SAM_WATCHER' ||
+        body.source === 'TEST'
+          ? body.source
+          : 'LIVE_CHART';
+
+      const optionalNum = (v: unknown): number | undefined => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : undefined;
+      };
+
+      const result = upstoxService.emitTradeNotification({
+        id,
+        kind,
+        direction,
+        signal,
+        source,
+        timestamp: optionalNum(body.timestamp) ?? Date.now(),
+        candleTimeSec: optionalNum(body.candleTimeSec),
+        entryPrice,
+        stoploss: optionalNum(body.stoploss),
+        target: optionalNum(body.target),
+        exitPrice: optionalNum(body.exitPrice),
+        exitReason: typeof body.exitReason === 'string' ? body.exitReason.slice(0, 60) : undefined,
+        status:
+          body.status === 'OPEN' || body.status === 'WIN' || body.status === 'LOSS' || body.status === 'BE'
+            ? body.status
+            : undefined,
+        spotPnl: optionalNum(body.spotPnl),
+        optionStrike: optionalNum(body.optionStrike),
+        optionType: body.optionType === 'CE' || body.optionType === 'PE' ? body.optionType : undefined,
+        optionEntryPremium: optionalNum(body.optionEntryPremium),
+        optionExitPremium: optionalNum(body.optionExitPremium),
+        premiumPnl: optionalNum(body.premiumPnl),
+        lotPnl: optionalNum(body.lotPnl),
+        message: typeof body.message === 'string' ? body.message.slice(0, 180) : undefined,
+      });
+
+      res.json({ status: "success", accepted: result.accepted, event: result.event });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/notifications/test", (_req, res) => {
+    try {
+      const event = upstoxService.emitTestNotification();
+      res.json({ status: "success", event });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/notifications/clear", (_req, res) => {
+    try {
+      upstoxService.clearNotifications();
+      res.json({ status: "success" });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/sam-config", (req, res) => {
+    try {
+      if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+        return res.status(400).json({ error: "Invalid SAM config payload" });
+      }
+      upstoxService.updateLiveSamConfig(req.body);
+      res.json({ status: "success" });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   app.get("/api/option-chain/premium-lookup", (req, res) => {
     try {
       const history = upstoxService.getOptionChainHistory();
-      const compactSnapshots = history.map((s: any) => {
-        const spot = Number(s.spotPrice || 0);
-        const atmStrike = Math.round(spot / 50) * 50;
-        const row = s.rows?.find((r: any) => r.strike === atmStrike);
-        return {
-          t: s.timestamp,
-          spot: spot,
-          atm: atmStrike,
-          ceLtp: row?.ce?.ltp ?? null,
-          peLtp: row?.pe?.ltp ?? null,
-          ceDelta: row?.ce?.delta !== undefined ? Number(row.ce.delta) : 0.50,
-          peDelta: row?.pe?.delta !== undefined ? Number(row.pe.delta) : -0.50,
-        };
-      });
+      const compactSnapshots = buildCompactOptionSnapshots(history);
+
+      const ceLtps = compactSnapshots.map(s => s.ceLtp).filter((v): v is number => typeof v === 'number' && v > 0);
+      const peLtps = compactSnapshots.map(s => s.peLtp).filter((v): v is number => typeof v === 'number' && v > 0);
+      const deltas = compactSnapshots
+        .flatMap(s => [s.ceDelta, s.peDelta])
+        .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v !== 0)
+        .map(v => Math.abs(v));
+
+      const avg = (arr: number[]) => arr.length > 0 ? Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2)) : null;
 
       res.json({
         status: "success",
         count: compactSnapshots.length,
-        lotSize: 65,
-        avgAtmDelta: 0.50,
-        avgAtmCeLtp: 89.94,
-        avgAtmPeLtp: 87.95,
+        lotSize: NIFTY_LOT_SIZE,
+        avgAtmDelta: avg(deltas),
+        avgAtmCeLtp: avg(ceLtps),
+        avgAtmPeLtp: avg(peLtps),
         snapshots: compactSnapshots,
+      });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/option-chain/resolve-trades", async (req, res) => {
+    try {
+      const rawTrades = req.body?.trades;
+      const timeframeMin = Math.max(1, Math.min(60, Number(req.body?.timeframeMin) || 1));
+      if (!Array.isArray(rawTrades)) {
+        return res.status(400).json({ error: "trades array is required" });
+      }
+      if (rawTrades.length > 500) {
+        return res.status(400).json({ error: "Maximum 500 trades per request" });
+      }
+
+      const sanitized: TradeOptionInput[] = [];
+      for (const item of rawTrades) {
+        if (!item || typeof item !== 'object') continue;
+        const id = String(item.id || '').trim();
+        const type = item.type === 'SHORT' ? 'SHORT' : item.type === 'LONG' ? 'LONG' : null;
+        const entryTime = Number(item.entryTime);
+        const entryPrice = Number(item.entryPrice);
+        if (!id || !type || !Number.isFinite(entryTime) || !Number.isFinite(entryPrice) || entryPrice <= 0) {
+          continue;
+        }
+        const status = item.status === 'WIN' || item.status === 'LOSS' || item.status === 'BE' ? item.status : 'OPEN';
+        sanitized.push({
+          id,
+          type,
+          entryTime,
+          entryPrice,
+          exitTime: Number.isFinite(Number(item.exitTime)) ? Number(item.exitTime) : undefined,
+          exitPrice: Number.isFinite(Number(item.exitPrice)) ? Number(item.exitPrice) : undefined,
+          exitReason: typeof item.exitReason === 'string' ? item.exitReason : undefined,
+          status,
+          pnl: Number.isFinite(Number(item.pnl)) ? Number(item.pnl) : undefined,
+          timeframeMin: Number.isFinite(Number(item.timeframeMin)) ? Math.max(1, Number(item.timeframeMin)) : timeframeMin,
+          exitSpotBar: item.exitSpotBar &&
+            Number.isFinite(Number(item.exitSpotBar.high)) &&
+            Number.isFinite(Number(item.exitSpotBar.low))
+            ? {
+                open: Number(item.exitSpotBar.open) || Number(item.exitSpotBar.close) || entryPrice,
+                high: Number(item.exitSpotBar.high),
+                low: Number(item.exitSpotBar.low),
+                close: Number(item.exitSpotBar.close) || entryPrice,
+              }
+            : undefined,
+        });
+      }
+
+      const resolved = await optionPremiumResolver.resolveTrades(sanitized, timeframeMin);
+      res.json({
+        status: "success",
+        lotSize: NIFTY_LOT_SIZE,
+        count: Object.keys(resolved).length,
+        resolved,
       });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
@@ -225,10 +413,29 @@ async function startServer() {
     });
   });
 
+  app.post("/api/option-chain/backfill", async (req, res) => {
+    try {
+      const maxDays = Math.max(1, Math.min(25, Number(req.body?.maxDays) || 12));
+      const summary = await optionPremiumResolver.backfillHistoricalOptionChain({
+        maxDays,
+        onSnapshotsCreated: (snaps) => upstoxService.mergeOptionChainSnapshots(snaps),
+      });
+      res.json({
+        status: "success",
+        ...summary,
+        totalSnapshots: upstoxService.getOptionChainHistory().length,
+      });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   app.get("/api/option-chain/history", (req, res) => {
     try {
       const history = upstoxService.getOptionChainHistory();
-      res.json({ status: "success", count: history.length, snapshots: history });
+      const limit = Math.max(50, Math.min(5000, Number(req.query.limit) || 1000));
+      const slice = history.length > limit ? history.slice(-limit) : history;
+      res.json({ status: "success", count: slice.length, totalCount: history.length, snapshots: slice });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }

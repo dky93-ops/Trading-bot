@@ -5,9 +5,25 @@ import path from 'path';
 import { StrategyEngine } from './strategy-engine.js';
 import { AppSettings, AppState, OptionChainSnapshot, TradingSymbol, InternalSignal } from './types.js';
 import { insertTick, seedHistoricalCandles, getCandles } from '../db/market.js';
+import {
+  saveOptionChainSnapshotToDb,
+  saveOptionChainSnapshotsBatchToDb,
+  loadOptionChainHistoryFromDb,
+  clearOptionChainHistoryInDb,
+} from '../db/option-chain.js';
 import { EnhancedDataManager } from './enhanced-data-manager.js';
 import { EnhancedOptionChainRecorder } from './enhanced-option-chain-recorder.js';
 import { UpstoxDataFetcher } from './upstox-data-fetcher.js';
+import {
+  TradeNotificationEvent,
+  isFreshLiveCandleTime,
+  mergeNotificationIdempotent,
+} from '../lib/trade-notifications.js';
+import {
+  computeSamSignals,
+  DEFAULT_SAM_CONFIG,
+  SamSignalsConfig,
+} from './sam-signals.js';
 
 export class UpstoxService {
   private wss: WebSocketServer;
@@ -44,10 +60,6 @@ export class UpstoxService {
     LAST_ENTRY_TIME_IST: '15:00',
     strategies: {
       samSignals: { enabled: true, lotSize: 1 },
-      comboFiltered: { enabled: true, lotSize: 1 },
-      comboUnfiltered: { enabled: true, lotSize: 1 },
-      alphaTrend: { enabled: true, lotSize: 1 },
-      t3Striped: { enabled: true, lotSize: 1 },
       macdAdaptiveSupertrend: { enabled: true, lotSize: 1 },
     },
   };
@@ -66,6 +78,10 @@ export class UpstoxService {
       ...safe,
       hasAccessToken: Boolean(this.settings.accessToken),
     };
+  }
+
+  public getAccessToken(): string {
+    return this.settings.accessToken || process.env.UPSTOX_ACCESS_TOKEN || '';
   }
 
   private state: AppState = {
@@ -92,6 +108,10 @@ export class UpstoxService {
   private candleSyncBackoffUntil = 0;
   private optionChainCache: Record<string, { timestamp: number, data: any }> = {};
   private invalidInstrumentKeys = new Set<string>();
+  private tradeNotifications: TradeNotificationEvent[] = [];
+  private emittedNotificationIds = new Set<string>();
+  private lastKnownSignalStatuses = new Map<string, string>();
+  private liveSamConfig: SamSignalsConfig = { ...DEFAULT_SAM_CONFIG };
 
   private isValidUpstoxKey(key: string): boolean {
     if (!key || typeof key !== 'string') return false;
@@ -154,11 +174,19 @@ export class UpstoxService {
     if (fs.existsSync(this.historyFilePath)) {
       try {
         const data = fs.readFileSync(this.historyFilePath, 'utf8');
-        this.optionChainHistory = JSON.parse(data);
+        const parsed = JSON.parse(data);
+        if (Array.isArray(parsed)) {
+          this.optionChainHistory = parsed;
+        }
       } catch (e) {
-        console.error("Failed to load option chain history:", e);
+        console.error("Failed to load legacy option chain history file:", e);
       }
     }
+
+    // Hydrate option chain history from Cloud SQL and migrate any legacy JSON snapshots once
+    this.initOptionChainHistoryFromDb().catch((e) => {
+      console.error("Failed to initialize option chain history from database:", e);
+    });
     
     if (this.hasBrokerCredentials()) {
       this.startPolling();
@@ -167,6 +195,7 @@ export class UpstoxService {
     this.wss.on('connection', (ws) => {
       this.clients.add(ws);
       ws.send(JSON.stringify({ type: 'STATE_UPDATE', data: this.state }));
+      ws.send(JSON.stringify({ type: 'NOTIFICATIONS_INIT', data: this.tradeNotifications }));
       
       ws.on('close', () => {
         this.clients.delete(ws);
@@ -174,13 +203,298 @@ export class UpstoxService {
     });
   }
 
-  private saveOptionChainHistoryToDisk() {
+  public getNotifications(): TradeNotificationEvent[] {
+    return this.tradeNotifications;
+  }
+
+  public updateLiveSamConfig(cfg: Partial<SamSignalsConfig>) {
+    if (!cfg || typeof cfg !== 'object') return;
+    this.liveSamConfig = {
+      ...this.liveSamConfig,
+      ...cfg,
+    };
+  }
+
+  public emitTradeNotification(event: TradeNotificationEvent): { accepted: boolean; event: TradeNotificationEvent } {
+    if (!event || !event.id) {
+      return { accepted: false, event };
+    }
+    if (this.emittedNotificationIds.has(event.id)) {
+      return { accepted: false, event };
+    }
+
+    const normalized: TradeNotificationEvent = {
+      ...event,
+      timestamp: Number.isFinite(event.timestamp) ? event.timestamp : Date.now(),
+    };
+
+    const merged = mergeNotificationIdempotent(this.tradeNotifications, normalized, 60);
+    if (!merged.added) {
+      return { accepted: false, event: normalized };
+    }
+
+    this.emittedNotificationIds.add(normalized.id);
+    if (this.emittedNotificationIds.size > 1000) {
+      const oldest = this.emittedNotificationIds.values().next().value;
+      if (oldest) this.emittedNotificationIds.delete(oldest);
+    }
+
+    this.tradeNotifications = merged.list;
+    this.broadcast({ type: 'TRADE_NOTIFICATION', data: normalized });
+    return { accepted: true, event: normalized };
+  }
+
+  public clearNotifications() {
+    this.tradeNotifications = [];
+    this.emittedNotificationIds.clear();
+    this.broadcast({ type: 'NOTIFICATIONS_CLEARED' });
+  }
+
+  private lookupLatestOptionPremium(spotPrice: number, optionType: 'CE' | 'PE'): { strike: number; ltp?: number } {
+    const strike = Math.round(spotPrice / 50) * 50;
+    const latestSnap = this.optionChainHistory[this.optionChainHistory.length - 1];
+    if (latestSnap && Array.isArray(latestSnap.rows)) {
+      const row = latestSnap.rows.find((r: any) => Number(r.strike) === strike);
+      const leg = optionType === 'CE' ? row?.ce : row?.pe;
+      const ltp = Number(leg?.ltp);
+      if (Number.isFinite(ltp) && ltp > 0) {
+        return { strike, ltp };
+      }
+    }
+    return { strike };
+  }
+
+  public emitTestNotification(): TradeNotificationEvent {
+    const spot = this.state.nifty50.lastPrice > 0 ? this.state.nifty50.lastPrice : 25800;
+    const opt = this.lookupLatestOptionPremium(spot, 'CE');
+    const slPts = this.liveSamConfig.stopLossPoints ?? 20;
+    const tpPts = this.liveSamConfig.targetPoints ?? 60;
+    const event: TradeNotificationEvent = {
+      id: `TEST:${Date.now()}`,
+      kind: 'TRADE_OPENED',
+      direction: 'CALL',
+      signal: 'SAM CALL (Real-Time WebSocket Test)',
+      source: 'TEST',
+      timestamp: Date.now(),
+      entryPrice: Number(spot.toFixed(2)),
+      stoploss: Number((spot - slPts).toFixed(2)),
+      target: Number((spot + tpPts).toFixed(2)),
+      status: 'OPEN',
+      optionStrike: opt.strike,
+      optionType: 'CE',
+      optionEntryPremium: opt.ltp,
+      message: 'Live server-to-browser WebSocket alert verified',
+    };
+    const res = this.emitTradeNotification(event);
+    return res.event;
+  }
+
+  private detectAndBroadcastEngineTradeEvents() {
+    const nowMs = Date.now();
+    // 1. Active signals -> detect newly opened trades
+    for (const sig of this.strategyEngine.activeSignals.values()) {
+      const prevStatus = this.lastKnownSignalStatuses.get(sig.id);
+      if (prevStatus !== 'ACTIVE') {
+        this.lastKnownSignalStatuses.set(sig.id, 'ACTIVE');
+        const dir: 'CALL' | 'PUT' =
+          sig.direction === 'PUT' || sig.signal === 'BUY_PUT' || sig.option_type === 'PE' ? 'PUT' : 'CALL';
+        const spotEntry = Number(sig.spotEntry || sig.spot || sig.entrySpot || this.state.nifty50.lastPrice || 0);
+        const optType: 'CE' | 'PE' = dir === 'CALL' ? 'CE' : 'PE';
+        const strike = sig.strike || (spotEntry > 0 ? Math.round(spotEntry / 50) * 50 : undefined);
+        const optPrem = Number(sig.optionEntry || sig.entryPrice || sig.entry || 0);
+
+        this.emitTradeNotification({
+          id: `OPEN:ENGINE:${sig.id}`,
+          kind: 'TRADE_OPENED',
+          direction: dir,
+          signal: `${sig.strategy_family || sig.strategy || 'ENGINE'} ${sig.signal || dir}`,
+          source: 'STRATEGY_ENGINE',
+          timestamp: nowMs,
+          entryPrice: spotEntry > 0 ? spotEntry : optPrem,
+          stoploss: sig.spotInvalidation || sig.stoploss,
+          target: sig.spotTarget1 || sig.target1 || sig.target,
+          status: 'OPEN',
+          optionStrike: strike,
+          optionType: optType,
+          optionEntryPremium: optPrem > 0 ? optPrem : undefined,
+          message: Array.isArray(sig.reason) && sig.reason.length > 0 ? sig.reason[0] : 'Strategy Engine Entry',
+        });
+      }
+    }
+
+    // 2. Closed signals -> detect newly closed trades
+    for (const sig of this.strategyEngine.history.values()) {
+      const prevStatus = this.lastKnownSignalStatuses.get(sig.id);
+      if (prevStatus !== 'CLOSED') {
+        this.lastKnownSignalStatuses.set(sig.id, 'CLOSED');
+        const dir: 'CALL' | 'PUT' =
+          sig.direction === 'PUT' || sig.signal === 'BUY_PUT' || sig.option_type === 'PE' ? 'PUT' : 'CALL';
+        const spotEntry = Number(sig.spotEntry || sig.spot || sig.entrySpot || this.state.nifty50.lastPrice || 0);
+        const spotExit = Number(sig.latestSpot || this.state.nifty50.lastPrice || spotEntry);
+        const optEntry = Number(sig.optionEntry || sig.entryPrice || sig.entry || 0);
+        const optExit = Number(sig.exitPrice ?? sig.latestPrice ?? optEntry);
+        const realized = sig.realizedPnL;
+        const status: 'WIN' | 'LOSS' | 'BE' =
+          realized !== undefined
+            ? realized > 0
+              ? 'WIN'
+              : realized < 0
+                ? 'LOSS'
+                : 'BE'
+            : optExit > optEntry
+              ? 'WIN'
+              : optExit < optEntry
+                ? 'LOSS'
+                : 'BE';
+
+        this.emitTradeNotification({
+          id: `CLOSE:ENGINE:${sig.id}`,
+          kind: 'TRADE_CLOSED',
+          direction: dir,
+          signal: `${sig.strategy_family || sig.strategy || 'ENGINE'} ${sig.signal || dir}`,
+          source: 'STRATEGY_ENGINE',
+          timestamp: nowMs,
+          entryPrice: spotEntry > 0 ? spotEntry : optEntry,
+          exitPrice: spotExit > 0 ? spotExit : optExit,
+          exitReason: sig.exitReason || 'CLOSED',
+          status,
+          spotPnl: spotEntry > 0 ? Number((dir === 'CALL' ? spotExit - spotEntry : spotEntry - spotExit).toFixed(2)) : undefined,
+          optionStrike: sig.strike || (spotEntry > 0 ? Math.round(spotEntry / 50) * 50 : undefined),
+          optionType: dir === 'CALL' ? 'CE' : 'PE',
+          optionEntryPremium: optEntry > 0 ? optEntry : undefined,
+          optionExitPremium: optExit > 0 ? optExit : undefined,
+          premiumPnl: optEntry > 0 && optExit > 0 ? Number((optExit - optEntry).toFixed(2)) : undefined,
+          lotPnl: realized !== undefined ? Number(realized.toFixed(2)) : undefined,
+        });
+      }
+    }
+  }
+
+  private async evaluateServerSamSignalsForNotifications() {
     try {
-      const dir = path.dirname(this.historyFilePath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(this.historyFilePath, JSON.stringify(this.optionChainHistory));
-    } catch (e) {
-      console.error("Failed to save option chain history:", e);
+      if (!this.settings.strategies?.samSignals?.enabled) return;
+      const rawCandles = await getCandles('NIFTY', 1, 250);
+      if (!Array.isArray(rawCandles) || rawCandles.length < 60) return;
+
+      const sortedAsc = rawCandles
+        .slice()
+        .reverse()
+        .map((c) => {
+          const tsMs = new Date(c.timestamp).getTime();
+          return {
+            time: Math.floor(tsMs / 1000) + 19800,
+            open: Number(c.open),
+            high: Number(c.high),
+            low: Number(c.low),
+            close: Number(c.close),
+            volume: Number(c.volume || 0),
+          };
+        })
+        .filter((c) => Number.isFinite(c.time) && Number.isFinite(c.close) && c.close > 0);
+
+      if (sortedAsc.length < 60) return;
+
+      const samResult = computeSamSignals(sortedAsc, this.liveSamConfig);
+      const lastIdx = sortedAsc.length - 1;
+      const bar = sortedAsc[lastIdx];
+      if (!bar || !isFreshLiveCandleTime(bar.time, Date.now(), 3)) return;
+
+      const slPts = this.liveSamConfig.stopLossPoints ?? 20;
+      const tpPts = this.liveSamConfig.targetPoints ?? 60;
+
+      if (samResult.callSignals[lastIdx] || samResult.putSignals[lastIdx]) {
+        const direction: 'CALL' | 'PUT' = samResult.callSignals[lastIdx] ? 'CALL' : 'PUT';
+        const optType: 'CE' | 'PE' = direction === 'CALL' ? 'CE' : 'PE';
+        const opt = this.lookupLatestOptionPremium(bar.close, optType);
+        const stoploss = direction === 'CALL' ? bar.close - slPts : bar.close + slPts;
+        const target = direction === 'CALL' ? bar.close + tpPts : bar.close - tpPts;
+
+        this.emitTradeNotification({
+          id: `OPEN:SAM:${bar.time}:${direction}`,
+          kind: 'TRADE_OPENED',
+          direction,
+          signal: `SAM ${direction} (1m Confirmed)`,
+          source: 'SERVER_SAM_WATCHER',
+          timestamp: Date.now(),
+          candleTimeSec: bar.time,
+          entryPrice: Number(bar.close.toFixed(2)),
+          stoploss: Number(stoploss.toFixed(2)),
+          target: Number(target.toFixed(2)),
+          status: 'OPEN',
+          optionStrike: opt.strike,
+          optionType: optType,
+          optionEntryPremium: opt.ltp,
+          message: 'Confirmed on 1m Bar+1 close (Server Live Watcher)',
+        });
+      } else if (samResult.candidateCallSignals?.[lastIdx] || samResult.candidatePutSignals?.[lastIdx]) {
+        const direction: 'CALL' | 'PUT' = samResult.candidateCallSignals?.[lastIdx] ? 'CALL' : 'PUT';
+        const optType: 'CE' | 'PE' = direction === 'CALL' ? 'CE' : 'PE';
+        const opt = this.lookupLatestOptionPremium(bar.close, optType);
+        const stoploss = direction === 'CALL' ? bar.close - slPts : bar.close + slPts;
+        const target = direction === 'CALL' ? bar.close + tpPts : bar.close - tpPts;
+
+        this.emitTradeNotification({
+          id: `PENDING:SAM:${bar.time}:${direction}`,
+          kind: 'SETUP_PENDING',
+          direction,
+          signal: `SAM ${direction} Setup (Bar 0 Closed)`,
+          source: 'SERVER_SAM_WATCHER',
+          timestamp: Date.now(),
+          candleTimeSec: bar.time,
+          entryPrice: Number(bar.close.toFixed(2)),
+          stoploss: Number(stoploss.toFixed(2)),
+          target: Number(target.toFixed(2)),
+          optionStrike: opt.strike,
+          optionType: optType,
+          optionEntryPremium: opt.ltp,
+          message: 'Awaiting Bar + 1 confirmation close',
+        });
+      }
+    } catch (e: any) {
+      console.warn("Server SAM notification watcher warning:", e?.message || e);
+    }
+  }
+
+  private async initOptionChainHistoryFromDb() {
+    const dbSnaps = await loadOptionChainHistoryFromDb(12000);
+    const byId = new Map<string, OptionChainSnapshot>();
+
+    for (const s of dbSnaps) {
+      if (s?.id) byId.set(s.id, s);
+    }
+
+    // Migrate any snapshots loaded from legacy JSON file that are not yet in Cloud SQL
+    const legacyMissing = this.optionChainHistory.filter((s) => s?.id && !byId.has(s.id));
+    if (legacyMissing.length > 0) {
+      console.log(`[DB] Migrating ${legacyMissing.length} option chain snapshots into PostgreSQL...`);
+      await saveOptionChainSnapshotsBatchToDb(legacyMissing);
+      for (const s of legacyMissing) {
+        byId.set(s.id, s);
+      }
+    }
+
+    const merged = Array.from(byId.values()).sort((a, b) => a.timestamp - b.timestamp);
+    this.optionChainHistory = merged.slice(-12000);
+    if (this.optionChainHistory.length > 0) {
+      const latestTs = this.optionChainHistory[this.optionChainHistory.length - 1].timestamp;
+      this.state.optionChainSnapshotTimestamp = latestTs;
+    }
+    console.log(`[DB] Option chain history ready (${this.optionChainHistory.length} snapshots in PostgreSQL).`);
+  }
+
+  public mergeOptionChainSnapshots(snaps: OptionChainSnapshot[]) {
+    if (!Array.isArray(snaps) || snaps.length === 0) return;
+    const byId = new Map<string, OptionChainSnapshot>();
+    for (const s of this.optionChainHistory) {
+      if (s?.id) byId.set(s.id, s);
+    }
+    for (const s of snaps) {
+      if (s?.id) byId.set(s.id, s);
+    }
+    const merged = Array.from(byId.values()).sort((a, b) => a.timestamp - b.timestamp);
+    this.optionChainHistory = merged.slice(-12000);
+    if (this.optionChainHistory.length > 0) {
+      this.state.optionChainSnapshotTimestamp = this.optionChainHistory[this.optionChainHistory.length - 1].timestamp;
     }
   }
 
@@ -640,8 +954,9 @@ public async startPolling() {
     const freshSpot = this.state.nifty50.timestamp > 0 && Date.now() - this.state.nifty50.timestamp <= 15_000;
     const isMarketOpen = this.strategyEngine.isMarketOpen();
 
+    // Run 1-minute candle sync and option chain DB recording whenever connected during NSE market hours
+    // (runs independently of isTradingEnabled so option chain history never drops when trading is paused)
     if (
-      this.settings.isTradingEnabled &&
       this.state.isConnected &&
       !this.state.apiError &&
       isMarketOpen &&
@@ -651,8 +966,9 @@ public async startPolling() {
       if (currentMinuteBucket !== this.lastSyncedMinuteBucket) {
         this.lastSyncedMinuteBucket = currentMinuteBucket;
         await this.syncHistoricalCandles();
+        await this.evaluateServerSamSignalsForNotifications();
         
-        // Auto-record option chain snapshot for history/replay buffer
+        // Auto-record option chain snapshot into PostgreSQL for backtest & replay
         try {
           const instrument = 'NSE_INDEX|Nifty 50';
           const expiry = await this.getNearestExpiry(instrument);
@@ -665,9 +981,18 @@ public async startPolling() {
           console.error("Failed to auto-record option chain snapshot:", e.message);
         }
       }
+    }
 
+    if (
+      this.settings.isTradingEnabled &&
+      this.state.isConnected &&
+      !this.state.apiError &&
+      isMarketOpen &&
+      freshSpot
+    ) {
       const newSignals = await this.strategyEngine.onTick(this.state);
       this.state.signals = newSignals.slice(0, 10);
+      this.detectAndBroadcastEngineTradeEvents();
     } else {
       // If market is closed or trading disabled or feed inactive, exit any active positions
       if (this.strategyEngine.activeSignals.size > 0) {
@@ -675,6 +1000,7 @@ public async startPolling() {
           ? "Market Closed (Outside Trading Hours)" 
           : "Market Feed Inactive or Trading Disabled";
         this.strategyEngine.exitAllActiveTrades(reason);
+        this.detectAndBroadcastEngineTradeEvents();
       }
       this.state.signals = [
         ...Array.from(this.strategyEngine.activeSignals.values()),
@@ -700,6 +1026,7 @@ public async startPolling() {
       if (this.strategyEngine.activeSignals.size > 0) {
         console.warn(`Upstox connection lost for ${this.errorCount * 1.5}s. Exiting all active trades.`);
         this.strategyEngine.exitAllActiveTrades("Upstox Connection Lost");
+        this.detectAndBroadcastEngineTradeEvents();
       }
     }
 
@@ -873,12 +1200,14 @@ public async startPolling() {
         };
 
         this.optionChainHistory.push(snap);
-        if (this.optionChainHistory.length > 5000) {
+        if (this.optionChainHistory.length > 12000) {
           this.optionChainHistory.shift();
         }
+        this.state.optionChainTimestamp = nowMs;
+        this.state.optionChainSnapshotTimestamp = nowMs;
 
-        // Persist to disk asynchronously
-        this.saveOptionChainHistoryToDisk();
+        // Persist directly to Cloud SQL PostgreSQL
+        await saveOptionChainSnapshotToDb(snap);
       }
     } catch (e) {
       console.error("Error recording 1-min option chain snapshot:", e);
@@ -891,7 +1220,16 @@ public async startPolling() {
 
   public clearOptionChainHistory() {
     this.optionChainHistory = [];
-    this.saveOptionChainHistoryToDisk();
+    clearOptionChainHistoryInDb().catch((e) => {
+      console.error("Failed to clear option chain history in DB:", e);
+    });
+    try {
+      if (fs.existsSync(this.historyFilePath)) {
+        fs.unlinkSync(this.historyFilePath);
+      }
+    } catch (e) {
+      console.warn("Failed to remove legacy option chain JSON file:", e);
+    }
   }
 
   private broadcastState() {
