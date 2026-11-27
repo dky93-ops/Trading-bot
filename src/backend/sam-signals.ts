@@ -102,7 +102,7 @@ export interface SamSignalsConfig {
   sam21AfternoonExitMode?: 'fixed40' | 'chandelier'; // default: 'fixed40'
 
   // 13. Institutional Recommendation #2: Morning + Afternoon Combined (SAM 21/5)
-  //     Morning: 3m SAM(21/5) OpenDrive (09:20–10:30 IST, PDH/PDL + StrongBar + 15m Supertrend, 2x/3x 5m ATR)
+  //     Morning: 3m SAM(21/5) OpenDrive (09:20–10:15 IST, PDH/PDL + StrongBar + 15m Supertrend, 2x/3x 5m ATR + BE30/Step2 +50->+20)
   //     Afternoon: 1m SAM(21/5) Afternoon Breakout (12:30–14:50 IST, #3 Fixed or #5 Chandelier)
   filterSam21CombinedEnabled?: boolean; // default: false
 }
@@ -201,6 +201,18 @@ export interface SamSignalsResult {
   sam21AfternoonSignalCount?: number;
   sam21OpenDriveSignalCount?: number;
   samSignalProfile?: Array<'STANDARD' | 'SAM21_AFT_FIXED' | 'SAM21_AFT_CHAND' | 'SAM21_3M_OPENDRIVE'>;
+  sam21LiveStatus?: {
+    latestDate: string;
+    latestTimeIst: string;
+    latestClose: number;
+    pdh: number | null;
+    pdl: number | null;
+    adx5m: number | null;
+    diSpread5m: number | null;
+    st15mDir: number;
+    inputBarMinutes: number;
+    breakoutState: 'ABOVE_PDH' | 'BELOW_PDL' | 'INSIDE_RANGE' | 'NO_PDH_PDL';
+  };
   atr5mValues?: number[];
   regimeState?: ('TREND_BULL' | 'TREND_BEAR' | 'RANGE')[];
   mtfEmaValues?: number[];
@@ -252,13 +264,35 @@ interface CausalHtfBar {
 }
 
 /**
+ * Detects the chart's native candle timeframe in minutes (e.g. 1, 3, 5, 15)
+ * from consecutive intra-day bar spacings.
+ */
+function detectInputBarMinutes(barMeta: Array<{ dayKey: number; mins: number } | null>): number {
+  const diffs: number[] = [];
+  for (let i = 1; i < barMeta.length && diffs.length < 60; i++) {
+    const prev = barMeta[i - 1];
+    const curr = barMeta[i];
+    if (prev && curr && prev.dayKey === curr.dayKey) {
+      const d = curr.mins - prev.mins;
+      if (d > 0 && d <= 60) diffs.push(d);
+    }
+  }
+  if (diffs.length === 0) return 1;
+  diffs.sort((a, b) => a - b);
+  return diffs[Math.floor(diffs.length / 2)] || 1;
+}
+
+/**
  * Strictly causal higher-timeframe resampler:
- * Every 1m bar i ONLY references bars formed from 0..i (zero future lookahead).
+ * Every bar i ONLY references bars formed from 0..i (zero future lookahead).
+ * Supports any input timeframe (1m, 3m, 5m, 15m) and skips flat holiday days.
  */
 function resampleCausalHTF(
   candles: Array<{ open: number; high: number; low: number; close: number }>,
   barMeta: Array<{ dayKey: number; mins: number } | null>,
-  tfMinutes: number
+  tfMinutes: number,
+  inputBarMinutes: number = 1,
+  flatHolidayDays?: Set<number>
 ): { bars: CausalHtfBar[]; lastClosedBarIdx: number[]; isClosing1mBar: boolean[] } {
   const n = candles.length;
   const bars: CausalHtfBar[] = [];
@@ -270,7 +304,7 @@ function resampleCausalHTF(
 
   for (let i = 0; i < n; i++) {
     const meta = barMeta[i];
-    if (!meta) {
+    if (!meta || (flatHolidayDays && flatHolidayDays.has(meta.dayKey))) {
       lastClosedBarIdx[i] = lastCompleted;
       continue;
     }
@@ -294,7 +328,12 @@ function resampleCausalHTF(
       curBar.close = candles[i].close;
     }
 
-    if ((meta.mins % tfMinutes) === (tfMinutes - 1)) {
+    // Causally mark HTF bar complete on the final input bar of the bucket
+    // (works for 1m->3m, 3m->3m, 1m->5m, 5m->5m, 3m->15m, 5m->15m, etc.)
+    const completesBucket =
+      inputBarMinutes >= tfMinutes ||
+      (meta.mins % tfMinutes) + inputBarMinutes >= tfMinutes;
+    if (completesBucket) {
       lastCompleted = bars.length - 1;
       isClosing1mBar[i] = true;
     }
@@ -414,6 +453,29 @@ export function computeSamSignals(
 
     const closes1m = candles.map(c => c.close);
     const barMeta = candles.map(c => getIstDayAndMinute(c));
+    const inputBarMinutes = detectInputBarMinutes(barMeta);
+
+    // Detect completely flat NSE exchange holiday days (e.g., 375 flat zero-range bars)
+    // so they never overwrite PDH/PDL or collapse ATR/ADX/Supertrend on the next trading day.
+    const dayStats = new Map<number, { h: number; l: number; count: number }>();
+    for (let i = 0; i < len; i++) {
+      const meta = barMeta[i];
+      if (!meta) continue;
+      const cur = dayStats.get(meta.dayKey);
+      if (!cur) {
+        dayStats.set(meta.dayKey, { h: candles[i].high, l: candles[i].low, count: 1 });
+      } else {
+        if (candles[i].high > cur.h) cur.h = candles[i].high;
+        if (candles[i].low < cur.l) cur.l = candles[i].low;
+        cur.count++;
+      }
+    }
+    const flatHolidayDays = new Set<number>();
+    for (const [dk, st] of dayStats.entries()) {
+      if (st.count >= 15 && (st.h - st.l) < 0.5) {
+        flatHolidayDays.add(dk);
+      }
+    }
 
     // Keep VWAP line available if chart displays VWAP
     if (config.showVwapLine || config.vwapFilterEnabled) {
@@ -421,6 +483,7 @@ export function computeSamSignals(
     }
 
     // 1. Compute strictly causal Previous Day High (PDH) & Previous Day Low (PDL)
+    //    (skipping flat holiday days so PDH/PDL always reflect the real previous trading session)
     const pdhArr = new Array<number>(len).fill(NaN);
     const pdlArr = new Array<number>(len).fill(NaN);
     let curDay = -1;
@@ -432,8 +495,13 @@ export function computeSamSignals(
     for (let i = 0; i < len; i++) {
       const meta = barMeta[i];
       if (!meta) continue;
+      if (flatHolidayDays.has(meta.dayKey)) {
+        pdhArr[i] = prevDayH;
+        pdlArr[i] = prevDayL;
+        continue;
+      }
       if (meta.dayKey !== curDay) {
-        if (curDay !== -1) {
+        if (curDay !== -1 && (curDayH - curDayL) >= 0.5) {
           prevDayH = curDayH;
           prevDayL = curDayL;
         }
@@ -448,7 +516,7 @@ export function computeSamSignals(
       pdlArr[i] = prevDayL;
     }
 
-    // 2. 1-Min SAM(21/5) oscillator
+    // 2. SAM(21/5) oscillator
     const smaFast21 = [...closes1m];
     const smaSlow21 = computeSMA(closes1m, 21);
     const buf1_21 = new Array<number>(len).fill(NaN);
@@ -464,14 +532,14 @@ export function computeSamSignals(
     res.buffer2 = buf2_21;
 
     // 3. Causal 5-Min resampling -> 5m ADX(14) & 5m ATR(14)
-    const htf5m = resampleCausalHTF(candles, barMeta, 5);
+    const htf5m = resampleCausalHTF(candles, barMeta, 5, inputBarMinutes, flatHolidayDays);
     const highs5m = htf5m.bars.map(b => b.high);
     const lows5m = htf5m.bars.map(b => b.low);
     const closes5m = htf5m.bars.map(b => b.close);
     const adx5m = computeADX(highs5m, lows5m, closes5m, 14);
     const atr5m = computeWilderATR(highs5m, lows5m, closes5m, 14);
 
-    // Map 5m ATR onto every 1m bar causally
+    // Map 5m ATR onto every bar causally
     for (let i = 0; i < len; i++) {
       const idx5 = htf5m.lastClosedBarIdx[i];
       if (idx5 >= 0 && !isNaN(atr5m[idx5])) {
@@ -488,7 +556,7 @@ export function computeSamSignals(
     let st15mDir: number[] | null = null;
 
     if (useSam21OpenDrive) {
-      htf3m = resampleCausalHTF(candles, barMeta, 3);
+      htf3m = resampleCausalHTF(candles, barMeta, 3, inputBarMinutes, flatHolidayDays);
       const highs3m = htf3m.bars.map(b => b.high);
       const lows3m = htf3m.bars.map(b => b.low);
       const closes3m = htf3m.bars.map(b => b.close);
@@ -497,7 +565,7 @@ export function computeSamSignals(
       buf2_3m = computeWMA(buf1_3m, 5);
       atr3m = computeWilderATR(highs3m, lows3m, closes3m, 14);
 
-      htf15m = resampleCausalHTF(candles, barMeta, 15);
+      htf15m = resampleCausalHTF(candles, barMeta, 15, inputBarMinutes, flatHolidayDays);
       const highs15m = htf15m.bars.map(b => b.high);
       const lows15m = htf15m.bars.map(b => b.low);
       const closes15m = htf15m.bars.map(b => b.close);
@@ -507,17 +575,17 @@ export function computeSamSignals(
     const aftProfile: 'SAM21_AFT_FIXED' | 'SAM21_AFT_CHAND' =
       config.sam21AfternoonExitMode === 'chandelier' ? 'SAM21_AFT_CHAND' : 'SAM21_AFT_FIXED';
 
-    // 5. Evaluate institutional signal triggers causally per 1m bar
+    // 5. Evaluate institutional signal triggers causally per bar
     for (let i = 1; i < len; i++) {
       const meta = barMeta[i];
-      if (!meta) continue;
+      if (!meta || flatHolidayDays.has(meta.dayKey)) continue;
       const mins = meta.mins;
       const pdh = pdhArr[i];
       const pdl = pdlArr[i];
       if (isNaN(pdh) || isNaN(pdl)) continue;
 
-      // A. Morning Window (#1): 3m SAM(21/5) OpenDrive (09:20–10:30 IST)
-      if (useSam21OpenDrive && mins >= 560 && mins <= 630 && htf3m && buf1_3m && buf2_3m && atr3m && htf15m && st15mDir) {
+      // A. Morning Window (#1): 3m SAM(21/5) OpenDrive (09:20–10:15 IST)
+      if (useSam21OpenDrive && mins >= 560 && mins <= 615 && htf3m && buf1_3m && buf2_3m && atr3m && htf15m && st15mDir) {
         if (htf3m.isClosing1mBar[i]) {
           const idx3 = htf3m.lastClosedBarIdx[i];
           const idx15 = htf15m.lastClosedBarIdx[i];
@@ -591,6 +659,49 @@ export function computeSamSignals(
           }
         }
       }
+    }
+
+    // 6. Populate live status for the latest bar so UI clearly shows active evaluation on current data
+    const lastIdx = len - 1;
+    const lastMeta = barMeta[lastIdx];
+    if (lastMeta) {
+      const latestPdh = isNaN(pdhArr[lastIdx]) ? null : Number(pdhArr[lastIdx].toFixed(2));
+      const latestPdl = isNaN(pdlArr[lastIdx]) ? null : Number(pdlArr[lastIdx].toFixed(2));
+      const latestClose = Number(candles[lastIdx].close.toFixed(2));
+      const idx5 = htf5m.lastClosedBarIdx[lastIdx];
+      const latestAdx5m =
+        idx5 >= 0 && !isNaN(adx5m.adx[idx5]) ? Number(adx5m.adx[idx5].toFixed(1)) : null;
+      const latestDiSpread5m =
+        idx5 >= 0 && !isNaN(adx5m.plusDI[idx5]) && !isNaN(adx5m.minusDI[idx5])
+          ? Number((adx5m.plusDI[idx5] - adx5m.minusDI[idx5]).toFixed(1))
+          : null;
+      const idx15 = htf15m ? htf15m.lastClosedBarIdx[lastIdx] : -1;
+      const latestSt15mDir = st15mDir && idx15 >= 0 ? st15mDir[idx15] : 0;
+
+      const d = new Date(lastMeta.dayKey * 86400 * 1000);
+      const latestDate = d.toISOString().slice(0, 10);
+      const hh = String(Math.floor(lastMeta.mins / 60)).padStart(2, '0');
+      const mm = String(lastMeta.mins % 60).padStart(2, '0');
+
+      let breakoutState: 'ABOVE_PDH' | 'BELOW_PDL' | 'INSIDE_RANGE' | 'NO_PDH_PDL' = 'NO_PDH_PDL';
+      if (latestPdh !== null && latestPdl !== null) {
+        if (latestClose > latestPdh) breakoutState = 'ABOVE_PDH';
+        else if (latestClose < latestPdl) breakoutState = 'BELOW_PDL';
+        else breakoutState = 'INSIDE_RANGE';
+      }
+
+      res.sam21LiveStatus = {
+        latestDate,
+        latestTimeIst: `${hh}:${mm}`,
+        latestClose,
+        pdh: latestPdh,
+        pdl: latestPdl,
+        adx5m: latestAdx5m,
+        diSpread5m: latestDiSpread5m,
+        st15mDir: latestSt15mDir,
+        inputBarMinutes,
+        breakoutState,
+      };
     }
 
     return res;

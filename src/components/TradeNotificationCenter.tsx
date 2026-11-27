@@ -6,6 +6,8 @@ import {
   unlockAudioContext,
 } from '../lib/trade-notifications';
 
+const isFiniteNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
 interface TradeNotificationHeaderProps {
   notifications: TradeNotificationEvent[];
   unreadCount: number;
@@ -245,25 +247,27 @@ export const TradeNotificationHeaderControls: React.FC<TradeNotificationHeaderPr
                     </div>
 
                     <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-gray-400">
-                      <span>Spot: <strong className="text-gray-200">{ev.entryPrice.toFixed(2)}</strong></span>
-                      {isClosed && ev.exitPrice !== undefined && (
+                      {isFiniteNum(ev.entryPrice) && (
+                        <span>Spot: <strong className="text-gray-200">{ev.entryPrice.toFixed(2)}</strong></span>
+                      )}
+                      {isClosed && isFiniteNum(ev.exitPrice) && (
                         <span>Exit: <strong className="text-gray-200">{ev.exitPrice.toFixed(2)}</strong></span>
                       )}
-                      {!isClosed && ev.stoploss !== undefined && (
+                      {!isClosed && isFiniteNum(ev.stoploss) && (
                         <span>SL: <strong className="text-red-400">{ev.stoploss.toFixed(1)}</strong></span>
                       )}
-                      {!isClosed && ev.target !== undefined && (
+                      {!isClosed && isFiniteNum(ev.target) && (
                         <span>TP: <strong className="text-emerald-400">{ev.target.toFixed(1)}</strong></span>
                       )}
-                      {ev.optionEntryPremium !== undefined && (
+                      {isFiniteNum(ev.optionEntryPremium) && (
                         <span>
                           Prem: <strong className="text-cyan-300">
                             ₹{ev.optionEntryPremium.toFixed(2)}
-                            {ev.optionExitPremium !== undefined ? ` → ₹${ev.optionExitPremium.toFixed(2)}` : ''}
+                            {isFiniteNum(ev.optionExitPremium) ? ` → ₹${ev.optionExitPremium.toFixed(2)}` : ''}
                           </strong>
                         </span>
                       )}
-                      {isClosed && ev.lotPnl !== undefined && (
+                      {isClosed && isFiniteNum(ev.lotPnl) && (
                         <span className={ev.lotPnl >= 0 ? 'text-emerald-400 font-bold' : 'text-red-400 font-bold'}>
                           {ev.lotPnl >= 0 ? '+' : ''}₹{ev.lotPnl.toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
                         </span>
@@ -351,9 +355,11 @@ export const TradeToastStack: React.FC<TradeToastStackProps> = ({ toasts, onDism
               <div>
                 <div className="text-[9px] text-gray-400 uppercase">{isClosed ? 'Entry → Exit' : 'Entry Spot'}</div>
                 <div className="font-bold text-white">
-                  {isClosed && ev.exitPrice !== undefined
+                  {isClosed && isFiniteNum(ev.entryPrice) && isFiniteNum(ev.exitPrice)
                     ? `${ev.entryPrice.toFixed(0)}→${ev.exitPrice.toFixed(0)}`
-                    : ev.entryPrice.toFixed(2)}
+                    : isFiniteNum(ev.entryPrice)
+                      ? ev.entryPrice.toFixed(2)
+                      : '-'}
                 </div>
               </div>
               {isClosed ? (
@@ -361,13 +367,13 @@ export const TradeToastStack: React.FC<TradeToastStackProps> = ({ toasts, onDism
                   <div>
                     <div className="text-[9px] text-gray-400 uppercase">Spot P&L</div>
                     <div className={`font-bold ${(ev.spotPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                      {ev.spotPnl !== undefined ? `${ev.spotPnl >= 0 ? '+' : ''}${ev.spotPnl.toFixed(1)} pt` : '-'}
+                      {isFiniteNum(ev.spotPnl) ? `${ev.spotPnl >= 0 ? '+' : ''}${ev.spotPnl.toFixed(1)} pt` : '-'}
                     </div>
                   </div>
                   <div>
                     <div className="text-[9px] text-gray-400 uppercase">1 Lot P&L</div>
                     <div className={`font-bold ${(ev.lotPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                      {ev.lotPnl !== undefined
+                      {isFiniteNum(ev.lotPnl)
                         ? `${ev.lotPnl >= 0 ? '+' : ''}₹${ev.lotPnl.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`
                         : ev.exitReason || '-'}
                     </div>
@@ -378,13 +384,13 @@ export const TradeToastStack: React.FC<TradeToastStackProps> = ({ toasts, onDism
                   <div>
                     <div className="text-[9px] text-gray-400 uppercase">Stoploss</div>
                     <div className="font-bold text-red-400">
-                      {ev.stoploss !== undefined ? ev.stoploss.toFixed(1) : '-'}
+                      {isFiniteNum(ev.stoploss) ? ev.stoploss.toFixed(1) : '-'}
                     </div>
                   </div>
                   <div>
                     <div className="text-[9px] text-gray-400 uppercase">Target</div>
                     <div className="font-bold text-emerald-400">
-                      {ev.target !== undefined ? ev.target.toFixed(1) : 'Trail'}
+                      {isFiniteNum(ev.target) ? ev.target.toFixed(1) : 'Trail'}
                     </div>
                   </div>
                 </>
@@ -393,8 +399,8 @@ export const TradeToastStack: React.FC<TradeToastStackProps> = ({ toasts, onDism
 
             <div className="mt-2 flex items-center justify-between text-[10px] text-gray-400">
               <span>
-                {ev.optionEntryPremium !== undefined
-                  ? `Opt Prem: ₹${ev.optionEntryPremium.toFixed(2)}${ev.optionExitPremium !== undefined ? ` → ₹${ev.optionExitPremium.toFixed(2)}` : ''}`
+                {isFiniteNum(ev.optionEntryPremium)
+                  ? `Opt Prem: ₹${ev.optionEntryPremium.toFixed(2)}${isFiniteNum(ev.optionExitPremium) ? ` → ₹${ev.optionExitPremium.toFixed(2)}` : ''}`
                   : ev.message || 'Real-time WebSocket Alert'}
               </span>
               <span className="text-brand-green font-bold">

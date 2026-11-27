@@ -40,6 +40,8 @@ type Trade = {
   signalBarIdx?: number;
   samExitProfile?: 'STANDARD' | 'FIXED_EOD' | 'CHANDELIER';
   samBeTriggerPts?: number;
+  samStep2TriggerPts?: number;
+  samStep2LockPts?: number;
   samChandelierDistPts?: number;
   samIgnoreOppositeExit?: boolean;
   samNoFixedTp?: boolean;
@@ -503,6 +505,18 @@ export function LiveChart({
     s12Filtered: 0,
     sam21AfternoonSignals: 0,
     sam21OpenDriveSignals: 0,
+    sam21LiveStatus: null as {
+      latestDate: string;
+      latestTimeIst: string;
+      latestClose: number;
+      pdh: number | null;
+      pdl: number | null;
+      adx5m: number | null;
+      diSpread5m: number | null;
+      st15mDir: number;
+      inputBarMinutes: number;
+      breakoutState: 'ABOVE_PDH' | 'BELOW_PDL' | 'INSIDE_RANGE' | 'NO_PDH_PDL';
+    } | null,
     dailyDrawdownHalted: false,
     currentRegimeState: 'RANGE' as 'TREND_BULL' | 'TREND_BEAR' | 'RANGE',
     circuitBreakerActive: false,
@@ -660,7 +674,8 @@ export function LiveChart({
         setLoading(true);
       }
       try {
-        const res = await fetch(`/api/candles?instrument=${encodeURIComponent(instrument)}&timeframe=${timeframe}&limit=3000`, {
+        const fetchLimit = timeframe === 1 ? 8000 : 3000;
+        const res = await fetch(`/api/candles?instrument=${encodeURIComponent(instrument)}&timeframe=${timeframe}&limit=${fetchLimit}`, {
           signal: abortController.signal
         });
         if (isDisposedRef.current) return;
@@ -1196,28 +1211,43 @@ export function LiveChart({
                    continue;
                  }
 
-                 // 3. Advance peak & trailing/BE stop for subsequent bars
+                 // 3. Advance peak & trailing/BE/Step-2 profit lock for subsequent bars
                  t.peakPrice = Math.max(t.peakPrice || t.entryPrice, curr.high);
-                 if (t.samExitProfile === 'FIXED_EOD' && t.samBeTriggerPts) {
-                   if (t.peakPrice >= t.entryPrice + t.samBeTriggerPts) {
-                     const newSl = Number(t.entryPrice.toFixed(2));
-                     if (newSl > t.stoploss) {
-                       t.stoploss = newSl;
-                       t.isBreakevenLocked = true;
-                       if (t.trailStage !== 1) {
-                         t.trailStage = 1;
-                         beSavedCount++;
-                         markers.push({
-                           time: curr.time,
-                           position: 'belowBar',
-                           color: '#3B82F6',
-                           shape: 'circle',
-                           text: `SL ➔ BE (+${t.samBeTriggerPts}pt)`
-                         });
-                       }
+                 if (t.samStep2TriggerPts && t.samStep2LockPts !== undefined && t.peakPrice >= t.entryPrice + t.samStep2TriggerPts) {
+                   const newSl = Number((t.entryPrice + t.samStep2LockPts).toFixed(2));
+                   if (newSl > t.stoploss) {
+                     t.stoploss = newSl;
+                     t.isBreakevenLocked = true;
+                     if (t.trailStage !== 2) {
+                       t.trailStage = 2;
+                       markers.push({
+                         time: curr.time,
+                         position: 'belowBar',
+                         color: '#10B981',
+                         shape: 'circle',
+                         text: `SL ➔ +${t.samStep2LockPts}pt (+${t.samStep2TriggerPts}pt)`
+                       });
                      }
                    }
-                 } else if (t.samExitProfile === 'CHANDELIER' && t.samChandelierDistPts && t.samChandelierDistPts > 0) {
+                 } else if (t.samBeTriggerPts && t.peakPrice >= t.entryPrice + t.samBeTriggerPts) {
+                   const newSl = Number(t.entryPrice.toFixed(2));
+                   if (newSl > t.stoploss) {
+                     t.stoploss = newSl;
+                     t.isBreakevenLocked = true;
+                     if (t.trailStage !== 1 && t.trailStage !== 2) {
+                       t.trailStage = 1;
+                       beSavedCount++;
+                       markers.push({
+                         time: curr.time,
+                         position: 'belowBar',
+                         color: '#3B82F6',
+                         shape: 'circle',
+                         text: `SL ➔ BE (+${t.samBeTriggerPts}pt)`
+                       });
+                     }
+                   }
+                 }
+                 if (t.samExitProfile === 'CHANDELIER' && t.samChandelierDistPts && t.samChandelierDistPts > 0) {
                    const newSl = Number((t.peakPrice - t.samChandelierDistPts).toFixed(2));
                    if (newSl > t.stoploss) {
                      t.stoploss = newSl;
@@ -1277,26 +1307,41 @@ export function LiveChart({
                  }
 
                  t.peakPrice = Math.min(t.peakPrice || t.entryPrice, curr.low);
-                 if (t.samExitProfile === 'FIXED_EOD' && t.samBeTriggerPts) {
-                   if (t.peakPrice <= t.entryPrice - t.samBeTriggerPts) {
-                     const newSl = Number(t.entryPrice.toFixed(2));
-                     if (newSl < t.stoploss) {
-                       t.stoploss = newSl;
-                       t.isBreakevenLocked = true;
-                       if (t.trailStage !== 1) {
-                         t.trailStage = 1;
-                         beSavedCount++;
-                         markers.push({
-                           time: curr.time,
-                           position: 'aboveBar',
-                           color: '#3B82F6',
-                           shape: 'circle',
-                           text: `SL ➔ BE (+${t.samBeTriggerPts}pt)`
-                         });
-                       }
+                 if (t.samStep2TriggerPts && t.samStep2LockPts !== undefined && t.peakPrice <= t.entryPrice - t.samStep2TriggerPts) {
+                   const newSl = Number((t.entryPrice - t.samStep2LockPts).toFixed(2));
+                   if (newSl < t.stoploss) {
+                     t.stoploss = newSl;
+                     t.isBreakevenLocked = true;
+                     if (t.trailStage !== 2) {
+                       t.trailStage = 2;
+                       markers.push({
+                         time: curr.time,
+                         position: 'aboveBar',
+                         color: '#10B981',
+                         shape: 'circle',
+                         text: `SL ➔ +${t.samStep2LockPts}pt (+${t.samStep2TriggerPts}pt)`
+                       });
                      }
                    }
-                 } else if (t.samExitProfile === 'CHANDELIER' && t.samChandelierDistPts && t.samChandelierDistPts > 0) {
+                 } else if (t.samBeTriggerPts && t.peakPrice <= t.entryPrice - t.samBeTriggerPts) {
+                   const newSl = Number(t.entryPrice.toFixed(2));
+                   if (newSl < t.stoploss) {
+                     t.stoploss = newSl;
+                     t.isBreakevenLocked = true;
+                     if (t.trailStage !== 1 && t.trailStage !== 2) {
+                       t.trailStage = 1;
+                       beSavedCount++;
+                       markers.push({
+                         time: curr.time,
+                         position: 'aboveBar',
+                         color: '#3B82F6',
+                         shape: 'circle',
+                         text: `SL ➔ BE (+${t.samBeTriggerPts}pt)`
+                       });
+                     }
+                   }
+                 }
+                 if (t.samExitProfile === 'CHANDELIER' && t.samChandelierDistPts && t.samChandelierDistPts > 0) {
                    const newSl = Number((t.peakPrice + t.samChandelierDistPts).toFixed(2));
                    if (newSl < t.stoploss) {
                      t.stoploss = newSl;
@@ -2043,6 +2088,8 @@ export function LiveChart({
               let profSlDist = 40;
               let exitProfile: 'FIXED_EOD' | 'CHANDELIER' = 'FIXED_EOD';
               let beTriggerPts: number | undefined = 30;
+              let step2TriggerPts: number | undefined = undefined;
+              let step2LockPts: number | undefined = undefined;
               let chandelierDistPts: number | undefined = undefined;
               let labelSuffix = 'AFT [#3 SL40/BE30]';
 
@@ -2055,9 +2102,11 @@ export function LiveChart({
               } else if (samProfile === 'SAM21_3M_OPENDRIVE') {
                 profSlDist = Number((2.0 * effAtr5m).toFixed(2));
                 exitProfile = 'CHANDELIER';
-                beTriggerPts = undefined;
+                beTriggerPts = 30;
+                step2TriggerPts = 50;
+                step2LockPts = 20;
                 chandelierDistPts = Number((3.0 * effAtr5m).toFixed(2));
-                labelSuffix = '3m OPEN [#1 2x/3x ATR]';
+                labelSuffix = '3m OPEN [#1 2x/3x ATR + BE30/L20]';
               }
 
               const stoploss = Number((isCall ? entry - profSlDist : entry + profSlDist).toFixed(2));
@@ -2088,6 +2137,8 @@ export function LiveChart({
                 signalBarIdx: i,
                 samExitProfile: exitProfile,
                 samBeTriggerPts: beTriggerPts,
+                samStep2TriggerPts: step2TriggerPts,
+                samStep2LockPts: step2LockPts,
                 samChandelierDistPts: chandelierDistPts,
                 samIgnoreOppositeExit: true,
                 samNoFixedTp: true,
@@ -2367,6 +2418,7 @@ export function LiveChart({
       s12Filtered: activeStrategies.samSignals ? (samSignalsResult.s12FilteredCount || 0) : 0,
       sam21AfternoonSignals: activeStrategies.samSignals ? (samSignalsResult.sam21AfternoonSignalCount || 0) : 0,
       sam21OpenDriveSignals: activeStrategies.samSignals ? (samSignalsResult.sam21OpenDriveSignalCount || 0) : 0,
+      sam21LiveStatus: activeStrategies.samSignals ? (samSignalsResult.sam21LiveStatus || null) : null,
       dailyDrawdownHalted,
       currentRegimeState: samSignalsResult.regimeState?.[candles.length - 1] || 'RANGE',
       circuitBreakerActive: (longCooldownUntil > (candles[candles.length - 1]?.time as number)) || (shortCooldownUntil > (candles[candles.length - 1]?.time as number)),
@@ -2957,7 +3009,7 @@ export function LiveChart({
                         ? 'bg-amber-950/70 border-amber-400/60 text-amber-300 shadow-sm'
                         : 'bg-[#0A0F1C] border-gray-700 text-gray-500 hover:text-gray-300'
                     }`}
-                    title="SAM(21/5) Morning + Afternoon Combined: 3m OpenDrive (09:20–10:30, PF 2.24) + 1m Afternoon (12:30–14:50, PF 1.83–1.91)"
+                    title="SAM(21/5) Morning + Afternoon Combined: 3m OpenDrive (09:20–10:15, BE30 / +50➔+20 Lock + 3x ATR) + 1m Afternoon (12:30–14:50)"
                   >
                     {samConfig.filterSam21CombinedEnabled ? `21/5 Comb:ON` : `21/5 Comb:OFF`}
                   </button>
@@ -3568,7 +3620,7 @@ export function LiveChart({
                           className="accent-emerald-400 cursor-pointer"
                         />
                         <span className={`font-semibold ${samConfig.filterSam21AfternoonEnabled ? 'text-emerald-300' : 'text-gray-400'}`}>
-                          SAM 21/5 1m Afternoon ({comparisonStats.sam21AfternoonSignals})
+                          SAM 21/5 1m Afternoon{samConfig.filterSam21AfternoonEnabled || samConfig.filterSam21CombinedEnabled ? ` (${comparisonStats.sam21AfternoonSignals})` : ''}
                         </span>
                       </label>
                       <button
@@ -3593,7 +3645,7 @@ export function LiveChart({
                     {/* Filter 13 (Rec #2): Morning + Afternoon Combined (3m OpenDrive + 1m Afternoon) */}
                     <label
                       className="flex items-center gap-1.5 cursor-pointer text-gray-200 hover:text-white"
-                      title="Recommendation #2 — Morning + Afternoon Combined (SAM 21/5): Runs #1 (3m SAM 21/5 OpenDrive 09:20–10:30, PDH/PDL + StrongBar + 15m Supertrend, 2x/3x 5m ATR, PF 2.24) in the morning + #3/#5 (1m SAM 21/5 Afternoon 12:30–14:50, PF 1.83–1.91) in the afternoon."
+                      title="Recommendation #2 — Morning + Afternoon Combined (SAM 21/5): Runs #1 (3m SAM 21/5 OpenDrive 09:20–10:15, PDH/PDL + StrongBar + 15m Supertrend, 2x/3x 5m ATR + BE30 / +50➔+20 Lock) in the morning + #3/#5 (1m SAM 21/5 Afternoon 12:30–14:50) in the afternoon."
                     >
                       <input
                         type="checkbox"
@@ -3602,17 +3654,54 @@ export function LiveChart({
                         className="accent-amber-400 cursor-pointer"
                       />
                       <span className={`font-semibold ${samConfig.filterSam21CombinedEnabled ? 'text-amber-300' : 'text-gray-400'}`}>
-                        SAM 21/5 Combined ({comparisonStats.sam21OpenDriveSignals + comparisonStats.sam21AfternoonSignals})
+                        SAM 21/5 Combined{samConfig.filterSam21CombinedEnabled ? ` (${comparisonStats.sam21OpenDriveSignals + comparisonStats.sam21AfternoonSignals})` : ''}
                       </span>
                       <span className={`text-[10px] px-1.5 py-0.2 rounded border font-mono ${
                         samConfig.filterSam21CombinedEnabled
                           ? 'bg-amber-500/15 text-amber-300 border-amber-500/35'
                           : 'bg-gray-800 text-gray-400 border-gray-700'
                       }`}>
-                        3m OpenDrive 09:20–10:30 + 1m Aft
+                        3m OpenDrive 09:20–10:15 + 1m Aft
                       </span>
                     </label>
                   </div>
+
+                  {(samConfig.filterSam21AfternoonEnabled || samConfig.filterSam21CombinedEnabled) && comparisonStats.sam21LiveStatus && (
+                    <div className="w-full mt-1 px-2.5 py-1.5 rounded bg-emerald-950/30 border border-emerald-700/40 text-[10px] font-mono text-gray-300 flex flex-wrap items-center gap-x-3 gap-y-1">
+                      <span className="text-emerald-300 font-bold">
+                        LIVE SAM 21/5 ({comparisonStats.sam21LiveStatus.latestDate} {comparisonStats.sam21LiveStatus.latestTimeIst} IST):
+                      </span>
+                      <span>Spot <strong className="text-white">{comparisonStats.sam21LiveStatus.latestClose.toFixed(1)}</strong></span>
+                      <span>
+                        PDH <strong className="text-emerald-300">{comparisonStats.sam21LiveStatus.pdh?.toFixed(1) ?? '-'}</strong> / PDL <strong className="text-red-300">{comparisonStats.sam21LiveStatus.pdl?.toFixed(1) ?? '-'}</strong>
+                      </span>
+                      <span className={
+                        comparisonStats.sam21LiveStatus.breakoutState === 'ABOVE_PDH'
+                          ? 'text-emerald-300 font-bold'
+                          : comparisonStats.sam21LiveStatus.breakoutState === 'BELOW_PDL'
+                            ? 'text-red-300 font-bold'
+                            : 'text-amber-300'
+                      }>
+                        {comparisonStats.sam21LiveStatus.breakoutState === 'ABOVE_PDH'
+                          ? 'Above PDH (CALL Ready)'
+                          : comparisonStats.sam21LiveStatus.breakoutState === 'BELOW_PDL'
+                            ? 'Below PDL (PUT Ready)'
+                            : 'Inside PDH/PDL Range (No Breakout Yet)'}
+                      </span>
+                      <span>
+                        5m ADX <strong className={(comparisonStats.sam21LiveStatus.adx5m ?? 0) >= 30 ? 'text-emerald-300' : 'text-amber-300'}>
+                          {comparisonStats.sam21LiveStatus.adx5m ?? '-'}
+                        </strong> (need ≥30)
+                      </span>
+                      {comparisonStats.sam21LiveStatus.diSpread5m !== null && (
+                        <span>
+                          DI Δ <strong className={Math.abs(comparisonStats.sam21LiveStatus.diSpread5m) > 5 ? 'text-emerald-300' : 'text-gray-400'}>
+                            {comparisonStats.sam21LiveStatus.diSpread5m > 0 ? '+' : ''}{comparisonStats.sam21LiveStatus.diSpread5m}
+                          </strong>
+                        </span>
+                      )}
+                    </div>
+                  )}
 
                   <button
                     onClick={() => setShowStrategySettingsModal('SAM')}
@@ -3724,10 +3813,24 @@ export function LiveChart({
               </div>
             )}
             {displayedTrades.length === 0 && !shouldShowPendingSetup ? (
-              <div className="col-span-full py-12 text-center text-gray-500 font-mono text-xs">
-                {selectedDateFilter !== 'ALL' || isCustomRangeOpen 
-                  ? 'No trades found matching the selected date filter.' 
-                  : 'No trades generated for this period or all filtered out by selected filters.'}
+              <div className="col-span-full py-12 text-center text-gray-400 font-mono text-xs flex flex-col items-center gap-2.5">
+                <span>
+                  {selectedDateFilter !== 'ALL' || isCustomRangeOpen 
+                    ? `No trades triggered on the selected date under active filters${backtestTrades.length > 0 ? ` (${backtestTrades.length} trades available across all dates)` : ''}.` 
+                    : 'No trades generated for this period or all filtered out by selected filters.'}
+                </span>
+                {(selectedDateFilter !== 'ALL' || isCustomRangeOpen) && backtestTrades.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedDateFilter('ALL');
+                      setIsCustomRangeOpen(false);
+                    }}
+                    className="px-3 py-1.5 rounded bg-blue-600/20 hover:bg-blue-600/35 text-blue-300 border border-blue-500/40 font-bold cursor-pointer transition-colors"
+                  >
+                    Show All {backtestTrades.length} Trades
+                  </button>
+                )}
               </div>
             ) : (
               displayedTrades.map((t, idx) => (
@@ -3942,10 +4045,26 @@ export function LiveChart({
                 )}
                 {displayedTrades.length === 0 && !shouldShowPendingSetup && (
                    <tr>
-                     <td colSpan={16} className="py-8 text-center text-gray-500 font-mono text-xs">
-                       {selectedDateFilter !== 'ALL' || isCustomRangeOpen 
-                         ? 'No trades found matching the selected date filter.' 
-                         : 'No trades generated for this period'}
+                     <td colSpan={16} className="py-8 text-center text-gray-400 font-mono text-xs">
+                       <div className="flex flex-col items-center gap-2">
+                         <span>
+                           {selectedDateFilter !== 'ALL' || isCustomRangeOpen 
+                             ? `No trades triggered on the selected date under active filters${backtestTrades.length > 0 ? ` (${backtestTrades.length} trades available across all dates)` : ''}.` 
+                             : 'No trades generated for this period'}
+                         </span>
+                         {(selectedDateFilter !== 'ALL' || isCustomRangeOpen) && backtestTrades.length > 0 && (
+                           <button
+                             type="button"
+                             onClick={() => {
+                               setSelectedDateFilter('ALL');
+                               setIsCustomRangeOpen(false);
+                             }}
+                             className="px-3 py-1 rounded bg-blue-600/20 hover:bg-blue-600/35 text-blue-300 border border-blue-500/40 font-bold cursor-pointer transition-colors"
+                           >
+                             Show All {backtestTrades.length} Trades
+                           </button>
+                         )}
+                       </div>
                      </td>
                    </tr>
                 )}
@@ -5538,7 +5657,7 @@ export function LiveChart({
                         </p>
 
                         <div className="text-[10px] space-y-1 bg-[#0A0F1C] p-2.5 rounded-md border border-gray-800/80 font-mono mb-2.5 text-gray-300">
-                          <p className="text-amber-300">• Morning (#1, PF 2.24): 3m SAM(21/5) OpenDrive (09:20–10:30) • PDH/PDL + StrongBar + 15m Supertrend • SL 2x / Trail 3x 5m ATR</p>
+                          <p className="text-amber-300">• Morning (#1): 3m SAM(21/5) OpenDrive (09:20–10:15) • PDH/PDL + StrongBar + 15m Supertrend • SL 2x / Trail 3x 5m ATR + BE30 / +50➔+20 Lock</p>
                           <p className="text-emerald-300">• Afternoon (#3/#5, PF 1.83–1.91): 1m SAM(21/5) (12:30–14:50) • PDH/PDL + 5m ADX &ge; 30 &amp; DI &gt; 5 • Uses selected exit mode above</p>
                         </div>
 

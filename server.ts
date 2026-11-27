@@ -98,7 +98,8 @@ async function startServer() {
       }
 
       // Fetch candles to account for out-of-market hour filtering
-      const rawCandles = await getCandles('NIFTY', 1, limit * timeframe * 10);
+      const rawFetchCount = Math.min(Math.max(limit * timeframe * 2, limit + 500), 25000);
+      const rawCandles = await getCandles('NIFTY', 1, rawFetchCount);
       
       // Strictly filter for genuine NSE market trading hours (Mon-Fri 09:15-15:30)
       const filtered = rawCandles.filter(c => isMarketHours(c.timestamp));

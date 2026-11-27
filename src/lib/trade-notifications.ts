@@ -150,12 +150,14 @@ export function playTradeAlertSound(event: TradeNotificationEvent): void {
   }
 
   // TRADE_CLOSED
-  if (event.status === 'WIN' || (event.lotPnl !== undefined && event.lotPnl > 0) || (event.spotPnl !== undefined && event.spotPnl > 0)) {
+  const lotNum = typeof event.lotPnl === 'number' && Number.isFinite(event.lotPnl) ? event.lotPnl : undefined;
+  const spotNum = typeof event.spotPnl === 'number' && Number.isFinite(event.spotPnl) ? event.spotPnl : undefined;
+  if (event.status === 'WIN' || (lotNum !== undefined && lotNum > 0) || (spotNum !== undefined && spotNum > 0)) {
     playToneSequence([
       { freq: 783.99, startOffset: 0, duration: 0.14, gain: 0.22, type: 'sine' },
       { freq: 1046.5, startOffset: 0.14, duration: 0.3, gain: 0.24, type: 'sine' },
     ]);
-  } else if (event.status === 'LOSS' || (event.lotPnl !== undefined && event.lotPnl < 0) || (event.spotPnl !== undefined && event.spotPnl < 0)) {
+  } else if (event.status === 'LOSS' || (lotNum !== undefined && lotNum < 0) || (spotNum !== undefined && spotNum < 0)) {
     playToneSequence([
       { freq: 311.13, startOffset: 0, duration: 0.16, gain: 0.2, type: 'sawtooth' },
       { freq: 246.94, startOffset: 0.18, duration: 0.26, gain: 0.18, type: 'sawtooth' },
@@ -184,23 +186,24 @@ export function formatTradeNotificationTitle(event: TradeNotificationEvent): str
 }
 
 export function formatTradeNotificationBody(event: TradeNotificationEvent): string {
+  const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
   const parts: string[] = [];
   if (event.signal) parts.push(event.signal);
   if (event.kind === 'TRADE_CLOSED') {
-    if (event.exitPrice !== undefined) {
+    if (isNum(event.entryPrice) && isNum(event.exitPrice)) {
       parts.push(`Spot ${event.entryPrice.toFixed(1)} → ${event.exitPrice.toFixed(1)}`);
     }
-    if (event.lotPnl !== undefined) {
+    if (isNum(event.lotPnl)) {
       parts.push(`1 Lot: ${event.lotPnl >= 0 ? '+' : ''}₹${event.lotPnl.toFixed(0)}`);
-    } else if (event.spotPnl !== undefined) {
+    } else if (isNum(event.spotPnl)) {
       parts.push(`Spot P&L: ${event.spotPnl >= 0 ? '+' : ''}${event.spotPnl.toFixed(1)} pts`);
     }
     if (event.exitReason) parts.push(event.exitReason);
   } else {
-    parts.push(`Spot: ${event.entryPrice.toFixed(2)}`);
-    if (event.stoploss !== undefined) parts.push(`SL: ${event.stoploss.toFixed(1)}`);
-    if (event.target !== undefined) parts.push(`TP: ${event.target.toFixed(1)}`);
-    if (event.optionEntryPremium !== undefined) {
+    if (isNum(event.entryPrice)) parts.push(`Spot: ${event.entryPrice.toFixed(2)}`);
+    if (isNum(event.stoploss)) parts.push(`SL: ${event.stoploss.toFixed(1)}`);
+    if (isNum(event.target)) parts.push(`TP: ${event.target.toFixed(1)}`);
+    if (isNum(event.optionEntryPremium)) {
       parts.push(`Prem: ₹${event.optionEntryPremium.toFixed(2)}`);
     }
   }

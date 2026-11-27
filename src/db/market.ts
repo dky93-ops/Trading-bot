@@ -57,12 +57,29 @@ export async function purgeOutOfMarketData(): Promise<void> {
       )
     `;
     const qPurgeOldTicks = `DELETE FROM ticks WHERE UPPER(instrument) != 'NIFTY'`;
+    // Purge completely flat NSE exchange holiday days (e.g. Guru Nanak Jayanti) where
+    // polling recorded identical OHLC across >= 30 bars, which corrupts PDH/PDL and ATR/ADX.
+    const qPurgeFlatHolidayCandles = `
+      DELETE FROM candles c
+      USING (
+        SELECT instrument, timeframe,
+               DATE(timestamp + INTERVAL '5 hours 30 minutes') AS ist_day
+        FROM candles
+        WHERE instrument = 'NIFTY'
+        GROUP BY instrument, timeframe, DATE(timestamp + INTERVAL '5 hours 30 minutes')
+        HAVING COUNT(*) >= 30 AND (MAX(high) - MIN(low)) < 0.5
+      ) flat
+      WHERE c.instrument = flat.instrument
+        AND c.timeframe = flat.timeframe
+        AND DATE(c.timestamp + INTERVAL '5 hours 30 minutes') = flat.ist_day
+    `;
     const pool = createPool();
     if (pool) {
       await pool.query(qNifty);
       await pool.query(qPurgeOld);
       await pool.query(qNiftyTicks);
       await pool.query(qPurgeOldTicks);
+      await pool.query(qPurgeFlatHolidayCandles);
     }
   } catch (e: any) {
     console.warn("Notice: purgeOutOfMarketData warning:", e.message);
